@@ -130,7 +130,7 @@ pub enum AttachmentKind {
 /// Static provider/model catalog for the model picker (the web client resolves
 /// this from the server's provider list; the native client keeps it fixed).
 /// Each row is `(instanceId, model, label)`.
-const MODEL_CATALOG: &[(&str, &str, &str)] = &[
+pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
     ("devReplay", "showcase", "Replay · showcase"),
     ("devin", "swe-2-high", "Devin · SWE-2 High"),
     ("codex", "gpt-6-astra", "Codex · GPT-6 Astra"),

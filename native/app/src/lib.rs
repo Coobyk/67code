@@ -2,6 +2,9 @@ mod composer;
 mod markdown;
 mod model;
 pub mod net;
+mod notifications;
+mod palette;
+mod settings;
 mod sidebar;
 mod text_field;
 mod theme;
@@ -15,6 +18,17 @@ use gpui_platform::application;
 use model::{AppState, ConnectionStatus, Role};
 use net::{ClientCommand, ShellEvent};
 use text_field::{PromptSubmitted, TextField};
+
+gpui::actions!(
+    app,
+    [
+        TogglePalette,
+        ToggleSettings,
+        NewThread,
+        CloseOverlay,
+        FocusSearch,
+    ]
+);
 
 /// How the app reaches a server and which provider new threads use.
 #[derive(Clone)]
@@ -51,6 +65,11 @@ struct AppView {
     sidebar_state: sidebar::State,
     timeline_state: timeline::State,
     composer_state: composer::State,
+    palette_state: palette::State,
+    settings_state: settings::State,
+    notifications_state: notifications::State,
+    /// Display-only label for the connected server (settings/connection UI).
+    endpoint_label: String,
 }
 
 impl AppView {
@@ -104,10 +123,19 @@ impl AppView {
             sidebar_state: sidebar::State::default(),
             timeline_state: timeline::State::default(),
             composer_state: composer::State::default(),
+            palette_state: palette::State::default(),
+            settings_state: settings::State::default(),
+            notifications_state: notifications::State::default(),
+            endpoint_label: config
+                .endpoint
+                .as_ref()
+                .map(|e| e.http_url.clone())
+                .unwrap_or_else(|| "offline".to_string()),
         }
     }
 
     fn apply_shell_event(&mut self, event: ShellEvent, cx: &mut Context<Self>) {
+        self.observe_shell_event(&event, cx);
         match event {
             ShellEvent::Connected => {
                 self.state.connection = ConnectionStatus::Connected;
@@ -294,6 +322,42 @@ impl AppView {
         cx.notify();
     }
 
+    fn on_new_thread(&mut self, _action: &NewThread, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.selected = None;
+        self.thread_items.clear();
+        cx.notify();
+    }
+
+    fn on_close_overlay(
+        &mut self,
+        _action: &CloseOverlay,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_state.open {
+            self.palette_state.open = false;
+        } else if self.settings_state.open {
+            self.settings_state.open = false;
+        } else if self.composer_state.picker.is_some() {
+            self.composer_state.picker = None;
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    fn on_focus_search(
+        &mut self,
+        _action: &FocusSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_field
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
     fn dispatch(&mut self, command: serde_json::Value) {
         if let Some(commands) = &self.commands {
             let _ = commands.send(ClientCommand::Dispatch { command });
@@ -342,10 +406,16 @@ impl Render for AppView {
             )
         });
         div()
+            .key_context("App")
             .flex()
             .size_full()
             .bg(theme::canvas())
             .text_color(theme::fg())
+            .on_action(cx.listener(AppView::on_toggle_palette))
+            .on_action(cx.listener(AppView::on_toggle_settings))
+            .on_action(cx.listener(AppView::on_new_thread))
+            .on_action(cx.listener(AppView::on_close_overlay))
+            .on_action(cx.listener(AppView::on_focus_search))
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -389,6 +459,9 @@ impl Render for AppView {
                     .child(self.render_timeline())
                     .child(self.render_composer()),
             )
+            .child(self.render_palette(cx))
+            .child(self.render_settings(cx))
+            .child(self.render_notifications(cx))
     }
 }
 
@@ -410,6 +483,13 @@ pub fn run(config: AppConfig) {
             KeyBinding::new("home", Home, Some("TextField")),
             KeyBinding::new("end", End, Some("TextField")),
             KeyBinding::new("enter", Submit, Some("TextField")),
+        ]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", TogglePalette, Some("App")),
+            KeyBinding::new("cmd-,", ToggleSettings, Some("App")),
+            KeyBinding::new("cmd-n", NewThread, Some("App")),
+            KeyBinding::new("cmd-f", FocusSearch, Some("App")),
+            KeyBinding::new("escape", CloseOverlay, Some("App")),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         cx.open_window(
