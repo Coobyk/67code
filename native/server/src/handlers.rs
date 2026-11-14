@@ -129,6 +129,52 @@ async fn dispatch_command(state: Arc<AppState>, payload: Value) -> RpcResult {
     }
 }
 
+/// `ServerConfig` snapshot — enough surface for the native client's model
+/// picker (providers/models are the fields it reads).
+fn server_config_snapshot(state: &AppState) -> Value {
+    let checked_at = domain::now_iso();
+    let provider = |instance: &str, driver: &str, name: &str, models: Value| {
+        json!({
+            "instanceId": instance,
+            "driver": driver,
+            "displayName": name,
+            "enabled": true,
+            "installed": true,
+            "version": "1.0.0",
+            "status": "ready",
+            "auth": { "status": "authenticated" },
+            "checkedAt": checked_at,
+            "models": models,
+        })
+    };
+    let model = |slug: &str, name: &str| {
+        json!({ "slug": slug, "name": name, "isCustom": false, "capabilities": null })
+    };
+    json!({
+        "environment": { "kind": "local" },
+        "auth": { "kind": "none" },
+        "cwd": state.project_dir.to_string_lossy(),
+        "keybindingsConfigPath": "",
+        "keybindings": { "bindings": [], "issues": [] },
+        "issues": [],
+        "providers": [
+            provider("devin", "devin", "Devin", json!([
+                model("swe-2-high", "SWE-2 High"),
+            ])),
+            provider("devReplay", "devReplay", "Replay (dev)", json!([
+                model("showcase", "Showcase"),
+            ])),
+            provider("codex", "codex", "Codex", json!([
+                model("o4-mini", "o4-mini"),
+                model("gpt-5", "GPT-5"),
+            ])),
+        ],
+        "availableEditors": [],
+        "observability": { "otlp": { "enabled": false } },
+        "settings": {},
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Subscription streams
 // ---------------------------------------------------------------------------
@@ -149,12 +195,14 @@ pub async fn run_stream(
             thread_stream(state, out, request_id, payload, window).await;
         }
         "orchestration.subscribeServerConfig" => {
-            // Minimal config payload; native client ignores this stream.
-            let providers = json!({
-                "kind": "config",
-                "providers": [],
-            });
-            let _ = window.send_chunk(&out, request_id, vec![providers]).await;
+            let config = server_config_snapshot(&state);
+            let _ = window
+                .send_chunk(
+                    &out,
+                    request_id,
+                    vec![json!({ "version": 1, "type": "snapshot", "config": config })],
+                )
+                .await;
         }
         _ => {}
     }
