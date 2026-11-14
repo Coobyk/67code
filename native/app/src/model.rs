@@ -25,6 +25,66 @@ pub struct Thread {
     pub project_id: SharedString,
     pub title: SharedString,
     pub status: SharedString,
+    /// Live run status while a turn is in flight, if any.
+    pub activity_run_status: Option<String>,
+    /// A runtime request (approval/user-input) is pending.
+    pub has_pending_request: bool,
+    /// A proposed plan awaits a decision.
+    pub has_actionable_proposed_plan: bool,
+    /// Provider instances that have run on this thread.
+    pub provider_instances: Vec<SharedString>,
+    pub pinned: bool,
+    pub updated_at: SharedString,
+}
+
+impl Thread {
+    /// Build a model thread from a wire shell row.
+    pub fn from_shell(t: &crate::net::ShellThread) -> Self {
+        Self {
+            id: t.id.clone().into(),
+            project_id: t.project_id.clone().into(),
+            title: t.title.clone().into(),
+            status: t.status.clone().into(),
+            activity_run_status: t.activity_run_status.clone(),
+            has_pending_request: t.has_pending_request,
+            has_actionable_proposed_plan: t.has_actionable_proposed_plan,
+            provider_instances: t
+                .provider_instances
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            pinned: t.pinned,
+            updated_at: t.updated_at.clone().into(),
+        }
+    }
+
+    /// Simple mock thread for the offline state.
+    fn mock(id: &str, project_id: &str, title: &str) -> Self {
+        Self {
+            id: id.into(),
+            project_id: project_id.into(),
+            title: title.into(),
+            status: "idle".into(),
+            activity_run_status: None,
+            has_pending_request: false,
+            has_actionable_proposed_plan: false,
+            provider_instances: Vec::new(),
+            pinned: false,
+            updated_at: "".into(),
+        }
+    }
+
+    /// True while a run is actively working on this thread.
+    pub fn running(&self) -> bool {
+        self.activity_run_status
+            .as_deref()
+            .is_some_and(|s| matches!(s, "running" | "starting" | "queued" | "waiting"))
+            || matches!(
+                self.status.as_ref(),
+                "running" | "starting" | "queued" | "active"
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,30 +125,10 @@ impl AppState {
                 },
             ],
             threads: vec![
-                Thread {
-                    id: "t-rust".into(),
-                    project_id: "p-67code".into(),
-                    title: "Rewrite the app in Rust + GPUI".into(),
-                    status: "idle".into(),
-                },
-                Thread {
-                    id: "t-scheme".into(),
-                    project_id: "p-67code".into(),
-                    title: "Fix Electron scheme crash".into(),
-                    status: "idle".into(),
-                },
-                Thread {
-                    id: "t-rebrand".into(),
-                    project_id: "p-67code".into(),
-                    title: "Rebrand sweep".into(),
-                    status: "idle".into(),
-                },
-                Thread {
-                    id: "t-sandbox".into(),
-                    project_id: "p-web".into(),
-                    title: "Sandbox test".into(),
-                    status: "idle".into(),
-                },
+                Thread::mock("t-rust", "p-67code", "Rewrite the app in Rust + GPUI"),
+                Thread::mock("t-scheme", "p-67code", "Fix Electron scheme crash"),
+                Thread::mock("t-rebrand", "p-67code", "Rebrand sweep"),
+                Thread::mock("t-sandbox", "p-web", "Sandbox test"),
             ],
             selected: Some("t-rust".into()),
             messages: vec![

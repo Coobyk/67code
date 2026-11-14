@@ -54,6 +54,20 @@ pub struct ShellThread {
     pub status: String,
     pub archived: bool,
     pub deleted: bool,
+    /// `activityRunStatus` — live status of the in-flight run, if any.
+    pub activity_run_status: Option<String>,
+    /// `latestRunStatus`-derived top status (completed/failed/interrupted/…).
+    pub latest_run_id: Option<String>,
+    /// A runtime request (approval/user-input) is pending on this thread.
+    pub has_pending_request: bool,
+    /// A proposed plan awaits a decision.
+    pub has_actionable_proposed_plan: bool,
+    /// `providerInstanceHistory` — providers that have run on this thread.
+    pub provider_instances: Vec<String>,
+    /// `pinned` ordering key from the shell, if any.
+    pub pinned: bool,
+    /// `updatedAt` ISO timestamp.
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +85,9 @@ pub struct TurnItemView {
     pub body: Option<String>,
     pub streaming: bool,
     pub status: String,
+    /// The complete wire payload — detail fields (diffStr, output, exitCode,
+    /// approval options, steps, …) for rich rendering.
+    pub raw: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -118,6 +135,18 @@ fn parse_thread(v: &Value) -> ShellThread {
         status: v["status"].as_str().unwrap_or("idle").to_string(),
         archived: !v["archivedAt"].is_null(),
         deleted: !v["deletedAt"].is_null(),
+        activity_run_status: v["activityRunStatus"].as_str().map(str::to_owned),
+        latest_run_id: v["latestRunId"].as_str().map(str::to_owned),
+        has_pending_request: !v["pendingRuntimeRequest"].is_null(),
+        has_actionable_proposed_plan: v["hasActionableProposedPlan"].as_bool() == Some(true),
+        provider_instances: v["providerInstanceHistory"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default(),
+        pinned: v["pinned"].as_bool() == Some(true)
+            || !v["pinnedOrderKey"].is_null()
+            || !v["orderKey"].is_null(),
+        updated_at: v["updatedAt"].as_str().unwrap_or_default().to_string(),
     }
 }
 
@@ -221,6 +250,7 @@ fn parse_turn_item(item: &Value) -> Option<TurnItemView> {
         body: turn_item_body(item),
         streaming: item["streaming"].as_bool().unwrap_or(false),
         status: item["status"].as_str().unwrap_or("done").to_string(),
+        raw: item.clone(),
     })
 }
 

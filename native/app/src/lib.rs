@@ -1,7 +1,11 @@
+mod composer;
+mod markdown;
 mod model;
 pub mod net;
+mod sidebar;
 mod text_field;
 mod theme;
+mod timeline;
 
 use gpui::{AppContext, Focusable, prelude::*, rgb,
     App, Bounds, Context, Entity, IntoElement, KeyBinding, MouseButton, Render,
@@ -38,11 +42,15 @@ impl AppConfig {
 struct AppView {
     state: AppState,
     composer: Entity<TextField>,
+    search_field: Entity<TextField>,
     commands: Option<std::sync::mpsc::Sender<ClientCommand>>,
     thread_items: Vec<net::TurnItemView>,
     scroll_handle: ScrollHandle,
     provider: String,
     model: String,
+    sidebar_state: sidebar::State,
+    timeline_state: timeline::State,
+    composer_state: composer::State,
 }
 
 impl AppView {
@@ -57,6 +65,7 @@ impl AppView {
             },
         )
         .detach();
+        let search_field = cx.new(|cx| TextField::new("Search threads…", cx));
 
         let mut commands = None;
         let state = match config.endpoint.clone() {
@@ -86,11 +95,15 @@ impl AppView {
         Self {
             state,
             composer,
+            search_field,
             commands,
             thread_items: Vec::new(),
             scroll_handle: ScrollHandle::new(),
             provider: config.provider.clone(),
             model: config.model.clone(),
+            sidebar_state: sidebar::State::default(),
+            timeline_state: timeline::State::default(),
+            composer_state: composer::State::default(),
         }
     }
 
@@ -112,14 +125,9 @@ impl AppView {
                     .collect();
                 self.state.threads = snapshot
                     .threads
-                    .into_iter()
+                    .iter()
                     .filter(|t| !t.deleted && !t.archived)
-                    .map(|t| model::Thread {
-                        id: t.id.into(),
-                        project_id: t.project_id.into(),
-                        title: t.title.into(),
-                        status: t.status.into(),
-                    })
+                    .map(model::Thread::from_shell)
                     .collect();
                 if self.state.selected.is_none()
                     && let Some(first) = self.state.threads.first()
@@ -153,12 +161,7 @@ impl AppView {
                 if thread.deleted || thread.archived {
                     self.state.threads.retain(|t| t.id.as_ref() != thread.id);
                 } else {
-                    let entry = model::Thread {
-                        id: thread.id.clone().into(),
-                        project_id: thread.project_id.into(),
-                        title: thread.title.into(),
-                        status: thread.status.into(),
-                    };
+                    let entry = model::Thread::from_shell(&thread);
                     match self.state.threads.iter().position(|e| e.id.as_ref() == thread.id) {
                         Some(i) => self.state.threads[i] = entry,
                         None => self.state.threads.push(entry),
@@ -200,12 +203,7 @@ impl AppView {
                     {
                         continue;
                     }
-                    self.state.threads.push(model::Thread {
-                        id: thread.id.into(),
-                        project_id: thread.project_id.into(),
-                        title: thread.title.into(),
-                        status: thread.status.into(),
-                    });
+                    self.state.threads.push(model::Thread::from_shell(&thread));
                 }
             }
             ShellEvent::Error(e) => {
@@ -249,8 +247,8 @@ impl AppView {
                                 "instanceId": self.provider.clone(),
                                 "model": self.model.clone(),
                             },
-                            "runtimeMode": "full-access",
-                            "interactionMode": "default",
+                            "runtimeMode": self.composer_state.runtime_mode.clone(),
+                            "interactionMode": self.composer_state.interaction_mode.clone(),
                             "branch": null,
                             "worktreePath": null,
                             "createdBy": "user",
@@ -267,6 +265,9 @@ impl AppView {
                 }
             };
 
+            let attachments = serde_json::Value::Array(
+                self.composer_state.drain_attachments(),
+            );
             self.dispatch(
                 serde_json::json!({
                     "type": "message.dispatch",
@@ -274,7 +275,7 @@ impl AppView {
                     "threadId": thread_id,
                     "messageId": uuid::Uuid::new_v4().to_string(),
                     "text": text.to_string(),
-                    "attachments": [],
+                    "attachments": attachments,
                     "dispatchMode": { "type": "start_immediately" },
                     "createdBy": "user",
                     "creationSource": "web",
@@ -321,262 +322,6 @@ impl AppView {
         }
         self.state.selected = Some(thread_id);
         cx.notify();
-    }
-
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut projects = div().flex().flex_col().flex_1().overflow_y_hidden().px_2();
-        for (pi, project) in self.state.projects.iter().enumerate() {
-            let mut section = div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .id(("project", pi))
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme::fg())
-                        .hover(|s| s.bg(theme::hover()))
-                        .child(project.name.clone()),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(project.path.clone()),
-                );
-            if project.expanded {
-                for (ti, thread) in self.state.threads_for(&project.id).enumerate() {
-                    let active = self.state.selected.as_ref() == Some(&thread.id);
-                    let thread_id = thread.id.clone();
-                    let mut row = div()
-                        .id(("thread", pi * 10_000 + ti))
-                        .mx_1()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .text_sm()
-                        .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
-                        .when(!active, |s| {
-                            s.text_color(theme::fg_muted())
-                                .hover(|s| s.bg(theme::hover()))
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.select_thread(thread_id.clone(), cx)
-                            }),
-                        )
-                        .child(thread.title.clone());
-                    if thread.status.as_ref() != "idle" {
-                        row = row.child(
-                            div()
-                                .ml_1()
-                                .text_xs()
-                                .text_color(theme::primary())
-                                .child(format!("({})", thread.status)),
-                        );
-                    }
-                    section = section.child(row);
-                }
-            }
-            projects = projects.child(section);
-        }
-
-        let status_text = match &self.state.connection {
-            ConnectionStatus::Mock => "Local mock data".to_string(),
-            ConnectionStatus::Connecting => "Connecting…".to_string(),
-            ConnectionStatus::Connected => "Connected".to_string(),
-            ConnectionStatus::Failed(e) => format!("Error: {e}"),
-            ConnectionStatus::Disconnected(e) => format!("Disconnected: {e}"),
-        };
-        let status_color = match &self.state.connection {
-            ConnectionStatus::Connected => theme::primary(),
-            ConnectionStatus::Failed(_) | ConnectionStatus::Disconnected(_) => rgb(0xff5a5a),
-            _ => theme::fg_muted(),
-        };
-
-        div()
-            .w(px(260.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::border())
-            .child(
-                div()
-                    .h(px(44.))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme::border())
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::fg())
-                            .child("67"),
-                    ),
-            )
-            .child(projects)
-            .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(theme::border())
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_text),
-            )
-    }
-
-    fn render_messages(&self) -> impl IntoElement {
-        let mut list = div()
-            .id("messages")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_4()
-            .gap_3();
-
-        if self.state.connection != ConnectionStatus::Mock {
-            if self.thread_items.is_empty() {
-                return list.child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(theme::fg_muted())
-                        .text_sm()
-                        .child("No messages yet — say something to the agent."),
-                );
-            }
-            for (i, item) in self.thread_items.iter().enumerate() {
-                let body = item
-                    .body
-                    .clone()
-                    .or_else(|| item.title.clone())
-                    .unwrap_or_else(|| item.kind.clone());
-                let dimmed = item.streaming || item.status == "running";
-                let row = match item.kind.as_str() {
-                    "user_message" => div().flex().justify_end().child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .rounded_lg()
-                            .text_sm()
-                            .max_w(px(560.))
-                            .bg(theme::user_bubble())
-                            .text_color(theme::fg())
-                            .child(body),
-                    ),
-                    "assistant_message" | "reasoning" | "proposed_plan" => {
-                        div().flex().justify_start().child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .rounded_lg()
-                                .text_sm()
-                                .max_w(px(560.))
-                                .bg(theme::raised())
-                                .border_1()
-                                .border_color(theme::border())
-                                .text_color(theme::fg())
-                                .child(body),
-                        )
-                    }
-                    _ => div().flex().justify_start().child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(if dimmed {
-                                format!("{}  {} …", item.kind, body)
-                            } else {
-                                format!("{}  {}", item.kind, body)
-                            }),
-                    ),
-                };
-                list = list.child(div().id(("item", i)).child(row));
-            }
-            return list;
-        }
-
-        if self.state.messages.is_empty() {
-            return list.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(theme::fg_muted())
-                    .text_sm()
-                    .child("No messages yet — say something to the agent."),
-            );
-        }
-
-        for (i, message) in self.state.messages.iter().enumerate() {
-            let bubble = div()
-                .px_3()
-                .py_2()
-                .rounded_lg()
-                .text_sm()
-                .max_w(px(560.))
-                .child(message.text.clone());
-            let row = match message.role {
-                Role::User => div().flex().justify_end().child(
-                    bubble.bg(theme::user_bubble()).text_color(theme::fg()),
-                ),
-                Role::Agent => div().flex().justify_start().child(
-                    bubble
-                        .bg(theme::raised())
-                        .border_1()
-                        .border_color(theme::border())
-                        .text_color(theme::fg()),
-                ),
-            };
-            list = list.child(div().id(("msg", i)).child(row));
-        }
-        list
-    }
-
-    fn render_composer(&self) -> impl IntoElement {
-        div().p_4().child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded_lg()
-                .bg(theme::raised())
-                .border_1()
-                .border_color(theme::border())
-                .px_3()
-                .py_2()
-                .child(div().flex_1().text_sm().child(self.composer.clone()))
-                .child(
-                    div()
-                        .id("send")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::primary())
-                        .text_xs()
-                        .text_color(gpui::white())
-                        .child("Send"),
-                ),
-        )
     }
 }
 
@@ -637,7 +382,7 @@ impl Render for AppView {
                                 )
                             }),
                     )
-                    .child(self.render_messages())
+                    .child(self.render_timeline())
                     .child(self.render_composer()),
             )
     }
