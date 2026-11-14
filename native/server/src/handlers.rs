@@ -339,12 +339,25 @@ async fn thread_stream(
         match state.store.thread_projection(&thread_id).await {
             Some(projection) => {
                 let wire = domain::project_projection_for_wire(&projection);
+                // `computeLatestLocalTurnOrdinal`: max ordinal across turn items.
+                let latest_local_turn_ordinal = wire
+                    .get("turnItems")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i.get("ordinal").and_then(Value::as_i64))
+                            .max()
+                    })
+                    .map(Value::from)
+                    .unwrap_or(Value::Null);
                 let item = json!({
                     "kind": "snapshot",
-                    "snapshot": {
-                        "snapshotSequence": snapshot_seq,
-                        "projection": wire,
-                    },
+                    "snapshotSequence": snapshot_seq,
+                    "projection": wire,
+                    "historyCursor": Value::Null,
+                    "hasMoreHistory": false,
+                    "latestLocalTurnOrdinal": latest_local_turn_ordinal,
                 });
                 if !window.send_chunk(&out, request_id, vec![item]).await {
                     return;

@@ -917,8 +917,10 @@ fn thread_shell_from_app(conn: &Connection, app: &Value) -> Value {
     );
     let items: Vec<Value> = column_json(
         conn,
-        "SELECT payload_json FROM orchestration_v2_projection_turn_items \
-         WHERE thread_id = ?1 ORDER BY ordinal ASC, turn_item_id ASC",
+        "SELECT t.payload_json FROM orchestration_v2_projection_turn_items t \
+         LEFT JOIN orchestration_v2_turn_item_positions p \
+           ON p.thread_id = t.thread_id AND p.turn_item_id = t.turn_item_id \
+         WHERE t.thread_id = ?1 ORDER BY COALESCE(p.ordinal, t.ordinal) ASC, t.turn_item_id ASC",
         &[&thread_id],
     );
     let visible = visible_turn_items(&runs, &attempts, &items);
@@ -1269,8 +1271,10 @@ fn thread_projection(conn: &Connection, thread_id: &str) -> Option<Value> {
         "SELECT payload_json FROM orchestration_v2_projection_plans WHERE thread_id = ?1",
     );
     let turn_items = col(
-        "SELECT payload_json FROM orchestration_v2_projection_turn_items \
-         WHERE thread_id = ?1 ORDER BY ordinal ASC, turn_item_id ASC",
+        "SELECT t.payload_json FROM orchestration_v2_projection_turn_items t \
+         LEFT JOIN orchestration_v2_turn_item_positions p \
+           ON p.thread_id = t.thread_id AND p.turn_item_id = t.turn_item_id \
+         WHERE t.thread_id = ?1 ORDER BY COALESCE(p.ordinal, t.ordinal) ASC, t.turn_item_id ASC",
     );
     let checkpoint_scopes = col(
         "SELECT payload_json FROM orchestration_v2_projection_checkpoint_scopes WHERE thread_id = ?1",
