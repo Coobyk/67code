@@ -140,7 +140,7 @@ pub async fn run(
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             match method {
                 "session/request_permission" => {
-                    handle_permission(state, &mut turn, &writer, id, &params).await?;
+                    handle_permission(state, &mut turn, &writer, id, &params, cancel).await?;
                 }
                 "fs/read_text_file" => {
                     let path = params.get("path").and_then(Value::as_str).unwrap_or("");
@@ -262,6 +262,7 @@ async fn handle_permission(
     writer: &RpcWriter,
     rpc_id: &Value,
     params: &Value,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     let tool_call = params.get("toolCall").cloned().unwrap_or(json!({}));
     let options = params
@@ -357,17 +358,52 @@ async fn handle_permission(
     )
     .await?;
 
-    // Auto-accept the most permissive allow option (allow_always > allow_once > first).
-    let chosen = options
-        .iter()
-        .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_always"))
-        .or_else(|| {
-            options
-                .iter()
-                .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_once"))
-        })
-        .or_else(|| options.first())
-        .cloned();
+    // Wait for the user's decision via `runtime-request.respond`. Unattended
+    // turns time out and fall back to the most permissive allow option.
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    state
+        .pending_requests
+        .lock()
+        .expect("pending_requests")
+        .insert(request_id.clone(), tx);
+    let decision = tokio::select! {
+        _ = cancel.cancelled() => None,
+        d = tokio::time::timeout(std::time::Duration::from_secs(300), rx) => match d {
+            Ok(Ok(d)) => Some(d),
+            _ => None,
+        },
+    };
+    state
+        .pending_requests
+        .lock()
+        .expect("pending_requests")
+        .remove(&request_id);
+
+    let chosen = if let Some(d) = decision {
+        let wanted = match d.as_str() {
+            "accept" => "allow_once",
+            "acceptForSession" | "acceptAlways" => "allow_always",
+            "decline" => "reject_once",
+            "cancel" => "reject_always",
+            _ => "allow_once",
+        };
+        options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some(wanted))
+            .or_else(|| options.last())
+            .cloned()
+    } else {
+        options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_always"))
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_once"))
+            })
+            .or_else(|| options.first())
+            .cloned()
+    };
     let option_id = chosen
         .as_ref()
         .and_then(|o| o.get("optionId").and_then(Value::as_str))

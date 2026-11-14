@@ -34,7 +34,17 @@ pub struct AppState {
     pub replay_dir: PathBuf,
     /// Workspace root for the seeded "Local workspace" project.
     pub project_dir: PathBuf,
+    /// Pending runtime requests awaiting a user decision. Keyed by
+    /// runtime request id; the sender delivers the decision to the
+    /// provider task that is blocked on `session/request_permission`.
+    pub pending_requests: PendingRequestRegistry,
 }
+
+/// The sender delivers the orchestration decision string ("accept",
+/// "acceptForSession", "acceptAlways", "decline", "cancel") to the provider
+/// task, which maps it onto the ACP option list it already holds.
+pub type PendingRequestRegistry =
+    StdMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>;
 
 /// Everything the server needs; no env lookup inside `run`.
 pub struct ServerConfig {
@@ -129,6 +139,7 @@ pub async fn run(
         store,
         events_tx,
         turns: StdMutex::new(HashMap::new()),
+        pending_requests: StdMutex::new(HashMap::new()),
         home_dir: config.home_dir,
         replay_dir,
         project_dir: config.project_dir,

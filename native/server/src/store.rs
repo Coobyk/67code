@@ -1879,8 +1879,282 @@ fn apply_command(conn: &Connection, command: &Value) -> Result<ApplyResult, Stri
         "thread.create" => apply_thread_create(conn, command, &command_id),
         "message.dispatch" => apply_message_dispatch(conn, command, &command_id),
         "thread.stop" => apply_thread_stop(conn, command, &command_id),
+        "thread.archive" | "thread.unarchive" | "thread.delete" | "thread.pin"
+        | "thread.unpin" | "thread.metadata.update" => {
+            apply_thread_mutation(conn, command, &command_id)
+        }
+        "runtime-request.respond" => apply_runtime_respond(conn, command, &command_id),
+        "project.create" => apply_project_create(conn, command, &command_id),
         other => Err(format!("unsupported command type: {other}")),
     }
+}
+
+/// Thread lifecycle mutations: read the projected thread payload, patch the
+/// affected field, and commit the matching `thread.*` event.
+fn apply_thread_mutation(
+    conn: &Connection,
+    command: &Value,
+    command_id: &str,
+) -> Result<ApplyResult, String> {
+    let ty = command.get("type").and_then(Value::as_str).unwrap_or("");
+    let thread_id = command
+        .get("threadId")
+        .and_then(Value::as_str)
+        .ok_or("missing threadId")?
+        .to_string();
+    let mut payload: Value = conn
+        .query_row(
+            "SELECT payload_json FROM orchestration_v2_projection_threads \
+             WHERE thread_id = ?1",
+            params![thread_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .ok_or("unknown thread")?;
+    let now = domain::now_iso();
+    payload["updatedAt"] = json!(now);
+    let event_ty = match ty {
+        "thread.archive" => {
+            payload["archivedAt"] = json!(now);
+            "thread.archived"
+        }
+        "thread.unarchive" => {
+            payload["archivedAt"] = Value::Null;
+            "thread.unarchived"
+        }
+        "thread.delete" => {
+            payload["deletedAt"] = json!(now);
+            "thread.deleted"
+        }
+        "thread.pin" => {
+            payload["pinnedAt"] = json!(now);
+            if payload.get("pinOrderKey").is_none()
+                || payload.get("pinOrderKey").is_some_and(Value::is_null)
+            {
+                payload["pinOrderKey"] = json!(now);
+            }
+            "thread.pinned"
+        }
+        "thread.unpin" => {
+            payload["pinnedAt"] = Value::Null;
+            payload["pinOrderKey"] = Value::Null;
+            "thread.unpinned"
+        }
+        "thread.metadata.update" => {
+            if let Some(t) = command.get("title").and_then(Value::as_str) {
+                payload["title"] = json!(t);
+            }
+            "thread.metadata-updated"
+        }
+        _ => return Err(format!("unsupported command type: {ty}")),
+    };
+    let ev = domain::thread_event(&thread_id, event_ty, payload, None, None, None, None, None);
+    let committed = commit_events(conn, &thread_id, Some(command_id), vec![ev])?;
+    let seq = committed.last().map(|e| e.sequence).unwrap_or(0);
+    record_receipt(conn, command_id, &thread_id, ty, seq);
+    Ok(ApplyResult {
+        sequence: seq,
+        events: committed,
+        run_ctx: None,
+    })
+}
+
+/// `runtime-request.respond`: resolve a pending runtime request and its
+/// approval turn item/node.
+fn apply_runtime_respond(
+    conn: &Connection,
+    command: &Value,
+    command_id: &str,
+) -> Result<ApplyResult, String> {
+    let request_id = command
+        .get("requestId")
+        .and_then(Value::as_str)
+        .ok_or("runtime-request.respond missing requestId")?
+        .to_string();
+    let thread_id = command
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let decision = command.get("decision").cloned();
+    let feedback = command.get("feedback").cloned();
+    let answers = command.get("answers").cloned();
+    let now = domain::now_iso();
+
+    let (tid, mut request, node_id): (String, Value, Option<String>) = conn
+        .query_row(
+            "SELECT thread_id, payload_json, node_id \
+             FROM orchestration_v2_projection_runtime_requests \
+             WHERE runtime_request_id = ?1",
+            params![request_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
+        )
+        .ok()
+        .and_then(|(t, s, n)| serde_json::from_str::<Value>(&s).ok().map(|v| (t, v, n)))
+        .ok_or("unknown runtime request")?;
+    let thread_id = thread_id.unwrap_or(tid);
+    if request.get("status").and_then(Value::as_str) != Some("pending") {
+        return Ok(ApplyResult {
+            sequence: latest_sequence(conn),
+            events: vec![],
+            run_ctx: None,
+        });
+    }
+
+    request["status"] = json!("resolved");
+    request["resolvedAt"] = json!(now);
+    if let Some(d) = &decision {
+        request["decision"] = d.clone();
+    }
+    if let Some(f) = feedback {
+        request["feedback"] = f;
+    }
+    if let Some(a) = answers {
+        request["answers"] = a;
+    }
+    request["responseCapability"] = json!({ "type": "resumable" });
+
+    let mut events = vec![domain::thread_event(
+        &thread_id,
+        "runtime-request.updated",
+        request,
+        None,
+        node_id.as_deref(),
+        None,
+        None,
+        None,
+    )];
+
+    // Close out the approval_request turn item + node that surfaced it.
+    let item_rows = column_json(
+        conn,
+        "SELECT payload_json FROM orchestration_v2_projection_turn_items \
+         WHERE thread_id = ?1 AND type = 'approval_request' AND status IN ('pending','waiting','running')",
+        &[&thread_id],
+    );
+    for mut item in item_rows {
+        let matches = node_id.is_none()
+            || item.get("nodeId").and_then(Value::as_str) == node_id.as_deref();
+        if matches {
+            item["status"] = json!("completed");
+            item["completedAt"] = json!(now);
+            item["updatedAt"] = json!(now);
+            if let Some(d) = &decision {
+                item["decision"] = d.clone();
+            }
+            events.push(domain::thread_event(
+                &thread_id,
+                "turn-item.updated",
+                item,
+                None,
+                node_id.as_deref(),
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+    if let Some(nid) = &node_id {
+        if let Some(node_s) = conn
+            .query_row(
+                "SELECT payload_json FROM orchestration_v2_projection_nodes \
+                 WHERE thread_id = ?1 AND node_id = ?2",
+                params![thread_id, nid],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        {
+            if let Ok(mut node) = serde_json::from_str::<Value>(&node_s) {
+                node["status"] = json!("completed");
+                node["completedAt"] = json!(now);
+                events.push(domain::thread_event(
+                    &thread_id,
+                    "node.updated",
+                    node,
+                    None,
+                    Some(nid),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+
+    let committed = commit_events(conn, &thread_id, Some(command_id), events)?;
+    let seq = committed.last().map(|e| e.sequence).unwrap_or(0);
+    record_receipt(conn, command_id, &thread_id, "runtime-request.respond", seq);
+    Ok(ApplyResult {
+        sequence: seq,
+        events: committed,
+        run_ctx: None,
+    })
+}
+
+/// `project.create` (dispatched via orchestration.dispatchCommand by the native
+/// client; the TS contract routes it through `projects.mutate` — same result).
+fn apply_project_create(
+    conn: &Connection,
+    command: &Value,
+    command_id: &str,
+) -> Result<ApplyResult, String> {
+    let project_id = command
+        .get("projectId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(domain::new_id);
+    let title = command
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Project".to_string());
+    let workspace_root = command
+        .get("workspaceRoot")
+        .and_then(Value::as_str)
+        .ok_or("project.create missing workspaceRoot")?
+        .to_string();
+    let now = domain::now_iso();
+    let event = json!({
+        "id": domain::new_id(),
+        "type": "project.created",
+        "occurredAt": now,
+        "payload": {
+            "id": project_id,
+            "title": title,
+            "workspaceRoot": workspace_root,
+            "scripts": command.get("scripts").cloned().unwrap_or(json!([])),
+            "defaultModelSelection": command.get("defaultModelSelection").cloned().unwrap_or(Value::Null),
+            "createdAt": now,
+            "updatedAt": now,
+        },
+    });
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let stored = append_event(&tx, "project", &project_id, &event, Some(command_id))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO projection_projects (
+           project_id, title, workspace_root, scripts_json, created_at, updated_at,
+           deleted_at, default_model_selection_json, default_thread_env_mode,
+           favicon_path, auto_pull, project_icon_json
+         ) VALUES (?1,?2,?3,'[]',?4,?4,NULL,?5,NULL,NULL,0,NULL)",
+        params![
+            project_id,
+            title,
+            workspace_root,
+            now,
+            command
+                .get("defaultModelSelection")
+                .map(|v| v.to_string()),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    record_receipt(conn, command_id, &project_id, "project.create", stored.sequence);
+    Ok(ApplyResult {
+        sequence: stored.sequence,
+        events: vec![stored],
+        run_ctx: None,
+    })
 }
 
 fn record_receipt(

@@ -80,13 +80,36 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
 }
 
 async fn dispatch_command(state: Arc<AppState>, payload: Value) -> RpcResult {
-    let stop_thread = if payload.get("type").and_then(Value::as_str) == Some("thread.stop") {
+    let ty = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let stop_thread = if ty == "thread.stop" {
         payload.get("threadId").and_then(Value::as_str).map(str::to_owned)
     } else {
         None
     };
     if let Some(tid) = &stop_thread {
         provider::cancel_turns(&state, tid);
+    }
+    // Interactive approvals: deliver the user's decision to the provider task
+    // blocked on `session/request_permission` BEFORE persisting resolution so
+    // the subprocess resumes promptly.
+    if ty == "runtime-request.respond" {
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let decision = payload
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
+        let sender = state
+            .pending_requests
+            .lock()
+            .map(|mut m| m.remove(&request_id))
+            .unwrap_or(None);
+        if let Some(tx) = sender {
+            let _ = tx.send(decision.to_string());
+        }
     }
     let result = state.store.apply_command(payload).await;
     match result {
