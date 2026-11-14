@@ -275,6 +275,10 @@ impl AppView {
                     "threadId": thread_id,
                     "messageId": uuid::Uuid::new_v4().to_string(),
                     "text": text.to_string(),
+                    "modelSelection": {
+                        "instanceId": self.provider.clone(),
+                        "model": self.model.clone(),
+                    },
                     "attachments": attachments,
                     "dispatchMode": { "type": "start_immediately" },
                     "createdBy": "user",

@@ -536,6 +536,7 @@ pub fn app_thread_from_create(cmd: &Value, now: &str) -> Value {
         "title": cmd.get("title").cloned().unwrap_or(json!("New thread")),
         "providerInstanceId": cmd.get("providerInstanceId")
             .or_else(|| cmd.pointer("/modelSelection/instanceId"))
+            .or_else(|| cmd.pointer("/modelSelection/provider"))
             .cloned()
             .unwrap_or(Value::Null),
         "modelSelection": cmd.get("modelSelection").cloned().unwrap_or(Value::Null),
