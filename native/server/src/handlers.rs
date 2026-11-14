@@ -450,13 +450,7 @@ pub async fn ensure_seed_project(state: &Arc<AppState>) -> anyhow::Result<()> {
     if !state.store.list_projects().await.is_empty() {
         return Ok(());
     }
-    let root = std::env::var("C67_PROJECT_DIR")
-        .or_else(|_| std::env::var("CODE67_PROJECT_DIR"))
-        .unwrap_or_else(|_| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "/".into())
-        });
+    let root = state.project_dir.to_string_lossy().to_string();
     let model = std::env::var("C67_DEFAULT_MODEL").ok().map(|m| {
         json!({ "instanceId": "devReplay", "model": m })
     }).or_else(|| Some(json!({ "instanceId": "devReplay", "model": "dev-replay" })));

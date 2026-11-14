@@ -1,0 +1,22 @@
+[workspace]
+members = ["native/server", "native/app"]
+
+[package]
+name = "c67"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "c67"
+path = "native/launcher/main.rs"
+
+[dependencies]
+c67-server = { path = "native/server" }
+c67-app = { path = "native/app" }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
