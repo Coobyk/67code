@@ -115,6 +115,8 @@ pub enum ClientCommand {
     SubscribeThread { thread_id: String },
     /// A raw `OrchestrationV2Command` JSON payload.
     Dispatch { command: Value },
+    /// Drop the current socket (or pending backoff) and reconnect now.
+    Reconnect,
     #[allow(dead_code)]
     Interrupt { request_id: u64 },
 }
@@ -348,8 +350,10 @@ pub fn run(
     commands: std::sync::mpsc::Receiver<ClientCommand>,
 ) {
     let mut backoff = Duration::from_millis(500);
+    // Commands issued while disconnected queue here for the next session.
+    let mut deferred: std::collections::VecDeque<ClientCommand> = Default::default();
     loop {
-        match run_inner(endpoint.clone(), events.clone(), &commands) {
+        match run_inner(endpoint.clone(), events.clone(), &commands, &mut deferred) {
             Err((connected, e)) => {
                 let _ = events.send_blocking(ShellEvent::Disconnected(e));
                 // After a healthy session retry soon; a refused reconnect backs off.
@@ -358,18 +362,36 @@ pub fn run(
                 } else {
                     (backoff * 2).min(Duration::from_secs(15))
                 };
-                std::thread::sleep(backoff);
+                // Wait out the backoff, but a manual Reconnect retries now;
+                // other commands issued during downtime ride the next session.
+                let deadline = std::time::Instant::now() + backoff;
+                while std::time::Instant::now() < deadline {
+                    let mut wake = false;
+                    while let Ok(cmd) = commands.try_recv() {
+                        match cmd {
+                            ClientCommand::Reconnect => wake = true,
+                            other => deferred.push_back(other),
+                        }
+                    }
+                    if wake {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             Ok(()) => return,
         }
     }
 }
 
-/// Returns `Err((was_connected, error))` on disconnect.
+/// Returns `Err((was_connected, error))` on disconnect. `deferred` carries
+/// commands issued during downtime; they are sent right after the session
+/// subscriptions.
 fn run_inner(
     endpoint: ServerEndpoint,
     events: Sender<ShellEvent>,
     commands: &std::sync::mpsc::Receiver<ClientCommand>,
+    deferred: &mut std::collections::VecDeque<ClientCommand>,
 ) -> Result<(), (bool, String)> {
     let ticket = mint_ticket(&endpoint).map_err(|e| (false, e))?;
     let ws_url = format!("{}/ws?wsTicket={ticket}&frameParts=1&orchestrationProtocol=2", endpoint.ws_url());
@@ -389,15 +411,22 @@ fn run_inner(
         std::collections::HashMap::new();
     let mut pending_commands: std::collections::VecDeque<ClientCommand> =
         [ClientCommand::SubscribeShell, ClientCommand::GetOlderSettled].into();
+    pending_commands.append(deferred);
     let mut pending = String::new();
 
     loop {
         if let Some(command) = pending_commands.pop_front() {
+            if matches!(command, ClientCommand::Reconnect) {
+                return Err(fail("reconnect requested".into()));
+            }
             send_command(&mut socket, &mut subscriptions, next_id, &command)
                 .map_err(|e| fail(format!("send failed: {e}")))?;
             next_id += 1;
         }
         while let Ok(command) = commands.try_recv() {
+            if matches!(command, ClientCommand::Reconnect) {
+                return Err(fail("reconnect requested".into()));
+            }
             send_command(&mut socket, &mut subscriptions, next_id, &command)
                 .map_err(|e| fail(format!("send failed: {e}")))?;
             next_id += 1;
@@ -511,6 +540,8 @@ fn send_command(
             "payload": command,
             "headers": [],
         }),
+        // Filtered out before send_command — it never produces a frame.
+        ClientCommand::Reconnect => unreachable!("Reconnect is handled in the run loop"),
         ClientCommand::Interrupt { request_id } => json!({
             "_tag": "Interrupt",
             "requestId": request_id,
