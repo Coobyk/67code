@@ -341,33 +341,48 @@ fn mint_ticket(endpoint: &ServerEndpoint) -> Result<String, String> {
 
 /// Connects, subscribes to the orchestration shell stream, and forwards parsed
 /// events on `events`. Runs on a dedicated thread; `commands` carries outbound
-/// RPC requests. Returns when the socket closes.
+/// RPC requests. Reconnects with exponential backoff until the app exits.
 pub fn run(
     endpoint: ServerEndpoint,
     events: Sender<ShellEvent>,
     commands: std::sync::mpsc::Receiver<ClientCommand>,
 ) {
-    if let Err(e) = run_inner(endpoint, events.clone(), commands) {
-        let _ = events.send_blocking(ShellEvent::Disconnected(e));
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        match run_inner(endpoint.clone(), events.clone(), &commands) {
+            Err((connected, e)) => {
+                let _ = events.send_blocking(ShellEvent::Disconnected(e));
+                // After a healthy session retry soon; a refused reconnect backs off.
+                backoff = if connected {
+                    Duration::from_millis(500)
+                } else {
+                    (backoff * 2).min(Duration::from_secs(15))
+                };
+                std::thread::sleep(backoff);
+            }
+            Ok(()) => return,
+        }
     }
 }
 
+/// Returns `Err((was_connected, error))` on disconnect.
 fn run_inner(
     endpoint: ServerEndpoint,
     events: Sender<ShellEvent>,
-    commands: std::sync::mpsc::Receiver<ClientCommand>,
-) -> Result<(), String> {
-    let ticket = mint_ticket(&endpoint)?;
+    commands: &std::sync::mpsc::Receiver<ClientCommand>,
+) -> Result<(), (bool, String)> {
+    let ticket = mint_ticket(&endpoint).map_err(|e| (false, e))?;
     let ws_url = format!("{}/ws?wsTicket={ticket}&frameParts=1&orchestrationProtocol=2", endpoint.ws_url());
 
     let (mut socket, _response) = tungstenite::connect(&ws_url)
-        .map_err(|e| format!("websocket connect failed: {e}"))?;
+        .map_err(|e| (false, format!("websocket connect failed: {e}")))?;
     if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
         tcp.set_read_timeout(Some(Duration::from_millis(50)))
-            .map_err(|e| format!("socket config failed: {e}"))?;
+            .map_err(|e| (false, format!("socket config failed: {e}")))?;
     }
 
     let _ = events.send_blocking(ShellEvent::Connected);
+    let fail = |e: String| (true, e);
 
     let mut next_id: u64 = 1;
     let mut subscriptions: std::collections::HashMap<u64, SubKind> =
@@ -379,12 +394,12 @@ fn run_inner(
     loop {
         if let Some(command) = pending_commands.pop_front() {
             send_command(&mut socket, &mut subscriptions, next_id, &command)
-                .map_err(|e| format!("send failed: {e}"))?;
+                .map_err(|e| fail(format!("send failed: {e}")))?;
             next_id += 1;
         }
         while let Ok(command) = commands.try_recv() {
             send_command(&mut socket, &mut subscriptions, next_id, &command)
-                .map_err(|e| format!("send failed: {e}"))?;
+                .map_err(|e| fail(format!("send failed: {e}")))?;
             next_id += 1;
         }
 
@@ -412,15 +427,15 @@ fn run_inner(
                 let _ = socket.send(tungstenite::Message::Pong(payload));
             }
             Ok(tungstenite::Message::Close(_)) => {
-                return Err("socket closed by server".into());
+                return Err(fail("socket closed by server".into()));
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))
                 if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(tungstenite::Error::Io(e)) => {
-                return Err(format!("socket io error: {e}"));
+                return Err(fail(format!("socket io error: {e}")));
             }
-            Err(e) => return Err(format!("socket error: {e}")),
+            Err(e) => return Err(fail(format!("socket error: {e}"))),
         }
     }
 }

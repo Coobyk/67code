@@ -139,6 +139,15 @@ impl AppView {
         match event {
             ShellEvent::Connected => {
                 self.state.connection = ConnectionStatus::Connected;
+                // Fresh socket: re-subscribe the open thread so its stream
+                // (and a fresh snapshot) resumes after a reconnect.
+                if let Some(thread_id) = self.state.selected.clone() {
+                    if let Some(commands) = &self.commands {
+                        let _ = commands.send(ClientCommand::SubscribeThread {
+                            thread_id: thread_id.to_string(),
+                        });
+                    }
+                }
             }
             ShellEvent::Snapshot(snapshot) => {
                 self.state.projects = snapshot
