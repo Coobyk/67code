@@ -405,7 +405,7 @@ impl AppView {
 
         if renaming {
             if let Some(field) = self.sidebar_state.rename_field.clone() {
-                row = row.child(div().flex_1().min_w_0().child(field));
+                row = row.child(div().flex_1().min_w_0().text_color(theme::fg()).child(field));
             }
         } else {
             row = row.child(
@@ -638,6 +638,7 @@ impl AppView {
                         .px_2()
                         .py_1()
                         .text_sm()
+                        .text_color(theme::fg())
                         .child(field),
                 )
             })
@@ -651,6 +652,7 @@ impl AppView {
                         .px_2()
                         .py_1()
                         .text_sm()
+                        .text_color(theme::fg())
                         .child(field),
                 )
             })
@@ -938,7 +940,7 @@ impl AppView {
                         .px_2()
                         .py_1()
                         .text_sm()
-                        .child(div().flex_1().min_w_0().child(self.search_field.clone())),
+                        .child(div().flex_1().min_w_0().text_color(theme::fg()).child(self.search_field.clone())),
                 ),
             )
             .child(

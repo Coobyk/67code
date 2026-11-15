@@ -16,8 +16,8 @@ mod text_field;
 mod theme;
 mod timeline;
 
-use gpui::{AppContext, Focusable, prelude::*, rgb,
-    App, Bounds, Context, Entity, IntoElement, KeyBinding, MouseButton, Render,
+use gpui::{AppContext, Focusable, prelude::*,
+    App, Bounds, Context, Entity, IntoElement, KeyBinding, Render,
     ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use gpui_platform::application;
@@ -97,6 +97,11 @@ struct AppView {
     /// Live endpoint (url + token) for authenticated HTTP calls from
     /// settings surfaces; env switching updates both this and endpoint_label.
     active_endpoint: Option<net::ServerEndpoint>,
+    /// When the selected thread started running, for the "Working for …"
+    /// row at the bottom of the timeline. `None` while idle.
+    turn_started_at: Option<std::time::Instant>,
+    /// Half-second tick counter driving the working row's pulsing dot.
+    working_pulse: u64,
 }
 
 impl AppView {
@@ -183,6 +188,8 @@ impl AppView {
                 .map(|e| e.http_url.clone())
                 .unwrap_or_else(|| "offline".to_string()),
             active_endpoint: config.endpoint.clone(),
+            turn_started_at: None,
+            working_pulse: 0,
         }
     }
 
@@ -453,7 +460,7 @@ impl AppView {
         }
     }
 
-    fn stop_thread(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn stop_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.state.selected_thread() else {
             return;
         };
@@ -467,6 +474,7 @@ impl AppView {
 
     fn select_thread(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
         self.thread_items.clear();
+        self.turn_started_at = None;
         if let Some(commands) = &self.commands {
             if commands
                 .send(ClientCommand::SubscribeThread {
@@ -494,6 +502,36 @@ impl Render for AppView {
                 "idle" | "completed" | "failed" | "stopped" | "interrupted"
             )
         });
+        // Drive the "Working for …" row: remember when the selected thread
+        // started running and tick a half-second repaint while it does.
+        match (running, self.turn_started_at) {
+            (true, None) => {
+                let start = std::time::Instant::now();
+                self.turn_started_at = Some(start);
+                self.working_pulse = 0;
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        smol::Timer::after(std::time::Duration::from_millis(500)).await;
+                        let alive = this
+                            .update(cx, |this, cx| {
+                                if this.turn_started_at != Some(start) {
+                                    return false;
+                                }
+                                this.working_pulse = this.working_pulse.wrapping_add(1);
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !alive {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            (false, Some(_)) => self.turn_started_at = None,
+            _ => {}
+        }
         div()
             .key_context("App")
             .flex()
@@ -523,27 +561,7 @@ impl Render for AppView {
                             .border_color(theme::border())
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(title)
-                            .when(running, |header| {
-                                header.child(
-                                    div()
-                                        .id("stop")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(rgb(0x7a2e2e))
-                                        .text_xs()
-                                        .text_color(gpui::white())
-                                        .hover(|s| s.bg(rgb(0x9a3a3a)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev, _window, cx| {
-                                                this.stop_thread(cx)
-                                            }),
-                                        )
-                                        .child("Stop"),
-                                )
-                            }),
+                            .child(title),
                     )
                     .child(self.render_timeline())
                     .child(self.render_composer()),

@@ -12,7 +12,7 @@
 
 use gpui::{
     ClipboardEntry, Context, Entity, EntityInputHandler, Focusable, KeystrokeEvent, MouseButton,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    SharedString, Subscription, Window, div, prelude::*, px, rgb,
 };
 
 use crate::AppView;
@@ -776,6 +776,13 @@ impl AppView {
     pub fn render_composer(&self) -> impl IntoElement {
         let state = &self.composer_state;
         let composer = self.composer.clone();
+        // While a turn runs, the send button becomes a stop square (web parity).
+        let running = self.state.selected_thread().is_some_and(|t| {
+            !matches!(
+                t.status.as_ref(),
+                "idle" | "completed" | "failed" | "stopped" | "interrupted"
+            )
+        });
 
         let mut root = div()
             .p_4()
@@ -862,9 +869,28 @@ impl AppView {
                     div()
                         .flex_1()
                         .text_sm()
+                        .text_color(theme::fg())
                         .child(composer.clone()),
                 )
-                .child(
+                .child(if running {
+                    div()
+                        .id("stop")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x7a2e2e))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .text_xs()
+                        .text_color(gpui::white())
+                        .hover(|s| s.bg(rgb(0x9a3a3a)))
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| this.stop_thread(cx));
+                        })
+                        .child("Stop")
+                } else {
                     div()
                         .id("send")
                         .px_3()
@@ -894,8 +920,8 @@ impl AppView {
                                 });
                             });
                         })
-                        .child("Send"),
-                ),
+                        .child("Send")
+                }),
         );
 
         root = root.child(card);

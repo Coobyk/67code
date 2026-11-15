@@ -806,7 +806,7 @@ impl AppView {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_sm()
-                    .child(div().flex_1().min_w_0().child(field)),
+                    .child(div().flex_1().min_w_0().text_color(theme::fg()).child(field)),
             );
         }
 

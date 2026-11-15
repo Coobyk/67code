@@ -276,6 +276,9 @@ impl AppView {
 
         if self.state.connection != ConnectionStatus::Mock {
             if self.thread_items.is_empty() {
+                if self.turn_started_at.is_some() {
+                    return list.child(self.render_working_row());
+                }
                 return list.child(
                     div()
                         .flex_1()
@@ -295,6 +298,9 @@ impl AppView {
                         .max_w_full()
                         .child(self.render_turn_item(i, item)),
                 );
+            }
+            if self.turn_started_at.is_some() {
+                list = list.child(self.render_working_row());
             }
             return list;
         }
@@ -335,6 +341,43 @@ impl AppView {
             list = list.child(div().id(("msg", i)).child(row));
         }
         list
+    }
+
+    /// Live "Working for Ns" footer row shown while a turn runs, matching the
+    /// web `WorkingTimelineRow`: muted tabular-nums elapsed text plus a small
+    /// pulsing dot driven by `working_pulse` (repainted every 500 ms).
+    fn render_working_row(&self) -> impl IntoElement {
+        let elapsed = self
+            .turn_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let label = if elapsed < 60 {
+            format!("{elapsed}s")
+        } else if elapsed < 3600 {
+            format!("{}m {:02}s", elapsed / 60, elapsed % 60)
+        } else {
+            format!("{}h {:02}m", elapsed / 3600, (elapsed % 3600) / 60)
+        };
+        let pulse = self.working_pulse % 2 == 0;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .child(
+                div()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(theme::primary())
+                    .opacity(if pulse { 1.0 } else { 0.3 }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .child(format!("Working for {label}")),
+            )
     }
 
     fn render_turn_item(&self, index: usize, item: &TurnItemView) -> AnyElement {
