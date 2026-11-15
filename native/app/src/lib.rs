@@ -108,6 +108,16 @@ impl AppView {
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
         theme::set_mode(client_config.theme_mode, system_dark);
+        // Follow OS appearance changes while the mode is System.
+        cx.observe_window_appearance(window, |this, window, cx| {
+            let system_dark = matches!(
+                window.appearance(),
+                gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+            );
+            theme::set_mode(this.client_config.theme_mode, system_dark);
+            cx.refresh_windows();
+        })
+        .detach();
 
         let composer = cx.new(|cx| TextField::new("Message the agent…", cx));
         composer.read(cx).focus_handle(cx).focus(window, cx);
@@ -286,7 +296,12 @@ impl AppView {
                 }
             }
             ShellEvent::Error(e) => {
-                self.state.connection = ConnectionStatus::Failed(e.into());
+                // A failed request/subscription (e.g. an RPC the server
+                // doesn't implement) must not downgrade a live connection —
+                // the toast already reports it.
+                if !matches!(self.state.connection, ConnectionStatus::Connected) {
+                    self.state.connection = ConnectionStatus::Failed(e.into());
+                }
             }
             ShellEvent::AuthAccessChange { value } => {
                 self.observe_auth_access(&value, cx);
