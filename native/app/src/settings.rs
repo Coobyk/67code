@@ -19,16 +19,26 @@ use crate::{AppView, ToggleSettings};
 /// Sections listed in the settings left nav.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Section {
+    Appearance,
     #[default]
     Connection,
+    Environments,
     Providers,
+    AcpSessions,
+    Clients,
+    ArchivedThreads,
     Shortcuts,
     About,
 }
 
 const SECTIONS: &[(Section, &str)] = &[
+    (Section::Appearance, "Appearance"),
     (Section::Connection, "Connection"),
+    (Section::Environments, "Environments"),
     (Section::Providers, "Providers"),
+    (Section::AcpSessions, "ACP Sessions"),
+    (Section::Clients, "Authorized Clients"),
+    (Section::ArchivedThreads, "Archived Threads"),
     (Section::Shortcuts, "Keyboard Shortcuts"),
     (Section::About, "About"),
 ];
@@ -386,13 +396,33 @@ impl AppView {
 
     fn render_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (heading, content) = match self.settings_state.section {
+            Section::Appearance => (
+                "Appearance",
+                self.render_appearance_section(cx).into_any_element(),
+            ),
             Section::Connection => (
                 "Connection",
                 self.render_connection_section(cx).into_any_element(),
             ),
+            Section::Environments => (
+                "Environments",
+                self.render_envs_section(cx).into_any_element(),
+            ),
             Section::Providers => (
                 "Providers",
                 self.render_providers_section(cx).into_any_element(),
+            ),
+            Section::AcpSessions => (
+                "ACP Sessions",
+                self.render_acp_section(cx).into_any_element(),
+            ),
+            Section::Clients => (
+                "Authorized Clients",
+                self.render_clients_section(cx).into_any_element(),
+            ),
+            Section::ArchivedThreads => (
+                "Archived Threads",
+                self.render_archived_section(cx).into_any_element(),
             ),
             Section::Shortcuts => (
                 "Keyboard Shortcuts",

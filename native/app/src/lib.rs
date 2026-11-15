@@ -1,4 +1,10 @@
+mod acp;
+mod appearance;
+mod archived;
+mod clients;
 mod composer;
+mod config;
+mod envs;
 mod markdown;
 mod model;
 pub mod net;
@@ -42,10 +48,21 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Env-driven config (standalone `c67-app` binary).
+    /// Env-driven config (standalone `c67-app` binary). Endpoint precedence:
+    /// C67_SERVER_URL+C67_TOKEN, then the active saved environment from the
+    /// client config, else the offline mock.
     pub fn from_env() -> Self {
+        let endpoint = net::ServerEndpoint::from_env().or_else(|| {
+            let cfg = config::ClientConfig::load();
+            cfg.active_environment
+                .and_then(|ix| cfg.environments.get(ix))
+                .map(|e| net::ServerEndpoint {
+                    http_url: e.http_url.clone(),
+                    token: e.token.clone(),
+                })
+        });
         Self {
-            endpoint: net::ServerEndpoint::from_env(),
+            endpoint,
             provider: std::env::var("C67_PROVIDER")
                 .unwrap_or_else(|_| "devReplay".to_string()),
             model: std::env::var("C67_MODEL").unwrap_or_else(|_| "showcase".to_string()),
@@ -68,12 +85,30 @@ struct AppView {
     palette_state: palette::State,
     settings_state: settings::State,
     notifications_state: notifications::State,
+    appearance_state: appearance::State,
+    archived_state: archived::State,
+    clients_state: clients::State,
+    acp_state: acp::State,
+    env_state: envs::State,
+    /// Persisted client config (theme mode, saved environments).
+    client_config: config::ClientConfig,
     /// Display-only label for the connected server (settings/connection UI).
     endpoint_label: String,
+    /// Live endpoint (url + token) for authenticated HTTP calls from
+    /// settings surfaces; env switching updates both this and endpoint_label.
+    active_endpoint: Option<net::ServerEndpoint>,
 }
 
 impl AppView {
     fn new(window: &mut Window, cx: &mut Context<Self>, config: &AppConfig) -> Self {
+        // Apply the persisted theme mode before first paint.
+        let client_config = config::ClientConfig::load();
+        let system_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        theme::set_mode(client_config.theme_mode, system_dark);
+
         let composer = cx.new(|cx| TextField::new("Message the agent…", cx));
         composer.read(cx).focus_handle(cx).focus(window, cx);
         cx.subscribe_in(
@@ -126,11 +161,18 @@ impl AppView {
             palette_state: palette::State::default(),
             settings_state: settings::State::default(),
             notifications_state: notifications::State::default(),
+            appearance_state: appearance::State::default(),
+            archived_state: archived::State::default(),
+            clients_state: clients::State::default(),
+            acp_state: acp::State::default(),
+            env_state: envs::State::default(),
+            client_config,
             endpoint_label: config
                 .endpoint
                 .as_ref()
                 .map(|e| e.http_url.clone())
                 .unwrap_or_else(|| "offline".to_string()),
+            active_endpoint: config.endpoint.clone(),
         }
     }
 
@@ -245,6 +287,9 @@ impl AppView {
             }
             ShellEvent::Error(e) => {
                 self.state.connection = ConnectionStatus::Failed(e.into());
+            }
+            ShellEvent::AuthAccessChange { value } => {
+                self.observe_auth_access(&value, cx);
             }
             ShellEvent::Disconnected(reason) => {
                 self.state.connection = ConnectionStatus::Disconnected(reason.into());
@@ -365,6 +410,26 @@ impl AppView {
             .read(cx)
             .focus_handle(cx)
             .focus(window, cx);
+    }
+
+    /// Send a request/response RPC (`{"tag": <tag>}`) and get a receiver that
+    /// resolves once with the `Exit` frame — `{"_tag":"Success","value":…}` or
+    /// a Failure object. None when offline.
+    fn send_query(
+        &self,
+        tag: &str,
+        payload: serde_json::Value,
+    ) -> Option<smol::channel::Receiver<serde_json::Value>> {
+        let (reply, rx) = smol::channel::bounded(1);
+        self.commands
+            .as_ref()?
+            .send(ClientCommand::Query {
+                tag: tag.to_string(),
+                payload,
+                reply,
+            })
+            .ok()?;
+        Some(rx)
     }
 
     fn dispatch(&mut self, command: serde_json::Value) {

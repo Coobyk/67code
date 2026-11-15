@@ -104,6 +104,9 @@ pub enum ShellEvent {
     /// Enrichment refresh: `resolvedRepositoryIdentityRoots` is present, so the
     /// snapshot carries project updates only — threads must be preserved.
     ProjectsRefreshed { projects: Vec<ShellProject> },
+    /// Raw auth-access stream value (`{type:"clientUpserted"|"clientRemoved"|
+    /// "snapshot"|…, payload}`); the clients surface folds these into state.
+    AuthAccessChange { value: Value },
     Error(String),
     Disconnected(String),
 }
@@ -112,11 +115,23 @@ pub enum ShellEvent {
 pub enum ClientCommand {
     SubscribeShell,
     GetOlderSettled,
+    /// `subscribeAuthAccess` stream — authorized clients + pairing links.
+    /// Chunk values arrive as ShellEvent::AuthAccessChange.
+    SubscribeAuthAccess,
     SubscribeThread { thread_id: String },
     /// A raw `OrchestrationV2Command` JSON payload.
     Dispatch { command: Value },
+    /// Request/response RPC (`{"_tag":"Request","tag":<tag>}`); the reply
+    /// sender resolves once with the `Exit` frame's value or an error object.
+    Query {
+        tag: String,
+        payload: Value,
+        reply: smol::channel::Sender<Value>,
+    },
     /// Drop the current socket (or pending backoff) and reconnect now.
     Reconnect,
+    /// Point the connection loop at a different server (environment switch).
+    SwitchEndpoint { http_url: String, token: String },
     #[allow(dead_code)]
     Interrupt { request_id: u64 },
 }
@@ -345,7 +360,7 @@ fn mint_ticket(endpoint: &ServerEndpoint) -> Result<String, String> {
 /// events on `events`. Runs on a dedicated thread; `commands` carries outbound
 /// RPC requests. Reconnects with exponential backoff until the app exits.
 pub fn run(
-    endpoint: ServerEndpoint,
+    mut endpoint: ServerEndpoint,
     events: Sender<ShellEvent>,
     commands: std::sync::mpsc::Receiver<ClientCommand>,
 ) {
@@ -353,7 +368,7 @@ pub fn run(
     // Commands issued while disconnected queue here for the next session.
     let mut deferred: std::collections::VecDeque<ClientCommand> = Default::default();
     loop {
-        match run_inner(endpoint.clone(), events.clone(), &commands, &mut deferred) {
+        match run_inner(&mut endpoint, events.clone(), &commands, &mut deferred) {
             Err((connected, e)) => {
                 let _ = events.send_blocking(ShellEvent::Disconnected(e));
                 // After a healthy session retry soon; a refused reconnect backs off.
@@ -362,14 +377,19 @@ pub fn run(
                 } else {
                     (backoff * 2).min(Duration::from_secs(15))
                 };
-                // Wait out the backoff, but a manual Reconnect retries now;
-                // other commands issued during downtime ride the next session.
+                // Wait out the backoff, but a manual Reconnect retries now and
+                // SwitchEndpoint swaps target immediately; other commands
+                // issued during downtime ride the next session.
                 let deadline = std::time::Instant::now() + backoff;
                 while std::time::Instant::now() < deadline {
                     let mut wake = false;
                     while let Ok(cmd) = commands.try_recv() {
                         match cmd {
                             ClientCommand::Reconnect => wake = true,
+                            ClientCommand::SwitchEndpoint { http_url, token } => {
+                                endpoint = ServerEndpoint { http_url, token };
+                                wake = true;
+                            }
                             other => deferred.push_back(other),
                         }
                     }
@@ -386,14 +406,14 @@ pub fn run(
 
 /// Returns `Err((was_connected, error))` on disconnect. `deferred` carries
 /// commands issued during downtime; they are sent right after the session
-/// subscriptions.
+/// subscriptions. `endpoint` may be swapped mid-loop by SwitchEndpoint.
 fn run_inner(
-    endpoint: ServerEndpoint,
+    endpoint: &mut ServerEndpoint,
     events: Sender<ShellEvent>,
     commands: &std::sync::mpsc::Receiver<ClientCommand>,
     deferred: &mut std::collections::VecDeque<ClientCommand>,
 ) -> Result<(), (bool, String)> {
-    let ticket = mint_ticket(&endpoint).map_err(|e| (false, e))?;
+    let ticket = mint_ticket(endpoint).map_err(|e| (false, e))?;
     let ws_url = format!("{}/ws?wsTicket={ticket}&frameParts=1&orchestrationProtocol=2", endpoint.ws_url());
 
     let (mut socket, _response) = tungstenite::connect(&ws_url)
@@ -409,26 +429,71 @@ fn run_inner(
     let mut next_id: u64 = 1;
     let mut subscriptions: std::collections::HashMap<u64, SubKind> =
         std::collections::HashMap::new();
-    let mut pending_commands: std::collections::VecDeque<ClientCommand> =
-        [ClientCommand::SubscribeShell, ClientCommand::GetOlderSettled].into();
+    let mut queries: std::collections::HashMap<u64, smol::channel::Sender<Value>> =
+        std::collections::HashMap::new();
+    let mut pending_commands: std::collections::VecDeque<ClientCommand> = [
+        ClientCommand::SubscribeShell,
+        ClientCommand::GetOlderSettled,
+        ClientCommand::SubscribeAuthAccess,
+    ]
+    .into();
     pending_commands.append(deferred);
     let mut pending = String::new();
 
     loop {
-        if let Some(command) = pending_commands.pop_front() {
-            if matches!(command, ClientCommand::Reconnect) {
-                return Err(fail("reconnect requested".into()));
+        let mut send_one = |socket: &mut _,
+                            subscriptions: &mut _,
+                            queries: &mut std::collections::HashMap<
+                                u64,
+                                smol::channel::Sender<Value>,
+                            >,
+                            id: u64,
+                            command: &ClientCommand|
+         -> Result<Option<String>, tungstenite::Error> {
+            match command {
+                ClientCommand::Reconnect => return Ok(Some("reconnect requested".into())),
+                ClientCommand::SwitchEndpoint { http_url, token } => {
+                    *endpoint = ServerEndpoint {
+                        http_url: http_url.clone(),
+                        token: token.clone(),
+                    };
+                    return Ok(Some("switching environment".into()));
+                }
+                ClientCommand::Query { reply, .. } => {
+                    queries.insert(id, reply.clone());
+                }
+                _ => {}
             }
-            send_command(&mut socket, &mut subscriptions, next_id, &command)
-                .map_err(|e| fail(format!("send failed: {e}")))?;
+            send_command(socket, subscriptions, id, command)?;
+            Ok(None)
+        };
+
+        if let Some(command) = pending_commands.pop_front() {
+            if let Some(reason) = send_one(
+                &mut socket,
+                &mut subscriptions,
+                &mut queries,
+                next_id,
+                &command,
+            )
+            .map_err(|e| fail(format!("send failed: {e}")))?
+            {
+                return Err(fail(reason));
+            }
             next_id += 1;
         }
         while let Ok(command) = commands.try_recv() {
-            if matches!(command, ClientCommand::Reconnect) {
-                return Err(fail("reconnect requested".into()));
+            if let Some(reason) = send_one(
+                &mut socket,
+                &mut subscriptions,
+                &mut queries,
+                next_id,
+                &command,
+            )
+            .map_err(|e| fail(format!("send failed: {e}")))?
+            {
+                return Err(fail(reason));
             }
-            send_command(&mut socket, &mut subscriptions, next_id, &command)
-                .map_err(|e| fail(format!("send failed: {e}")))?;
             next_id += 1;
         }
 
@@ -445,9 +510,13 @@ fn run_inner(
                         pending.push_str(&text);
                         std::mem::take(&mut pending)
                     };
-                    if let Err(e) =
-                        handle_frame(&whole, &mut socket, &events, &mut subscriptions)
-                    {
+                    if let Err(e) = handle_frame(
+                        &whole,
+                        &mut socket,
+                        &events,
+                        &mut subscriptions,
+                        &mut queries,
+                    ) {
                         eprintln!("[frame] dropped: {e}");
                     }
                 }
@@ -474,6 +543,7 @@ enum SubKind {
     Shell,
     Thread,
     OlderSettled,
+    AuthAccess,
 }
 
 fn send_command(
@@ -485,6 +555,9 @@ fn send_command(
     match command {
         ClientCommand::SubscribeShell => {
             subscriptions.insert(id, SubKind::Shell);
+        }
+        ClientCommand::SubscribeAuthAccess => {
+            subscriptions.insert(id, SubKind::AuthAccess);
         }
         ClientCommand::GetOlderSettled => {
             subscriptions.insert(id, SubKind::OlderSettled);
@@ -526,6 +599,13 @@ fn send_command(
             },
             "headers": [],
         }),
+        ClientCommand::SubscribeAuthAccess => json!({
+            "_tag": "Request",
+            "id": id,
+            "tag": "subscribeAuthAccess",
+            "payload": {},
+            "headers": [],
+        }),
         ClientCommand::SubscribeThread { thread_id } => json!({
             "_tag": "Request",
             "id": id,
@@ -540,8 +620,17 @@ fn send_command(
             "payload": command,
             "headers": [],
         }),
-        // Filtered out before send_command — it never produces a frame.
-        ClientCommand::Reconnect => unreachable!("Reconnect is handled in the run loop"),
+        ClientCommand::Query { tag, payload, .. } => json!({
+            "_tag": "Request",
+            "id": id,
+            "tag": tag,
+            "payload": payload,
+            "headers": [],
+        }),
+        // Handled in the run loop — they never produce a frame.
+        ClientCommand::Reconnect | ClientCommand::SwitchEndpoint { .. } => {
+            unreachable!("control commands are handled in the run loop")
+        },
         ClientCommand::Interrupt { request_id } => json!({
             "_tag": "Interrupt",
             "requestId": request_id,
@@ -558,6 +647,7 @@ fn handle_frame(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     events: &Sender<ShellEvent>,
     subscriptions: &mut std::collections::HashMap<u64, SubKind>,
+    queries: &mut std::collections::HashMap<u64, smol::channel::Sender<Value>>,
 ) -> Result<(), String> {
     let frames: Vec<Value> = serde_json::from_str::<Value>(text)
         .map(|v| if v.is_array() { vec![v] } else { vec![v] })
@@ -587,12 +677,20 @@ fn handle_frame(
                         .into(),
                 ));
                 let is_thread = matches!(subscriptions.get(&request_id), Some(SubKind::Thread));
+                let is_auth_access =
+                    matches!(subscriptions.get(&request_id), Some(SubKind::AuthAccess));
                 if std::env::var("C67_DEBUG").is_ok() {
                     eprintln!("[chunk] req={request_id} is_thread={is_thread} kinds={:?}",
                         frame["values"].as_array().map(|a| a.iter().map(|v| v["kind"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>()));
                 }
                 if let Some(values) = frame["values"].as_array() {
                     for value in values {
+                        if is_auth_access {
+                            let _ = events.send_blocking(ShellEvent::AuthAccessChange {
+                                value: value.clone(),
+                            });
+                            continue;
+                        }
                         let parsed = if is_thread {
                             if std::env::var("C67_DEBUG").is_ok()
                                 && value["kind"].as_str() == Some("event")
@@ -613,6 +711,10 @@ fn handle_frame(
             }
             Some("Exit") => {
                 let request_id = frame["requestId"].as_u64();
+                if let Some(reply) = request_id.and_then(|rid| queries.remove(&rid)) {
+                    let _ = reply.send_blocking(frame["exit"].clone());
+                    continue;
+                }
                 let kind = request_id.and_then(|rid| subscriptions.remove(&rid));
                 if frame["exit"]["_tag"].as_str() == Some("Success")
                     && matches!(kind, Some(SubKind::OlderSettled))
