@@ -14,8 +14,66 @@ pub fn now_iso() -> String {
     OffsetDateTime::now_utc().format(ISO_FORMAT).unwrap()
 }
 
+/// `now + secs` in the same ISO format (session/pairing expiry).
+pub fn iso_in_seconds(secs: i64) -> String {
+    (OffsetDateTime::now_utc() + time::Duration::seconds(secs))
+        .format(ISO_FORMAT)
+        .unwrap()
+}
+
+pub fn unix_to_iso(secs: i64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(ISO_FORMAT).ok())
+}
+
+/// Unix epoch value of ambiguous scale: `>= 1e12` is treated as milliseconds,
+/// otherwise seconds. Strings are passed through when already ISO-shaped.
+pub fn epochish_to_iso(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => {
+            let raw = n.as_i64()?;
+            if raw.abs() >= 1_000_000_000_000 {
+                OffsetDateTime::from_unix_timestamp_nanos(raw as i128 * 1_000_000)
+                    .ok()
+                    .and_then(|dt| dt.format(ISO_FORMAT).ok())
+            } else {
+                unix_to_iso(raw)
+            }
+        }
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// JS `encodeURIComponent` percent-encoding (UTF-8 bytes, uppercase hex).
+pub fn uri_component(s: &str) -> String {
+    const UNRESERVED: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if UNRESERVED.contains(b) {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// `IdAllocator.deriveThreadFromProviderThread`: the deterministic thread id
+/// an imported native ACP session maps to.
+pub fn imported_acp_thread_id(driver: &str, instance_id: &str, session_id: &str) -> String {
+    format!(
+        "thread:provider:{}:provider-instance:{}:native-thread:{}",
+        uri_component(driver),
+        uri_component(instance_id),
+        uri_component(session_id)
+    )
 }
 
 pub const PROJECTION_SCHEMA_VERSION: i64 = 2;
@@ -523,12 +581,11 @@ pub fn app_thread_from_create(cmd: &Value, now: &str) -> Value {
     let thread_id = cmd.get("threadId").and_then(Value::as_str).unwrap_or("");
     let lineage = cmd.get("lineage").cloned().unwrap_or_else(|| {
         json!({
-            "parentThreadId": null,
-            "relationshipToParent": null,
+            "parentThreadId": null,            "relationshipToParent": null,
             "rootThreadId": thread_id,
         })
     });
-    json!({
+    let mut app = json!({
         "createdBy": cmd.get("createdBy").cloned().unwrap_or(json!("user")),
         "creationSource": cmd.get("creationSource").cloned().unwrap_or(json!("web")),
         "id": thread_id,
@@ -554,5 +611,11 @@ pub fn app_thread_from_create(cmd: &Value, now: &str) -> Value {
         "settledAt": null,
         "lastVisitedAt": null,
         "deletedAt": null,
-    })
+    });
+    // Imported native ACP session ref (server.importAcpRegistrySession): keeps
+    // the native session id on the thread payload so resume is possible later.
+    if let Some(v) = cmd.get("importedNativeThread") {
+        app["importedNativeThread"] = v.clone();
+    }
+    app
 }

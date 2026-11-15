@@ -110,6 +110,20 @@ enum StoreCmd {
         default_model_selection: Option<Value>,
         reply: Reply<()>,
     },
+    ArchivedShellSnapshot(Reply<Value>),
+    AcpImportedThreadId {
+        instance_id: String,
+        project_id: String,
+        session_id: String,
+        reply: Reply<Option<String>>,
+    },
+    RecordAcpImport {
+        instance_id: String,
+        project_id: String,
+        session_id: String,
+        thread_id: String,
+        reply: Reply<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -286,6 +300,51 @@ impl StoreHandle {
             title: title.into(),
             workspace_root: workspace_root.into(),
             default_model_selection,
+            reply: tx,
+        });
+        let _ = rx.await;
+    }
+
+    /// `{schemaVersion, snapshotSequence, projects, threads}` where threads are
+    /// archived (not deleted) — `OrchestrationV2ArchivedShellSnapshot`.
+    pub async fn archived_shell_snapshot(&self) -> Value {
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCmd::ArchivedShellSnapshot(tx));
+        rx.await.unwrap_or_else(|_| json!({}))
+    }
+
+    /// The T3 thread id an imported native ACP session maps to, when one was
+    /// already imported (mapping row or deterministic derived id).
+    pub async fn acp_imported_thread_id(
+        &self,
+        instance_id: &str,
+        project_id: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCmd::AcpImportedThreadId {
+            instance_id: instance_id.into(),
+            project_id: project_id.into(),
+            session_id: session_id.into(),
+            reply: tx,
+        });
+        rx.await.ok().flatten()
+    }
+
+    /// Record an `instanceId/projectId/sessionId → threadId` import mapping.
+    pub async fn record_acp_import(
+        &self,
+        instance_id: &str,
+        project_id: &str,
+        session_id: &str,
+        thread_id: &str,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCmd::RecordAcpImport {
+            instance_id: instance_id.into(),
+            project_id: project_id.into(),
+            session_id: session_id.into(),
+            thread_id: thread_id.into(),
             reply: tx,
         });
         let _ = rx.await;
@@ -613,6 +672,16 @@ CREATE TABLE IF NOT EXISTS orchestration_v2_projection_context_transfers (
   source_provider_instance_id TEXT,
   target_provider_instance_id TEXT
 );
+
+-- Native ACP session imports (`server.importAcpRegistrySession`).
+CREATE TABLE IF NOT EXISTS acp_imported_sessions (
+  instance_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (instance_id, project_id, session_id)
+);
 "#;
 
 // ---------------------------------------------------------------------------
@@ -711,6 +780,37 @@ fn actor_loop(conn: Connection, rx: std_mpsc::Receiver<StoreCmd>) {
                 reply,
             } => {
                 seed_project(&conn, &id, &title, &workspace_root, default_model_selection);
+                let _ = reply.send(());
+            }
+            StoreCmd::ArchivedShellSnapshot(reply) => {
+                let _ = reply.send(archived_shell_snapshot(&conn));
+            }
+            StoreCmd::AcpImportedThreadId {
+                instance_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let _ = reply.send(acp_imported_thread_id(
+                    &conn,
+                    &instance_id,
+                    &project_id,
+                    &session_id,
+                ));
+            }
+            StoreCmd::RecordAcpImport {
+                instance_id,
+                project_id,
+                session_id,
+                thread_id,
+                reply,
+            } => {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO acp_imported_sessions (
+                       instance_id, project_id, session_id, thread_id, created_at
+                     ) VALUES (?1,?2,?3,?4,?5)",
+                    params![instance_id, project_id, session_id, thread_id, domain::now_iso()],
+                );
                 let _ = reply.send(());
             }
         }
@@ -1111,6 +1211,70 @@ fn shell_snapshot(conn: &Connection, omit_idle_subagents: bool, omit_older_settl
     snap.insert("threads".into(), Value::Array(threads));
     snap.insert("archivedThreads".into(), Value::Array(archived));
     Value::Object(snap)
+}
+
+/// `OrchestrationV2ArchivedShellSnapshot`: same shell payload shape as the
+/// subscribeShell snapshot, restricted to archived (not deleted) threads, with
+/// all live projects.
+fn archived_shell_snapshot(conn: &Connection) -> Value {
+    let snapshot_sequence = latest_sequence(conn);
+    let projects = list_projects(conn);
+    let app_rows: Vec<Value> = column_json(
+        conn,
+        "SELECT payload_json FROM orchestration_v2_projection_threads \
+         WHERE deleted_at IS NULL AND archived_at IS NOT NULL \
+         ORDER BY updated_at ASC, thread_id ASC",
+        &[],
+    );
+    let threads: Vec<Value> = app_rows
+        .iter()
+        .map(|app| thread_shell_from_app(conn, app))
+        .collect();
+    json!({
+        "schemaVersion": domain::PROJECTION_SCHEMA_VERSION,
+        "snapshotSequence": snapshot_sequence,
+        "projects": projects,
+        "threads": threads,
+    })
+}
+
+/// Thread exists and is not deleted.
+fn live_thread_exists(conn: &Connection, thread_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM orchestration_v2_projection_threads \
+         WHERE thread_id = ?1 AND deleted_at IS NULL",
+        params![thread_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Resolve `importedThreadId` for a native ACP session: the recorded mapping
+/// when its thread is still live, else the deterministic derived thread id if
+/// a thread happens to exist there (imported before the mapping table).
+fn acp_imported_thread_id(
+    conn: &Connection,
+    instance_id: &str,
+    _project_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    let mapped: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM acp_imported_sessions \
+             WHERE instance_id = ?1 AND project_id = ?2 AND session_id = ?3",
+            params![instance_id, _project_id, session_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(tid) = mapped {
+        return live_thread_exists(conn, &tid).then_some(tid);
+    }
+    let derived = domain::imported_acp_thread_id(
+        provider_driver(instance_id),
+        instance_id,
+        session_id,
+    );
+    live_thread_exists(conn, &derived).then_some(derived)
 }
 
 fn is_live_subagent_shell(shell: &Value) -> bool {

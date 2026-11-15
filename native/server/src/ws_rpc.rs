@@ -13,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers;
 use crate::store::WINDOW_SIZE;
@@ -35,17 +36,17 @@ pub async fn ws_upgrade(
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let ticket_ok = params
+    let grant = params
         .ws_ticket
         .as_deref()
-        .is_some_and(|t| state.tickets.take(t));
-    if !ticket_ok {
+        .and_then(|t| state.tickets.take(t));
+    let Some(grant) = grant else {
         return axum::http::Response::builder()
             .status(axum::http::StatusCode::UNAUTHORIZED)
             .body(axum::body::Body::empty())
             .unwrap()
             .into_response();
-    }
+    };
     if params.orchestration_protocol.as_deref() != Some("2") {
         return axum::http::Response::builder()
             .status(axum::http::StatusCode::BAD_REQUEST)
@@ -53,7 +54,7 @@ pub async fn ws_upgrade(
             .unwrap()
             .into_response();
     }
-    ws.on_upgrade(move |socket| connection(state, socket))
+    ws.on_upgrade(move |socket| connection(state, socket, grant))
         .into_response()
 }
 
@@ -176,10 +177,16 @@ pub fn exit_failure(request_id: u64, error: Value) -> Value {
     })
 }
 
-async fn connection(state: Arc<AppState>, socket: WebSocket) {
+async fn connection(state: Arc<AppState>, socket: WebSocket, grant: crate::auth::TicketGrant) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let out: OutTx = out_tx;
+
+    // Client session for the auth-access surface: one per connection, removed
+    // on disconnect or revoked via `/api/auth/clients/revoke{,-others}`.
+    let close = CancellationToken::new();
+    let session_id: Arc<str> =
+        Arc::from(state.auth_access.register_session(&grant, close.clone()));
 
     let writer = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
@@ -199,12 +206,13 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     Message::Text(text) => {
-                        handle_text(&state, &out, &windows, text.as_str());
+                        handle_text(&state, &out, &windows, text.as_str(), &session_id);
                     }
                     Message::Close(_) => break,
                     _ => {}
                 }
             }
+            _ = close.cancelled() => break,
             _ = next_live_poll.tick() => {
                 // Idle loop tick; windows and producers are event-driven, but a
                 // periodic sweep keeps `Ack` accounting responsive after races.
@@ -217,6 +225,7 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) {
     }
     drop(out);
     let _ = writer.await;
+    state.auth_access.remove_session(&session_id);
 }
 
 fn handle_text(
@@ -224,6 +233,7 @@ fn handle_text(
     out: &OutTx,
     windows: &Arc<Mutex<HashMap<u64, Arc<Window>>>>,
     text: &str,
+    session_id: &Arc<str>,
 ) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -252,9 +262,18 @@ fn handle_text(
                     let st = state.clone();
                     let out2 = out.clone();
                     let wins = windows.clone();
+                    let sid = session_id.clone();
                     tokio::spawn(async move {
-                        handlers::run_stream(st, out2.clone(), id, &tag, payload, window.clone())
-                            .await;
+                        handlers::run_stream(
+                            st,
+                            out2.clone(),
+                            id,
+                            &tag,
+                            payload,
+                            window.clone(),
+                            sid,
+                        )
+                        .await;
                         wins.lock().unwrap().remove(&id);
                     });
                 } else {

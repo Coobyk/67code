@@ -24,6 +24,8 @@ pub struct AppState {
     /// Dev auth token; when `None`, any bearer token is accepted.
     pub auth_token: Option<String>,
     pub tickets: auth::TicketStore,
+    /// Live client sessions + pairing links for the auth-access surface.
+    pub auth_access: auth::AuthAccess,
     pub store: StoreHandle,
     /// Broadcast of committed domain events (sequences assigned at commit).
     pub events_tx: broadcast::Sender<CommittedEvent>,
@@ -38,6 +40,8 @@ pub struct AppState {
     /// runtime request id; the sender delivers the decision to the
     /// provider task that is blocked on `session/request_permission`.
     pub pending_requests: PendingRequestRegistry,
+    /// Address the listener binds — fallback host for pairing URLs.
+    pub listen_addr: SocketAddr,
 }
 
 /// The sender delivers the orchestration decision string ("accept",
@@ -136,6 +140,7 @@ pub async fn run(
     let state = std::sync::Arc::new(AppState {
         auth_token: config.auth_token,
         tickets: auth::TicketStore::new(),
+        auth_access: auth::AuthAccess::new(),
         store,
         events_tx,
         turns: StdMutex::new(HashMap::new()),
@@ -143,6 +148,7 @@ pub async fn run(
         home_dir: config.home_dir,
         replay_dir,
         project_dir: config.project_dir,
+        listen_addr: config.bind_addr,
     });
 
     // Guarantee at least one project so clients have somewhere to create threads.
@@ -151,6 +157,16 @@ pub async fn run(
     let app = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/auth/websocket-ticket/rpc", post(auth::issue_ticket))
+        .route("/api/auth/pairing-token", post(auth::create_pairing_token))
+        .route(
+            "/api/auth/pairing-links/revoke",
+            post(auth::revoke_pairing_link),
+        )
+        .route("/api/auth/clients/revoke", post(auth::revoke_client))
+        .route(
+            "/api/auth/clients/revoke-others",
+            post(auth::revoke_other_clients),
+        )
         .route("/ws", get(ws_rpc::ws_upgrade))
         .with_state(state);
 

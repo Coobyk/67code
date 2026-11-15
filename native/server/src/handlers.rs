@@ -20,6 +20,7 @@ pub fn is_windowed_tag(tag: &str) -> bool {
         "orchestration.subscribeShell"
             | "orchestration.subscribeThread"
             | "orchestration.subscribeServerConfig"
+            | "subscribeAuthAccess"
     )
 }
 
@@ -72,6 +73,20 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
             "_tag": "OrchestrationV2GetTurnItemError",
             "message": "not implemented",
         })),
+        "orchestration.getArchivedShellSnapshot" => {
+            RpcResult::ok(state.store.archived_shell_snapshot().await)
+        }
+        "server.listAcpRegistrySessions" => list_acp_sessions(state, payload).await,
+        "server.importAcpRegistrySession" => import_acp_session(state, payload).await,
+        "server.deleteAcpRegistrySession" => delete_acp_session(state, payload).await,
+        "server.logoutAcpRegistry" => RpcResult::ok(json!({ "loggedOut": true })),
+        "server.listAcpRegistryProviders" => RpcResult::ok(json!({ "providers": [] })),
+        "server.setAcpRegistryProvider" | "server.disableAcpRegistryProvider" => {
+            RpcResult::err(acp_op_error(
+                "provider_configuration_failed",
+                "ACP provider configuration is not supported by this driver.",
+            ))
+        }
         other => RpcResult::err(json!({
             "_tag": "RpcClientError",
             "message": format!("unknown rpc tag: {other}"),
@@ -111,22 +126,29 @@ async fn dispatch_command(state: Arc<AppState>, payload: Value) -> RpcResult {
             let _ = tx.send(decision.to_string());
         }
     }
-    let result = state.store.apply_command(payload).await;
-    match result {
+    match apply_and_publish(&state, payload).await {
         Err(e) => RpcResult::err(json!({
             "_tag": "OrchestrationV2DispatchError",
             "message": e,
         })),
-        Ok(applied) => {
-            for ev in &applied.events {
-                let _ = state.events_tx.send(ev.clone());
-            }
-            if let Some(ctx) = applied.run_ctx {
-                provider::spawn_turn(state, ctx);
-            }
-            RpcResult::ok(json!({ "sequence": applied.sequence }))
-        }
+        Ok(applied) => RpcResult::ok(json!({ "sequence": applied.sequence })),
     }
+}
+
+/// Apply a command, broadcast the committed events to subscribers, and spawn
+/// the provider turn the command produced (if any).
+async fn apply_and_publish(
+    state: &Arc<AppState>,
+    command: Value,
+) -> Result<crate::store::ApplyResult, String> {
+    let mut applied = state.store.apply_command(command).await?;
+    for ev in &applied.events {
+        let _ = state.events_tx.send(ev.clone());
+    }
+    if let Some(ctx) = applied.run_ctx.take() {
+        provider::spawn_turn(state.clone(), ctx);
+    }
+    Ok(applied)
 }
 
 /// `ServerConfig` snapshot — enough surface for the native client's model
@@ -186,6 +208,7 @@ pub async fn run_stream(
     tag: &str,
     payload: Value,
     window: Arc<Window>,
+    session_id: Arc<str>,
 ) {
     match tag {
         "orchestration.subscribeShell" => {
@@ -193,6 +216,9 @@ pub async fn run_stream(
         }
         "orchestration.subscribeThread" => {
             thread_stream(state, out, request_id, payload, window).await;
+        }
+        "subscribeAuthAccess" => {
+            auth_access_stream(state, out, request_id, window, session_id).await;
         }
         "orchestration.subscribeServerConfig" => {
             let config = server_config_snapshot(&state);
@@ -554,4 +580,346 @@ pub fn obj(fields: &[(&str, Value)]) -> Value {
         m.insert((*k).to_string(), v.clone());
     }
     Value::Object(m)
+}
+
+// ---------------------------------------------------------------------------
+// subscribeAuthAccess
+// ---------------------------------------------------------------------------
+
+/// `subscribeAuthAccess` stream: first chunk is the
+/// `AuthAccessStreamSnapshotEvent`, then `AuthAccessStreamEvent` changes as
+/// client sessions and pairing links come and go. The stream stays open until
+/// the socket drops or the client interrupts it.
+async fn auth_access_stream(
+    state: Arc<AppState>,
+    out: OutTx,
+    request_id: u64,
+    window: Arc<Window>,
+    session_id: Arc<str>,
+) {
+    use crate::auth::{AuthAccess, AuthAccessChange};
+
+    // Subscribe before snapshotting so changes after the snapshot cannot be
+    // missed.
+    let mut rx = state.auth_access.changes.subscribe();
+    let (links, sessions) = {
+        let links = state
+            .auth_access
+            .pairing_links
+            .lock()
+            .unwrap()
+            .values()
+            .map(AuthAccess::pairing_link_wire)
+            .collect::<Vec<Value>>();
+        let sessions = state
+            .auth_access
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| AuthAccess::session_wire(s, &session_id))
+            .collect::<Vec<Value>>();
+        (links, sessions)
+    };
+    let snapshot = json!({
+        "version": 1,
+        "revision": 1,
+        "type": "snapshot",
+        "payload": { "pairingLinks": links, "clientSessions": sessions },
+    });
+    if !window.send_chunk(&out, request_id, vec![snapshot]).await {
+        return;
+    }
+
+    let mut revision = 1u64;
+    loop {
+        let change = match rx.recv().await {
+            Ok(c) => c,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        if window.is_cancelled() {
+            return;
+        }
+        revision += 1;
+        let event = match change {
+            AuthAccessChange::ClientUpserted(session) => json!({
+                "version": 1,
+                "revision": revision,
+                "type": "clientUpserted",
+                "payload": AuthAccess::session_wire(&session, &session_id),
+            }),
+            AuthAccessChange::ClientRemoved { session_id: id } => json!({
+                "version": 1,
+                "revision": revision,
+                "type": "clientRemoved",
+                "payload": { "sessionId": id },
+            }),
+            AuthAccessChange::PairingLinkUpserted(link) => json!({
+                "version": 1,
+                "revision": revision,
+                "type": "pairingLinkUpserted",
+                "payload": AuthAccess::pairing_link_wire(&link),
+            }),
+            AuthAccessChange::PairingLinkRemoved { id } => json!({
+                "version": 1,
+                "revision": revision,
+                "type": "pairingLinkRemoved",
+                "payload": { "id": id },
+            }),
+        };
+        if !window.send_chunk(&out, request_id, vec![event]).await {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ACP registry (`server.*AcpRegistry*`)
+// ---------------------------------------------------------------------------
+
+fn acp_op_error(reason: &str, message: impl Into<String>) -> Value {
+    json!({
+        "_tag": "AcpRegistryOperationError",
+        "reason": reason,
+        "message": message.into(),
+    })
+}
+
+/// Resolve the payload's instanceId to a supported driver ("devin" for now).
+fn acp_driver(payload: &Value) -> Result<&'static str, Value> {
+    let instance_id = payload.get("instanceId").and_then(Value::as_str).unwrap_or("");
+    match instance_id {
+        "devin" | "devin-acp" => Ok("devin"),
+        other => Err(acp_op_error(
+            "instance_not_found",
+            format!("Provider instance {other} does not expose ACP session management."),
+        )),
+    }
+}
+
+/// The project's workspace root for a `projectId` payload field.
+async fn acp_project_root(state: &AppState, payload: &Value) -> Result<String, Value> {
+    let project_id = payload.get("projectId").and_then(Value::as_str).unwrap_or("");
+    match state.store.project_shell(project_id).await {
+        Some(project) => Ok(project
+            .get("workspaceRoot")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()),
+        None => Err(acp_op_error(
+            "project_not_found",
+            format!("Project {project_id} was not found."),
+        )),
+    }
+}
+
+fn empty_acp_session_list() -> Value {
+    json!({
+        "sessions": [],
+        "nextCursor": null,
+        "canLoad": false,
+        "canResume": false,
+        "canDelete": false,
+    })
+}
+
+/// `server.listAcpRegistrySessions`: `devin list --format json` in the project
+/// workspace. Driver failures return an empty "cannot" result, not an error.
+async fn list_acp_sessions(state: Arc<AppState>, payload: Value) -> RpcResult {
+    let instance_id = payload.get("instanceId").and_then(Value::as_str).unwrap_or("");
+    let project_id = payload.get("projectId").and_then(Value::as_str).unwrap_or("");
+    if let Err(e) = acp_driver(&payload) {
+        return RpcResult::err(e);
+    }
+    let workspace_root = match acp_project_root(&state, &payload).await {
+        Ok(r) => r,
+        Err(e) => return RpcResult::err(e),
+    };
+
+    let listed = tokio::process::Command::new("devin")
+        .args(["list", "--format", "json"])
+        .current_dir(&workspace_root)
+        .output()
+        .await;
+    let rows: Vec<Value> = match listed {
+        Ok(out) if out.status.success() => {
+            match serde_json::from_slice::<Vec<Value>>(&out.stdout) {
+                Ok(rows) => rows,
+                // Unparseable output is a driver failure, not an empty list.
+                Err(_) => return RpcResult::ok(empty_acp_session_list()),
+            }
+        }
+        _ => return RpcResult::ok(empty_acp_session_list()),
+    };
+
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let session_id = row
+            .get("id")
+            .or_else(|| row.get("sessionId"))
+            .or_else(|| row.get("session_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if session_id.is_empty() {
+            continue;
+        }
+        let cwd = row
+            .get("working_directory")
+            .or_else(|| row.get("workingDirectory"))
+            .or_else(|| row.get("cwd"))
+            .and_then(Value::as_str)
+            .unwrap_or(&workspace_root)
+            .to_string();
+        let updated_at = row
+            .get("last_activity_at")
+            .or_else(|| row.get("lastActivityAt"))
+            .or_else(|| row.get("updatedAt"))
+            .and_then(domain::epochish_to_iso)
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+        let title = row.get("title").cloned().unwrap_or(Value::Null);
+        let imported = state
+            .store
+            .acp_imported_thread_id(instance_id, project_id, &session_id)
+            .await
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+        sessions.push(json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "additionalDirectories": [],
+            "title": title,
+            "updatedAt": updated_at,
+            "importedThreadId": imported,
+        }));
+    }
+
+    RpcResult::ok(json!({
+        "sessions": sessions,
+        "nextCursor": null,
+        "canLoad": true,
+        "canResume": true,
+        "canDelete": true,
+    }))
+}
+
+/// `server.importAcpRegistrySession`: create a T3 thread for the native
+/// session (deterministic thread id) and record the mapping.
+async fn import_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
+    let driver = match acp_driver(&payload) {
+        Ok(d) => d,
+        Err(e) => return RpcResult::err(e),
+    };
+    let instance_id = payload.get("instanceId").and_then(Value::as_str).unwrap_or("");
+    let project_id = payload.get("projectId").and_then(Value::as_str).unwrap_or("");
+    let session_id = payload.get("sessionId").and_then(Value::as_str).unwrap_or("");
+    if session_id.is_empty() {
+        return RpcResult::err(acp_op_error(
+            "session_import_failed",
+            "server.importAcpRegistrySession missing sessionId",
+        ));
+    }
+    if let Err(e) = acp_project_root(&state, &payload).await {
+        return RpcResult::err(e);
+    }
+    if let Some(thread_id) = state
+        .store
+        .acp_imported_thread_id(instance_id, project_id, session_id)
+        .await
+    {
+        return RpcResult::ok(json!({ "threadId": thread_id, "imported": false }));
+    }
+
+    let thread_id = domain::imported_acp_thread_id(driver, instance_id, session_id);
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Devin session {session_id}"));
+    let command = json!({
+        "type": "thread.create",
+        "commandId": domain::new_id(),
+        "threadId": thread_id,
+        "projectId": project_id,
+        "title": title,
+        "modelSelection": { "instanceId": instance_id, "model": "swe-2-high" },
+        "runtimeMode": "approval-required",
+        "interactionMode": "default",
+        "createdBy": "user",
+        "creationSource": "web",
+        "providerInstanceId": instance_id,
+        "importedNativeThread": {
+            "ref": { "driver": driver, "nativeId": session_id, "strength": "strong" },
+        },
+    });
+    match apply_and_publish(&state, command).await {
+        Ok(_) => {
+            state
+                .store
+                .record_acp_import(instance_id, project_id, session_id, &thread_id)
+                .await;
+            RpcResult::ok(json!({ "threadId": thread_id, "imported": true }))
+        }
+        Err(e) => {
+            // A racing import may have committed the same thread id.
+            if let Some(existing) = state
+                .store
+                .acp_imported_thread_id(instance_id, project_id, session_id)
+                .await
+            {
+                return RpcResult::ok(json!({ "threadId": existing, "imported": false }));
+            }
+            RpcResult::err(acp_op_error(
+                "session_import_failed",
+                format!("Could not create a T3 thread for the ACP session: {e}"),
+            ))
+        }
+    }
+}
+
+/// `server.deleteAcpRegistrySession`: `devin rm --force <sessionId>` in the
+/// project workspace. Refuses while an imported T3 thread still references it.
+async fn delete_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
+    if let Err(e) = acp_driver(&payload) {
+        return RpcResult::err(e);
+    }
+    let instance_id = payload.get("instanceId").and_then(Value::as_str).unwrap_or("");
+    let project_id = payload.get("projectId").and_then(Value::as_str).unwrap_or("");
+    let session_id = payload.get("sessionId").and_then(Value::as_str).unwrap_or("");
+    let workspace_root = match acp_project_root(&state, &payload).await {
+        Ok(r) => r,
+        Err(e) => return RpcResult::err(e),
+    };
+    if state
+        .store
+        .acp_imported_thread_id(instance_id, project_id, session_id)
+        .await
+        .is_some()
+    {
+        return RpcResult::err(acp_op_error(
+            "session_delete_failed",
+            "Delete the imported T3 thread before deleting its native ACP session.",
+        ));
+    }
+    let removed = tokio::process::Command::new("devin")
+        .args(["rm", "--force", session_id])
+        .current_dir(&workspace_root)
+        .output()
+        .await;
+    match removed {
+        Ok(out) if out.status.success() => RpcResult::ok(json!({ "deleted": true })),
+        Ok(out) => RpcResult::err(acp_op_error(
+            "session_delete_failed",
+            format!(
+                "devin rm failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        )),
+        Err(e) => RpcResult::err(acp_op_error(
+            "session_delete_failed",
+            format!("devin rm failed to spawn: {e}"),
+        )),
+    }
 }
