@@ -993,9 +993,38 @@ impl AppView {
                     .py_2()
                     .border_t_1()
                     .border_color(theme::border())
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_text),
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_x_hidden()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(status_color)
+                            .child(status_text),
+                    )
+                    .child(
+                        div()
+                            .id("settings-gear")
+                            .px_1()
+                            .rounded_sm()
+                            .text_sm()
+                            .text_color(theme::fg_muted())
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _ev, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.settings_state.open = !this.settings_state.open;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("⚙"),
+                    ),
             );
 
         if self.sidebar_state.context_menu.is_some() {

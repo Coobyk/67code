@@ -576,6 +576,7 @@ pub fn run(config: AppConfig) {
         cx.bind_keys([
             KeyBinding::new("cmd-k", TogglePalette, Some("App")),
             KeyBinding::new("cmd-,", ToggleSettings, Some("App")),
+            KeyBinding::new("ctrl-,", ToggleSettings, Some("App")),
             KeyBinding::new("cmd-n", NewThread, Some("App")),
             KeyBinding::new("cmd-f", FocusSearch, Some("App")),
             KeyBinding::new("escape", CloseOverlay, Some("App")),
