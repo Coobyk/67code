@@ -460,6 +460,27 @@ impl AppView {
         }
     }
 
+    /// Push the composer's runtime/interaction mode picks onto the selected
+    /// thread so the next run uses them (web sends the same set commands).
+    pub(crate) fn set_thread_modes(&mut self) {
+        let Some(thread) = self.state.selected_thread() else {
+            return;
+        };
+        let thread_id = thread.id.to_string();
+        self.dispatch(serde_json::json!({
+            "type": "thread.runtime-mode.set",
+            "commandId": uuid::Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+            "runtimeMode": self.composer_state.runtime_mode.clone(),
+        }));
+        self.dispatch(serde_json::json!({
+            "type": "thread.interaction-mode.set",
+            "commandId": uuid::Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+            "interactionMode": self.composer_state.interaction_mode.clone(),
+        }));
+    }
+
     pub(crate) fn stop_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.state.selected_thread() else {
             return;

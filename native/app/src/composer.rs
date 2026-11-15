@@ -665,6 +665,7 @@ impl AppView {
                                     this.composer_state.interaction_mode =
                                         (*value).to_string();
                                     this.composer_state.picker = None;
+                                    this.set_thread_modes();
                                     cx.notify();
                                 });
                             }),
@@ -683,6 +684,7 @@ impl AppView {
                                 view.update(cx, |this, cx| {
                                     this.composer_state.runtime_mode = (*value).to_string();
                                     this.composer_state.picker = None;
+                                    this.set_thread_modes();
                                     cx.notify();
                                 });
                             }),

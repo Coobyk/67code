@@ -39,6 +39,8 @@ pub struct RunContext {
     pub provider_instance_id: String,
     pub workspace_root: String,
     pub dispatch_queued: bool,
+    pub runtime_mode: String,
+    pub interaction_mode: String,
 }
 
 pub struct ApplyResult {
@@ -2044,9 +2046,8 @@ fn apply_command(conn: &Connection, command: &Value) -> Result<ApplyResult, Stri
         "message.dispatch" => apply_message_dispatch(conn, command, &command_id),
         "thread.stop" => apply_thread_stop(conn, command, &command_id),
         "thread.archive" | "thread.unarchive" | "thread.delete" | "thread.pin"
-        | "thread.unpin" | "thread.metadata.update" => {
-            apply_thread_mutation(conn, command, &command_id)
-        }
+        | "thread.unpin" | "thread.metadata.update" | "thread.runtime-mode.set"
+        | "thread.interaction-mode.set" => apply_thread_mutation(conn, command, &command_id),
         "runtime-request.respond" => apply_runtime_respond(conn, command, &command_id),
         "project.create" => apply_project_create(conn, command, &command_id),
         other => Err(format!("unsupported command type: {other}")),
@@ -2110,6 +2111,18 @@ fn apply_thread_mutation(
                 payload["title"] = json!(t);
             }
             "thread.metadata-updated"
+        }
+        "thread.runtime-mode.set" => {
+            if let Some(m) = command.get("runtimeMode").and_then(Value::as_str) {
+                payload["runtimeMode"] = json!(m);
+            }
+            "thread.runtime-mode-updated"
+        }
+        "thread.interaction-mode.set" => {
+            if let Some(m) = command.get("interactionMode").and_then(Value::as_str) {
+                payload["interactionMode"] = json!(m);
+            }
+            "thread.interaction-mode-updated"
         }
         _ => return Err(format!("unsupported command type: {ty}")),
     };
@@ -2414,6 +2427,18 @@ fn apply_message_dispatch(
         .unwrap_or("")
         .to_string();
     let driver = provider_driver(&provider_instance_id);
+    let runtime_mode = command
+        .get("runtimeMode")
+        .and_then(Value::as_str)
+        .or_else(|| app.get("runtimeMode").and_then(Value::as_str))
+        .unwrap_or("full-access")
+        .to_string();
+    let interaction_mode = command
+        .get("interactionMode")
+        .and_then(Value::as_str)
+        .or_else(|| app.get("interactionMode").and_then(Value::as_str))
+        .unwrap_or("default")
+        .to_string();
 
     let run_ordinal: i64 = conn
         .query_row(
@@ -2629,6 +2654,8 @@ fn apply_message_dispatch(
             provider_instance_id,
             workspace_root,
             dispatch_queued,
+            runtime_mode,
+            interaction_mode,
         }),
     })
 }

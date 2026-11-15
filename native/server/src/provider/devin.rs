@@ -198,6 +198,14 @@ pub async fn run(
                     if session_id.is_empty() {
                         anyhow::bail!("session/new returned no sessionId: {msg}");
                     }
+                    if let Some(frame) = mode_set_frame(
+                        &session_id,
+                        msg.get("result").unwrap_or(&Value::Null),
+                        &ctx.runtime_mode,
+                        &ctx.interaction_mode,
+                    ) {
+                        writer.send(frame).await?;
+                    }
                     writer
                         .request(
                             3,
@@ -230,6 +238,11 @@ pub async fn run(
                     finished = true;
                     break;
                 }
+                4 => {
+                    if let Some(err) = msg.get("error") {
+                        tracing::warn!(%err, "devin session mode request failed");
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -251,6 +264,83 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Map the run's runtime/interaction modes onto the agent's session mode, per
+/// the `modes`/`configOptions` advertised in the `session/new` result.
+/// Prefers `session/set_config_option` (ACP v2); falls back to `session/set_mode`.
+fn mode_set_frame(
+    session_id: &str,
+    new_result: &Value,
+    runtime_mode: &str,
+    interaction_mode: &str,
+) -> Option<Value> {
+    let target = if interaction_mode == "plan" {
+        "plan"
+    } else {
+        match runtime_mode {
+            "full-access" => "bypass",
+            "auto" => "smart",
+            "auto-accept-edits" => "accept-edits",
+            // "approval-required" and unknown modes keep the session default.
+            _ => return None,
+        }
+    };
+
+    if let Some(opt) = new_result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|opts| {
+            opts.iter().find(|o| {
+                o.get("category").and_then(Value::as_str) == Some("mode")
+                    && o.get("type").and_then(Value::as_str).unwrap_or("select") == "select"
+            })
+        })
+    {
+        let config_id = opt.get("id").and_then(Value::as_str).unwrap_or("mode");
+        let offered = opt.get("options").and_then(Value::as_array).map(|list| {
+            list.iter()
+                .flat_map(|entry| {
+                    // Options may be flat values or `{group, options:[...]}` groups.
+                    if entry.get("options").is_some() {
+                        entry
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        vec![entry.clone()]
+                    }
+                })
+                .filter_map(|o| o.get("value").and_then(Value::as_str).map(str::to_owned))
+                .collect::<Vec<_>>()
+        });
+        if offered.is_some_and(|ids| !ids.iter().any(|v| v == target)) {
+            return None;
+        }
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/set_config_option",
+            "params": { "sessionId": session_id, "configId": config_id, "value": target },
+        }));
+    }
+
+    let available = new_result
+        .pointer("/modes/availableModes")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    if !available.contains(&target) {
+        return None;
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/set_mode",
+        "params": { "sessionId": session_id, "modeId": target },
+    }))
 }
 
 /// Emit approval_request events (same shape as the replay provider) and answer
@@ -305,7 +395,7 @@ async fn handle_permission(
     let request_id = domain::new_id();
     let node_id = domain::new_id();
     let now = domain::now_iso();
-    let node = json!({
+    let mut node = json!({
         "id": node_id,
         "threadId": turn.ctx.thread_id,
         "runId": turn.ctx.run_id,
@@ -343,6 +433,58 @@ async fn handle_permission(
     item.insert("requestKind".into(), json!(request_kind));
     item.insert("prompt".into(), json!(title));
     item.insert("options".into(), Value::Array(opts));
+
+    // Full-access runs auto-approve: answer with the most permissive option
+    // immediately and record the request already resolved — no waiting state.
+    if turn.ctx.runtime_mode == "full-access" {
+        let chosen = options
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_always"))
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|o| o.get("kind").and_then(Value::as_str) == Some("allow_once"))
+            })
+            .or_else(|| options.first())
+            .cloned();
+        let option_id = chosen
+            .as_ref()
+            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+            .unwrap_or("");
+        let decision = match chosen
+            .as_ref()
+            .and_then(|o| o.get("kind").and_then(Value::as_str))
+        {
+            Some("allow_always") => "acceptForSession",
+            _ => "accept",
+        };
+        writer
+            .respond(
+                rpc_id,
+                json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            )
+            .await?;
+        let resolved_at = domain::now_iso();
+        node["status"] = json!("completed");
+        node["completedAt"] = json!(resolved_at);
+        item["status"] = json!("completed");
+        item["completedAt"] = json!(resolved_at);
+        item["updatedAt"] = json!(resolved_at);
+        turn.commit(
+            state,
+            vec![
+                turn.ev("node.updated", node, Some(&node_id)),
+                turn.ev(
+                    "runtime-request.updated",
+                    request_payload("resolved", json!(resolved_at), json!(decision)),
+                    Some(&node_id),
+                ),
+                turn.ev("turn-item.updated", Value::Object(item), Some(&node_id)),
+            ],
+        )
+        .await?;
+        return Ok(());
+    }
 
     turn.commit(
         state,
