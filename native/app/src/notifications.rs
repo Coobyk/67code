@@ -120,7 +120,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 impl AppView {
-    fn push_toast(
+    pub(crate) fn push_toast(
         &mut self,
         kind: ToastKind,
         title: impl Into<SharedString>,
