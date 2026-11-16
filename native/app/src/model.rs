@@ -35,6 +35,20 @@ pub struct Thread {
     pub provider_instances: Vec<SharedString>,
     pub pinned: bool,
     pub updated_at: SharedString,
+    /// Snoozed until ISO timestamp.
+    pub snoozed_until: Option<SharedString>,
+    /// Explicit unread marker timestamp.
+    pub marked_unread_at: Option<SharedString>,
+    /// Last-visited timestamp.
+    pub visited_at: Option<SharedString>,
+    /// Latest run start timestamp (unread comparison).
+    pub latest_run_started_at: Option<SharedString>,
+    /// Linked PR object (url etc.) when present.
+    pub linked_pull_request: Option<serde_json::Value>,
+    pub pin_order_key: Option<SharedString>,
+    pub active_order_key: Option<SharedString>,
+    pub runtime_mode: Option<SharedString>,
+    pub interaction_mode: Option<SharedString>,
 }
 
 impl Thread {
@@ -56,6 +70,15 @@ impl Thread {
                 .collect(),
             pinned: t.pinned,
             updated_at: t.updated_at.clone().into(),
+            snoozed_until: t.snoozed_until.clone().map(Into::into),
+            marked_unread_at: t.marked_unread_at.clone().map(Into::into),
+            visited_at: t.visited_at.clone().map(Into::into),
+            latest_run_started_at: t.latest_run_started_at.clone().map(Into::into),
+            linked_pull_request: t.linked_pull_request.clone(),
+            pin_order_key: t.pin_order_key.clone().map(Into::into),
+            active_order_key: t.active_order_key.clone().map(Into::into),
+            runtime_mode: t.runtime_mode.clone().map(Into::into),
+            interaction_mode: t.interaction_mode.clone().map(Into::into),
         }
     }
 
@@ -72,6 +95,15 @@ impl Thread {
             provider_instances: Vec::new(),
             pinned: false,
             updated_at: "".into(),
+            snoozed_until: None,
+            marked_unread_at: None,
+            visited_at: None,
+            latest_run_started_at: None,
+            linked_pull_request: None,
+            pin_order_key: None,
+            active_order_key: None,
+            runtime_mode: None,
+            interaction_mode: None,
         }
     }
 

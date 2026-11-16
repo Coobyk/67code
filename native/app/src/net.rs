@@ -68,6 +68,26 @@ pub struct ShellThread {
     pub pinned: bool,
     /// `updatedAt` ISO timestamp.
     pub updated_at: String,
+    /// `snoozedUntil` ISO timestamp while the thread is snoozed.
+    pub snoozed_until: Option<String>,
+    /// `markedUnreadAt` ISO timestamp — explicit unread marker.
+    pub marked_unread_at: Option<String>,
+    /// `visitedAt` ISO timestamp — last time the user opened the thread.
+    pub visited_at: Option<String>,
+    /// `latestRunStartedAt` ISO timestamp for unread comparison.
+    pub latest_run_started_at: Option<String>,
+    /// `linkedPullRequest` object (e.g. `{url,...}`) when a PR is linked.
+    pub linked_pull_request: Option<Value>,
+    /// `pinOrderKey`/`activeOrderKey` ordering keys.
+    pub pin_order_key: Option<String>,
+    pub active_order_key: Option<String>,
+    /// `interactionMode`/`runtimeMode`/`modelSelection` from the shell.
+    pub interaction_mode: Option<String>,
+    pub runtime_mode: Option<String>,
+    pub model_selection: Option<Value>,
+    /// `branch`/`worktreePath` when the thread targets a non-default workspace.
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +184,21 @@ fn parse_thread(v: &Value) -> ShellThread {
             || !v["pinnedOrderKey"].is_null()
             || !v["orderKey"].is_null(),
         updated_at: v["updatedAt"].as_str().unwrap_or_default().to_string(),
+        snoozed_until: v["snoozedUntil"].as_str().map(str::to_owned),
+        marked_unread_at: v["markedUnreadAt"].as_str().map(str::to_owned),
+        visited_at: v["visitedAt"].as_str().map(str::to_owned),
+        latest_run_started_at: v["latestRunStartedAt"].as_str().map(str::to_owned),
+        linked_pull_request: v.get("linkedPullRequest").filter(|v| !v.is_null()).cloned(),
+        pin_order_key: v["pinOrderKey"]
+            .as_str()
+            .or_else(|| v["pinnedOrderKey"].as_str())
+            .map(str::to_owned),
+        active_order_key: v["activeOrderKey"].as_str().map(str::to_owned),
+        interaction_mode: v["interactionMode"].as_str().map(str::to_owned),
+        runtime_mode: v["runtimeMode"].as_str().map(str::to_owned),
+        model_selection: v.get("modelSelection").filter(|v| !v.is_null()).cloned(),
+        branch: v["branch"].as_str().map(str::to_owned),
+        worktree_path: v["worktreePath"].as_str().map(str::to_owned),
     }
 }
 

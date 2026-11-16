@@ -339,6 +339,15 @@ impl AppView {
             provider_instances: Vec::new(),
             pinned: false,
             updated_at: "".into(),
+            snoozed_until: None,
+            marked_unread_at: None,
+            visited_at: None,
+            latest_run_started_at: None,
+            linked_pull_request: None,
+            pin_order_key: None,
+            active_order_key: None,
+            runtime_mode: None,
+            interaction_mode: None,
         });
         self.select_thread(thread_id.into(), cx);
     }
