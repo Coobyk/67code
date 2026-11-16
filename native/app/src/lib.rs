@@ -195,6 +195,9 @@ impl AppView {
             None => AppState::mock(),
         };
 
+        let mut misc_settings_state = settings_misc::State::default();
+        misc_settings_state.seed_from_config(&client_config);
+
         Self {
             state,
             composer,
@@ -231,7 +234,7 @@ impl AppView {
             terminal_state: terminal_drawer::State::default(),
             vcs_state: vcs::State::default(),
             search_state: search_dialog::State::default(),
-            misc_settings_state: settings_misc::State::default(),
+            misc_settings_state,
             backend_settings_state: settings_backend::State::default(),
             stream_sinks: std::collections::HashMap::new(),
             next_stream_id: 0,
@@ -515,6 +518,8 @@ impl AppView {
             self.settings_state.open = false;
         } else if self.composer_state.picker.is_some() {
             self.composer_state.picker = None;
+        } else if self.vcs_dismiss_picker(cx) {
+            return;
         } else {
             return;
         }

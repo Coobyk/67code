@@ -213,7 +213,9 @@ impl AppView {
                 }
                 // The user is already watching the selected thread; only a
                 // live→settled transition in the background is worth a toast.
-                if !previous.as_deref().is_some_and(is_live_status) {
+                if !previous.as_deref().is_some_and(is_live_status)
+                    || !self.in_app_notifications_enabled()
+                {
                     return;
                 }
                 match thread.status.as_str() {

@@ -65,6 +65,17 @@ pub struct ClientConfig {
     /// Parked composer drafts per project key (newest first).
     #[serde(default)]
     pub stashed_drafts: HashMap<String, Vec<StashedDraft>>,
+    /// System-notification mode for thread events ("off" default) — mirrors
+    /// the web's device-local ClientSettings.notificationMode.
+    #[serde(default)]
+    pub notification_mode: String,
+    /// Show in-app toasts when a background thread settles (default true).
+    #[serde(default = "default_in_app_notifications")]
+    pub in_app_notifications: bool,
+}
+
+fn default_in_app_notifications() -> bool {
+    true
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
