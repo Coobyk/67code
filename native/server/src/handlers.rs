@@ -109,8 +109,10 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
         other => {
             if other.starts_with("filesystem.") || other.starts_with("projects.") {
                 crate::rpc_fs::handle(state, other, payload).await
-            } else if other.starts_with("vcs.") || other.starts_with("git.") {
+            } else if other.starts_with("vcs.") {
                 crate::rpc_vcs::handle(state, other, payload).await
+            } else if other.starts_with("git.") {
+                crate::rpc_prs::handle_git(state, other, payload).await
             } else if other.starts_with("terminal.") || other.starts_with("worktreeSetup.") {
                 crate::rpc_terminal::handle(state, other, payload).await
             } else if other.starts_with("scheduledTasks.") || other.starts_with("agentSessions.")
