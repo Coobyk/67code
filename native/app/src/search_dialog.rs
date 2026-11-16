@@ -11,10 +11,9 @@
 //! in render — deferred out of render via `cx.spawn` so the window is off the
 //! update stack (same trick as `field_text` below, borrowed from palette.rs).
 //!
-//! INTEGRATE: activating a match should reveal the file in the explorer pane
-//! at the hit's line number (explorer_state is owned by explorer.rs — expose
-//! a `reveal(path, line)` method). Until then we open the Files tab and toast
-//! the path.
+//! Activating a match reveals the file in the explorer pane via
+//! `explorer_reveal` (line-number scroll is still a gap — the preview opens
+//! at the top).
 
 use std::time::Duration;
 

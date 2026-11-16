@@ -4,8 +4,8 @@
 //!   `inAppNotificationsEnabled` row from `GeneralSettingsPanel`: a
 //!   `notificationMode` select (off / notifications / sound /
 //!   notifications-and-sound) and an in-app toast switch. The web persists
-//!   both as *client* settings (device-local), so they live on `State` here
-//!   until `ClientConfig` grows the fields — see the INTEGRATE notes.
+//!   both as *client* settings (device-local); here they persist on
+//!   `ClientConfig.notification_mode` / `.in_app_notifications`.
 //! - **Chat defaults** mirrors the web "New threads" / "Default permissions"
 //!   rows (`ProjectDefaultsSettings`): `defaultModelSelection`,
 //!   `fallbackModelSelection`, `defaultRuntimeMode`, `defaultThreadEnvMode`,
@@ -134,10 +134,9 @@ pub struct State {
     // (seeded on startup; written back on change).
     notification_mode: String,
     in_app_notifications: bool,
-    // INTEGRATE: notifications.rs — consume `notification_mode` to gate the
-    //   native alert backend (OS toast / sound) once one exists, and
-    //   `in_app_notifications` to gate the "another thread finished" toasts
-    //   while the window is focused.
+    // `in_app_notifications` gates the "another thread finished" toasts
+    // (notifications.rs). `notification_mode` still awaits a native alert
+    // backend (OS toast / sound) to consume the other three modes.
 
     // ── Projects section ────────────────────────────────────────────
     /// Add-project form visible.
@@ -347,6 +346,7 @@ impl AppView {
                             Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
                                 state.settings = exit["value"]["settings"].clone();
                                 state.settings_error = None;
+                                this.apply_server_defaults();
                             }
                             Ok(exit) => {
                                 state.settings_error =
@@ -363,6 +363,35 @@ impl AppView {
                 .detach();
             }
             None => state.settings_loaded.set(true),
+        }
+    }
+
+    /// Push server-side defaults into the composer for fields the user
+    /// hasn't explicitly picked: `defaultModelSelection` → provider/model,
+    /// `defaultRuntimeMode` → permission mode. Matches the web composer,
+    /// where these settings seed the pickers for new threads.
+    fn apply_server_defaults(&mut self) {
+        let state = &self.misc_settings_state;
+        if !self.composer_state.model_picked
+            && let Value::Object(sel) = &state.settings["defaultModelSelection"]
+        {
+            let instance = sel["instanceId"]
+                .as_str()
+                .or_else(|| sel["provider"].as_str());
+            let model = sel["model"].as_str();
+            if let (Some(instance), Some(model)) = (instance, model)
+                && !instance.is_empty()
+                && !model.is_empty()
+            {
+                self.provider = instance.to_string();
+                self.model = model.to_string();
+            }
+        }
+        if !self.composer_state.runtime_mode_picked
+            && let Some(mode) = state.settings["defaultRuntimeMode"].as_str()
+            && !mode.is_empty()
+        {
+            self.composer_state.runtime_mode = mode.to_string();
         }
     }
 
@@ -391,6 +420,7 @@ impl AppView {
                     Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
                         state.settings = exit["value"].clone();
                         state.settings_error = None;
+                        this.apply_server_defaults();
                     }
                     Ok(exit) => {
                         state.settings_error = Some(format!(
@@ -665,10 +695,9 @@ impl AppView {
         }
 
         // ── Default model (defaultModelSelection) ────────────────────────
-        // INTEGRATE: lib.rs `on_prompt_submitted` + composer.model_selection()
-        //   still pick from self.provider/self.model (env/config); they should
-        //   prefer the server's defaultModelSelection for new threads once a
-        //   shared accessor lands.
+        // `apply_server_defaults` pushes this into the composer whenever the
+        // user hasn't explicitly picked a model — the chip then shows the
+        // server default for new threads.
         let default_selection = &settings["defaultModelSelection"];
         let default_value = if default_selection.is_null() {
             AUTO_VALUE.to_string()
@@ -1014,8 +1043,8 @@ impl AppView {
     /// `createWorkspaceRootIfMissing`); the Rust server doesn't interpret
     /// that flag, so the app does it itself — same machine assumption as the
     /// rest of the local workflow.
-    // INTEGRATE: a real folder picker wants a `filesystem.browse` RPC; the
-    //   path TextField is the documented stand-in.
+    // A navigable folder picker is a noted gap — `filesystem.browse` exists
+    // server-side; the path TextField (with ~ expansion) is the stand-in.
     fn add_project_folder(&mut self, path: String, cx: &mut Context<Self>) {
         let path = expand_home(&path);
         if path.is_empty() || self.misc_settings_state.creating {

@@ -46,6 +46,12 @@ pub struct State {
     /// Reasoning effort for `modelSelection.options` (`""` = provider
     /// default, emits no option). One of `""`, `low`, `medium`, `high`.
     pub effort: String,
+    /// User explicitly picked a model; blocks `defaultModelSelection`
+    /// (server settings) from reseeding `provider`/`model`.
+    pub model_picked: bool,
+    /// User explicitly picked a permission mode; blocks
+    /// `defaultRuntimeMode` from reseeding `runtime_mode`.
+    pub runtime_mode_picked: bool,
     /// Index into the project's persisted prompt history while browsing with
     /// up/down; `None` = live draft, not browsing.
     pub history_index: Option<usize>,
@@ -73,6 +79,8 @@ impl Default for State {
             interaction_mode: "default".to_string(),
             runtime_mode: "full-access".to_string(),
             effort: String::new(),
+            model_picked: false,
+            runtime_mode_picked: false,
             history_index: None,
             history_draft: String::new(),
             history_recalled: String::new(),
@@ -898,6 +906,7 @@ impl AppView {
                             view.update(cx, |this, cx| {
                                 this.provider = (*instance).to_string();
                                 this.model = (*model).to_string();
+                                this.composer_state.model_picked = true;
                                 this.composer_state.picker = None;
                                 cx.notify();
                             });
@@ -936,6 +945,7 @@ impl AppView {
                                 };
                                 view.update(cx, |this, cx| {
                                     this.composer_state.runtime_mode = (*value).to_string();
+                                    this.composer_state.runtime_mode_picked = true;
                                     this.composer_state.picker = None;
                                     this.set_thread_modes();
                                     cx.notify();

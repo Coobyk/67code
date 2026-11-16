@@ -12,11 +12,9 @@
 //!   the `pullRequests.subscribeRefreshes` stream emits, plus the thread's
 //!   linked pull request pinned above the list.
 //!
-//! INTEGRATE: right_panel.rs's `render_panel_tab_bar` is a stub — it needs a
-//! Pull Requests button so this pane is reachable (`Tab::PullRequests`
-//! already dispatches to `render_prs_pane`).
-//! INTEGRATE: lib.rs `on_close_overlay` could also close
-//! `vcs_state.picker_open` so Esc dismisses the branch picker.
+//! Reachable via the right-panel tab bar (`Tab::PullRequests` →
+//! `render_prs_pane`); Esc dismisses the branch picker through
+//! `on_close_overlay` → `vcs_dismiss_picker`.
 
 use std::cell::{Cell, RefCell};
 use std::time::{SystemTime, UNIX_EPOCH};
