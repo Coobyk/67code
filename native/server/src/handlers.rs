@@ -24,6 +24,8 @@ pub fn is_windowed_tag(tag: &str) -> bool {
             | "subscribeServerConfig"
             | "subscribeVcsStatus"
             | "subscribeVcsBranch"
+            | "terminal.attach"
+            | "terminal.observe"
             | "subscribeTerminalMetadata"
             | "subscribeServerLifecycle"
             | "subscribeDiscoveredLocalServers"
@@ -279,6 +281,33 @@ pub async fn run_stream(
                 )
                 .await
                 || crate::rpc_misc::handle_subscription(
+                    state.clone(),
+                    out.clone(),
+                    request_id,
+                    other,
+                    payload.clone(),
+                    window.clone(),
+                )
+                .await
+                || crate::rpc_prs::handle_subscription(
+                    state.clone(),
+                    out.clone(),
+                    request_id,
+                    other,
+                    payload.clone(),
+                    window.clone(),
+                )
+                .await
+                || crate::rpc_fs::handle_subscription(
+                    state.clone(),
+                    out.clone(),
+                    request_id,
+                    other,
+                    payload.clone(),
+                    window.clone(),
+                )
+                .await
+                || crate::rpc_assets::handle_subscription(
                     state, out, request_id, other, payload, window,
                 )
                 .await;

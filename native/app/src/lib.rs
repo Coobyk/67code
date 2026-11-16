@@ -8,13 +8,20 @@ mod envs;
 mod markdown;
 mod model;
 pub mod net;
+mod explorer;
 mod notifications;
 mod palette;
+mod right_panel;
+mod search_dialog;
 mod settings;
+mod settings_backend;
+mod settings_misc;
 mod sidebar;
+mod terminal_drawer;
 mod text_field;
 mod theme;
 mod timeline;
+mod vcs;
 mod welcome;
 
 use gpui::{AppContext, Focusable, prelude::*,
@@ -107,6 +114,20 @@ struct AppView {
     welcome_state: welcome::State,
     /// Expanded image attachment viewer overlay (composer.rs).
     expanded_image: Option<composer::ExpandedImage>,
+    /// Right inspector panel (right_panel.rs).
+    panel_state: right_panel::State,
+    /// File explorer pane (explorer.rs).
+    explorer_state: explorer::State,
+    /// Terminal drawer + pane (terminal_drawer.rs).
+    terminal_state: terminal_drawer::State,
+    /// Source-control panes (vcs.rs).
+    vcs_state: vcs::State,
+    /// Project content-search dialog (search_dialog.rs).
+    search_state: search_dialog::State,
+    /// Notifications/Chat/Projects settings (settings_misc.rs).
+    misc_settings_state: settings_misc::State,
+    /// Tasks/Secrets/Diagnostics/Usage settings (settings_backend.rs).
+    backend_settings_state: settings_backend::State,
 }
 
 impl AppView {
@@ -197,6 +218,13 @@ impl AppView {
             working_pulse: 0,
             welcome_state: welcome::State::default(),
             expanded_image: None,
+            panel_state: right_panel::State::default(),
+            explorer_state: explorer::State::default(),
+            terminal_state: terminal_drawer::State::default(),
+            vcs_state: vcs::State::default(),
+            search_state: search_dialog::State::default(),
+            misc_settings_state: settings_misc::State::default(),
+            backend_settings_state: settings_backend::State::default(),
         }
     }
 
@@ -332,8 +360,12 @@ impl AppView {
             role: Role::User,
             text: text.clone(),
         });
+        self.composer_state.history_index = None;
 
         if self.state.connection == ConnectionStatus::Connected {
+            // The submitted prompt joins the project's recall history.
+            let project = self.composer_project_key();
+            self.client_config.record_prompt(&project, text.as_ref());
             let thread_id = match self.state.selected_thread() {
                 Some(thread) => thread.id.to_string(),
                 None => {
@@ -354,10 +386,7 @@ impl AppView {
                             "threadId": thread_id,
                             "projectId": project.id.to_string(),
                             "title": text.chars().take(60).collect::<String>(),
-                            "modelSelection": {
-                                "instanceId": self.provider.clone(),
-                                "model": self.model.clone(),
-                            },
+                            "modelSelection": self.model_selection(),
                             "runtimeMode": self.composer_state.runtime_mode.clone(),
                             "interactionMode": self.composer_state.interaction_mode.clone(),
                             "branch": null,
@@ -379,6 +408,13 @@ impl AppView {
             let attachments = serde_json::Value::Array(
                 self.composer_state.drain_attachments(),
             );
+            // A busy thread queues the message behind the active run instead
+            // of interrupting it (web parity).
+            let dispatch_mode = if self.selected_thread_busy() {
+                serde_json::json!({ "type": "queue_after_active" })
+            } else {
+                serde_json::json!({ "type": "start_immediately" })
+            };
             self.dispatch(
                 serde_json::json!({
                     "type": "message.dispatch",
@@ -386,12 +422,9 @@ impl AppView {
                     "threadId": thread_id,
                     "messageId": uuid::Uuid::new_v4().to_string(),
                     "text": text.to_string(),
-                    "modelSelection": {
-                        "instanceId": self.provider.clone(),
-                        "model": self.model.clone(),
-                    },
+                    "modelSelection": self.model_selection(),
                     "attachments": attachments,
-                    "dispatchMode": { "type": "start_immediately" },
+                    "dispatchMode": dispatch_mode,
                     "createdBy": "user",
                     "creationSource": "web",
                 }),
@@ -417,7 +450,9 @@ impl AppView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.palette_state.open {
+        if self.expanded_image.is_some() {
+            self.expanded_image = None;
+        } else if self.palette_state.open {
             self.palette_state.open = false;
         } else if self.settings_state.open {
             self.settings_state.open = false;
@@ -592,14 +627,17 @@ impl Render for AppView {
                             .child(title),
                     )
                     .child(self.render_timeline())
+                    .child(self.render_terminal_drawer(cx))
                     .child(self.render_composer()),
             )
+            .child(self.render_right_panel(cx))
             .child(self.render_palette(cx))
             .child(self.render_settings(cx))
             .child(self.render_notifications(cx))
             .child(self.render_welcome(cx))
             .child(self.render_snooze_overlay(cx))
             .child(self.render_image_overlay(cx))
+            .child(self.render_search_dialog(cx))
     }
 }
 

@@ -27,6 +27,13 @@ pub enum Section {
     AcpSessions,
     Clients,
     ArchivedThreads,
+    Notifications,
+    ChatDefaults,
+    Projects,
+    ScheduledTasks,
+    Secrets,
+    Diagnostics,
+    Usage,
     Shortcuts,
     About,
 }
@@ -39,6 +46,13 @@ const SECTIONS: &[(Section, &str)] = &[
     (Section::AcpSessions, "ACP Sessions"),
     (Section::Clients, "Authorized Clients"),
     (Section::ArchivedThreads, "Archived Threads"),
+    (Section::Notifications, "Notifications"),
+    (Section::ChatDefaults, "Chat"),
+    (Section::Projects, "Projects"),
+    (Section::ScheduledTasks, "Scheduled Tasks"),
+    (Section::Secrets, "Secrets"),
+    (Section::Diagnostics, "Diagnostics"),
+    (Section::Usage, "Usage Limits"),
     (Section::Shortcuts, "Keyboard Shortcuts"),
     (Section::About, "About"),
 ];
@@ -423,6 +437,34 @@ impl AppView {
             Section::ArchivedThreads => (
                 "Archived Threads",
                 self.render_archived_section(cx).into_any_element(),
+            ),
+            Section::Notifications => (
+                "Notifications",
+                self.render_notifications_section(cx).into_any_element(),
+            ),
+            Section::ChatDefaults => (
+                "Chat",
+                self.render_chat_defaults_section(cx).into_any_element(),
+            ),
+            Section::Projects => (
+                "Projects",
+                self.render_projects_section(cx).into_any_element(),
+            ),
+            Section::ScheduledTasks => (
+                "Scheduled Tasks",
+                self.render_tasks_section(cx).into_any_element(),
+            ),
+            Section::Secrets => (
+                "Secrets",
+                self.render_secrets_section(cx).into_any_element(),
+            ),
+            Section::Diagnostics => (
+                "Diagnostics",
+                self.render_diagnostics_section(cx).into_any_element(),
+            ),
+            Section::Usage => (
+                "Usage Limits",
+                self.render_usage_section(cx).into_any_element(),
             ),
             Section::Shortcuts => (
                 "Keyboard Shortcuts",
