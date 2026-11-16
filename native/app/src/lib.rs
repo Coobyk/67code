@@ -38,6 +38,9 @@ gpui::actions!(
     [
         TogglePalette,
         ToggleSettings,
+        TogglePanel,
+        ToggleTerminalDrawer,
+        ToggleSearch,
         NewThread,
         CloseOverlay,
         FocusSearch,
@@ -444,6 +447,40 @@ impl AppView {
         cx.notify();
     }
 
+    fn on_toggle_panel(
+        &mut self,
+        _action: &TogglePanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel_state.tab = if self.panel_state.tab.is_some() {
+            None
+        } else {
+            Some(right_panel::Tab::Files)
+        };
+        cx.notify();
+    }
+
+    fn on_toggle_terminal_drawer(
+        &mut self,
+        _action: &ToggleTerminalDrawer,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_state.drawer_open = !self.terminal_state.drawer_open;
+        cx.notify();
+    }
+
+    fn on_toggle_search(
+        &mut self,
+        _action: &ToggleSearch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_state.open = !self.search_state.open;
+        cx.notify();
+    }
+
     fn on_close_overlay(
         &mut self,
         _action: &CloseOverlay,
@@ -452,6 +489,8 @@ impl AppView {
     ) {
         if self.expanded_image.is_some() {
             self.expanded_image = None;
+        } else if self.search_state.open {
+            self.search_state.open = false;
         } else if self.palette_state.open {
             self.palette_state.open = false;
         } else if self.settings_state.open {
@@ -603,6 +642,9 @@ impl Render for AppView {
             .text_color(theme::fg())
             .on_action(cx.listener(AppView::on_toggle_palette))
             .on_action(cx.listener(AppView::on_toggle_settings))
+            .on_action(cx.listener(AppView::on_toggle_panel))
+            .on_action(cx.listener(AppView::on_toggle_terminal_drawer))
+            .on_action(cx.listener(AppView::on_toggle_search))
             .on_action(cx.listener(AppView::on_new_thread))
             .on_action(cx.listener(AppView::on_close_overlay))
             .on_action(cx.listener(AppView::on_focus_search))
@@ -624,7 +666,56 @@ impl Render for AppView {
                             .border_color(theme::border())
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(title),
+                            .child(title)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id("terminal-drawer-toggle")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(theme::fg_muted())
+                                            .hover(|s| s.bg(theme::hover()))
+                                            .child("❯_")
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _ev, _w, cx| {
+                                                    this.terminal_state.drawer_open =
+                                                        !this.terminal_state.drawer_open;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("right-panel-toggle")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(theme::fg_muted())
+                                            .hover(|s| s.bg(theme::hover()))
+                                            .child("▤")
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _ev, _w, cx| {
+                                                    this.panel_state.tab =
+                                                        if this.panel_state.tab.is_some() {
+                                                            None
+                                                        } else {
+                                                            Some(right_panel::Tab::Files)
+                                                        };
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    ),
+                            ),
                     )
                     .child(self.render_timeline())
                     .child(self.render_terminal_drawer(cx))
@@ -666,6 +757,9 @@ pub fn run(config: AppConfig) {
             KeyBinding::new("ctrl-,", ToggleSettings, Some("App")),
             KeyBinding::new("cmd-n", NewThread, Some("App")),
             KeyBinding::new("cmd-f", FocusSearch, Some("App")),
+            KeyBinding::new("ctrl-shift-f", ToggleSearch, Some("App")),
+            KeyBinding::new("ctrl-`", ToggleTerminalDrawer, Some("App")),
+            KeyBinding::new("ctrl-b", TogglePanel, Some("App")),
             KeyBinding::new("escape", CloseOverlay, Some("App")),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);

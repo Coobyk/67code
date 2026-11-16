@@ -5,7 +5,10 @@ use gpui::{div, prelude::*, Context, Div};
 use crate::AppView;
 
 #[derive(Default)]
-pub struct State {}
+pub struct State {
+    /// Whether the bottom terminal drawer is open for the selected thread.
+    pub drawer_open: bool,
+}
 
 impl AppView {
     pub(crate) fn render_terminal_drawer(&self, _cx: &mut Context<Self>) -> Div {
