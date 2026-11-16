@@ -485,10 +485,29 @@ impl AppView {
     fn on_toggle_terminal_drawer(
         &mut self,
         _action: &ToggleTerminalDrawer,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal_state.drawer_open = !self.terminal_state.drawer_open;
+        let open = !self.terminal_state.drawer_open;
+        self.terminal_drawer_set_open(open, window, cx);
+    }
+
+    /// Single door for opening/closing the terminal drawer: closing hands
+    /// focus back to the composer so keystrokes never land on a hidden
+    /// terminal focus handle.
+    pub(crate) fn terminal_drawer_set_open(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_state.drawer_open = open;
+        if !open {
+            self.composer
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -741,10 +760,9 @@ impl Render for AppView {
                                             .child("❯_")
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
-                                                cx.listener(|this, _ev, _w, cx| {
-                                                    this.terminal_state.drawer_open =
-                                                        !this.terminal_state.drawer_open;
-                                                    cx.notify();
+                                                cx.listener(|this, _ev, w, cx| {
+                                                    let open = !this.terminal_state.drawer_open;
+                                                    this.terminal_drawer_set_open(open, w, cx);
                                                 }),
                                             ),
                                     )
