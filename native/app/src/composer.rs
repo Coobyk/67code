@@ -10,12 +10,17 @@
 //! keymap/action dispatch, which is what lets Enter apply a slash command
 //! instead of submitting the raw text.
 
+use std::sync::Arc;
+
 use gpui::{
-    ClipboardEntry, Context, Entity, EntityInputHandler, Focusable, KeystrokeEvent, MouseButton,
-    SharedString, Subscription, Window, div, prelude::*, px, rgb,
+    ClipboardEntry, Context, Entity, EntityInputHandler, ExternalPaths, Focusable, KeystrokeEvent,
+    MouseButton, ObjectFit, RenderImage, SharedString, Subscription, Window, div, img, prelude::*,
+    px, rgb, rgba,
 };
 
 use crate::AppView;
+use crate::config;
+use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, Submit, TextField};
 use crate::theme;
 
@@ -38,6 +43,18 @@ pub struct State {
     /// Runtime mode for the `runtimeMode` field of `thread.create` payloads.
     /// One of `full-access`, `approval-required`, `auto`, `auto-accept-edits`.
     pub runtime_mode: String,
+    /// Reasoning effort for `modelSelection.options` (`""` = provider
+    /// default, emits no option). One of `""`, `low`, `medium`, `high`.
+    pub effort: String,
+    /// Index into the project's persisted prompt history while browsing with
+    /// up/down; `None` = live draft, not browsing.
+    pub history_index: Option<usize>,
+    /// Draft parked when history browsing began, restored when the user
+    /// browses back down past the newest entry.
+    pub history_draft: String,
+    /// The history entry currently shown in the composer — lets
+    /// `sync_composer_draft` notice manual edits and exit history mode.
+    pub history_recalled: String,
     /// Inline path input staged by "Attach file…" (no native file dialog).
     pub attach_field: Option<Entity<TextField>>,
     attach_subscription: Option<Subscription>,
@@ -55,6 +72,10 @@ impl Default for State {
             slash_selection: 0,
             interaction_mode: "default".to_string(),
             runtime_mode: "full-access".to_string(),
+            effort: String::new(),
+            history_index: None,
+            history_draft: String::new(),
+            history_recalled: String::new(),
             attach_field: None,
             attach_subscription: None,
             key_subscription: None,
@@ -119,6 +140,9 @@ pub enum PickerKind {
 pub struct Attachment {
     pub name: String,
     pub kind: AttachmentKind,
+    /// Decoded pixels for the thumbnail strip and the expand overlay
+    /// (`Image` kind only; `None` when decode failed → file-icon block).
+    pub thumbnail: Option<Arc<RenderImage>>,
 }
 
 pub enum AttachmentKind {
@@ -154,6 +178,29 @@ const RUNTIME_MODES: &[(&str, &str)] = &[
     ("auto-accept-edits", "Auto-accept edits"),
     ("approval-required", "Supervised"),
 ];
+
+/// Reasoning-effort cycle for the footer chip; `""` emits no option so the
+/// provider applies its own default.
+const EFFORT_LEVELS: &[&str] = &["", "low", "medium", "high"];
+
+fn effort_label(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        _ => "Default",
+    }
+}
+
+/// Decode image bytes into a gpui-renderable image. gpui's software buffers
+/// are BGRA, so R and B are swapped like `decode_static_image` does.
+fn decode_thumbnail(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let mut data = image::load_from_memory(bytes).ok()?.into_rgba8();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new([image::Frame::new(data)])))
+}
 
 struct SlashCommand {
     name: &'static str,
@@ -233,28 +280,47 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
     let Some(view) = app_view(window) else {
         return;
     };
-    let (slash_open, picker_open, attach_open) = {
-        let state = &view.read(cx).composer_state;
+    let (slash_open, picker_open, attach_open, browsing, overlay_open, draft_empty) = {
+        let this = view.read(cx);
+        let state = &this.composer_state;
         (
             state.slash_open,
             state.picker.is_some(),
             state.attach_field.is_some(),
+            state.history_index.is_some(),
+            this.expanded_image.is_some(),
+            state.draft.is_empty(),
         )
     };
-    if !slash_open && !picker_open && !attach_open {
+    if !(slash_open || picker_open || attach_open || browsing || overlay_open || draft_empty) {
         return;
     }
 
     match event.keystroke.key.as_str() {
         "escape" => {
-            view.update(cx, |this, cx| {
-                this.composer_state.slash_open = false;
-                this.composer_state.picker = None;
-                this.composer_state.attach_field = None;
-                this.composer_state.attach_subscription = None;
+            // Only consume Esc when something is actually open — the plain
+            // Escape keybinding (CloseOverlay) handles palette/settings when
+            // the composer has nothing to dismiss.
+            let consumed = view.update(cx, |this, cx| {
+                if this.expanded_image.is_some() {
+                    this.expanded_image = None;
+                } else if this.composer_state.slash_open
+                    || this.composer_state.picker.is_some()
+                    || this.composer_state.attach_field.is_some()
+                {
+                    this.composer_state.slash_open = false;
+                    this.composer_state.picker = None;
+                    this.composer_state.attach_field = None;
+                    this.composer_state.attach_subscription = None;
+                } else {
+                    return false;
+                }
                 cx.notify();
+                true
             });
-            cx.stop_propagation();
+            if consumed {
+                cx.stop_propagation();
+            }
         }
         "enter" if slash_open => {
             let applied = view.update(cx, |this, cx| {
@@ -287,6 +353,24 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
                     };
                     cx.notify();
                 }
+            });
+            cx.stop_propagation();
+        }
+        // ctrl/cmd-shift-s: stash the current draft (the web client's
+        // composer.stash command).
+        key if key.eq_ignore_ascii_case("s")
+            && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && event.keystroke.modifiers.shift =>
+        {
+            view.update(cx, |this, cx| this.stash_draft(window, cx));
+            cx.stop_propagation();
+        }
+        // Prompt history: up from an empty composer walks backward through
+        // submitted prompts; down steps forward and returns to the draft.
+        key @ ("up" | "down") if (browsing || draft_empty) && !attach_open => {
+            let backward = key == "up";
+            view.update(cx, |this, cx| {
+                this.step_prompt_history(backward, window, cx)
             });
             cx.stop_propagation();
         }
@@ -461,8 +545,174 @@ impl AppView {
             state.draft = text;
             state.slash_open = state.draft.starts_with('/');
             state.slash_selection = 0;
+            // A manual edit while browsing history drops out of history mode.
+            if state.history_index.is_some() && state.draft != state.history_recalled {
+                state.history_index = None;
+            }
             cx.notify();
         }
+    }
+
+    /// Project key that prompt history and the draft stash hang off: the
+    /// selected thread's project, else the project a new thread would be
+    /// created in, else a shared "" bucket for the empty state.
+    pub(crate) fn composer_project_key(&self) -> String {
+        self.state
+            .selected_thread()
+            .map(|thread| thread.project_id.to_string())
+            .or_else(|| self.state.projects.first().map(|p| p.id.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// `modelSelection` payload for `thread.create` / `message.dispatch`:
+    /// instance + model, plus a reasoning-effort provider option when the
+    /// effort chip picked one.
+    pub(crate) fn model_selection(&self) -> serde_json::Value {
+        let mut selection = serde_json::json!({
+            "instanceId": self.provider,
+            "model": self.model,
+        });
+        if !self.composer_state.effort.is_empty() {
+            selection["options"] = serde_json::json!([{
+                "id": "effort",
+                "value": self.composer_state.effort,
+            }]);
+        }
+        selection
+    }
+
+    /// True while the selected thread has a run in flight — a submit then
+    /// queues behind it (`queue_after_active`) instead of interrupting.
+    pub(crate) fn selected_thread_busy(&self) -> bool {
+        self.state.selected_thread().is_some_and(|t| {
+            !matches!(
+                t.status.as_ref(),
+                "idle" | "completed" | "failed" | "stopped" | "interrupted"
+            )
+        })
+    }
+
+    /// Replace the composer field's content (reset + insert at caret 0).
+    fn set_composer_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |field, cx| {
+            field.reset(window, cx);
+            field.replace_text_in_range(None, text, window, cx);
+        });
+    }
+
+    /// Up/down through the persisted prompt history (web parity). `up`
+    /// enters history mode only from an empty composer and parks the live
+    /// draft; `down` past the newest entry restores it.
+    fn step_prompt_history(
+        &mut self,
+        backward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.composer_project_key();
+        let history_len = self.client_config.history_for(&project).len();
+        if history_len == 0 {
+            self.composer_state.history_index = None;
+            return;
+        }
+        let next = match (backward, self.composer_state.history_index) {
+            // First step back from a clean composer: park the live draft and
+            // land on the newest entry.
+            (true, None) if self.composer_state.draft.is_empty() => {
+                self.composer_state.history_draft = self.composer_state.draft.clone();
+                Some(history_len - 1)
+            }
+            (true, Some(index)) => Some(index.saturating_sub(1)),
+            (false, Some(index)) if index + 1 < history_len => Some(index + 1),
+            // Down past the newest entry: back to the parked draft.
+            (false, Some(_)) => None,
+            _ => return,
+        };
+        let text = match next {
+            Some(index) => {
+                self.composer_state.history_index = Some(index);
+                self.client_config
+                    .history_for(&project)
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            None => {
+                self.composer_state.history_index = None;
+                std::mem::take(&mut self.composer_state.history_draft)
+            }
+        };
+        self.composer_state.history_recalled = text.clone();
+        self.composer_state.draft = text.clone();
+        self.set_composer_text(&text, window, cx);
+        cx.notify();
+    }
+
+    /// Park the current draft + file attachments and clear the composer —
+    /// `ctrl-shift-s` or the Stash chip (the web client's prompt stash).
+    fn stash_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer_state.draft.trim().to_string();
+        let files: Vec<config::StashedFile> = self
+            .composer_state
+            .attachments
+            .iter()
+            .filter_map(|attachment| match &attachment.kind {
+                AttachmentKind::File { path } => Some(config::StashedFile {
+                    name: attachment.name.clone(),
+                    path: path.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if prompt.is_empty() && files.is_empty() {
+            return;
+        }
+        let project = self.composer_project_key();
+        self.client_config
+            .push_stash(&project, config::StashedDraft { prompt, files });
+        self.composer.update(cx, |field, cx| field.reset(window, cx));
+        let state = &mut self.composer_state;
+        state.draft.clear();
+        state.attachments.clear();
+        state.history_index = None;
+        self.push_toast(ToastKind::Info, "Draft stashed", None, None, cx);
+        cx.notify();
+    }
+
+    /// Restore the newest stashed draft — the "Stashed (n)" footer chip.
+    fn restore_stash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.composer_project_key();
+        let Some(entry) = self.client_config.pop_stash(&project) else {
+            return;
+        };
+        self.set_composer_text(&entry.prompt, window, cx);
+        self.composer_state.draft = entry.prompt;
+        for file in entry.files {
+            self.composer_state.attachments.push(Attachment {
+                name: file.name,
+                kind: AttachmentKind::File { path: file.path },
+                thumbnail: None,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Stage files dropped on the composer (gpui delivers an external file
+    /// drop as `ExternalPaths` to `on_drop` listeners under the pointer).
+    fn stage_dropped_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        for path in paths {
+            let display = path.display().to_string();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| display.clone());
+            self.composer_state.attachments.push(Attachment {
+                name,
+                kind: AttachmentKind::File { path: display },
+                thumbnail: None,
+            });
+        }
+        cx.notify();
     }
 
     fn apply_slash_command(
@@ -532,6 +782,7 @@ impl AppView {
                 ClipboardEntry::Image(image) => {
                     self.composer_state.attachments.push(Attachment {
                         name: format!("pasted-image.{}", image.format.extension()),
+                        thumbnail: decode_thumbnail(&image.bytes),
                         kind: AttachmentKind::Image {
                             bytes: image.bytes.clone(),
                             mime: image.format.mime_type().to_string(),
@@ -548,6 +799,7 @@ impl AppView {
                         self.composer_state.attachments.push(Attachment {
                             name,
                             kind: AttachmentKind::File { path: display },
+                            thumbnail: None,
                         });
                     }
                 }
@@ -576,6 +828,7 @@ impl AppView {
                     this.composer_state.attachments.push(Attachment {
                         name,
                         kind: AttachmentKind::File { path },
+                        thumbnail: None,
                     });
                 }
                 this.composer_state.attach_field = None;
@@ -735,19 +988,72 @@ impl AppView {
     fn render_attachment_strip(&self) -> impl IntoElement {
         let mut strip = div().flex().flex_wrap().gap_1().pb_2();
         for (index, attachment) in self.composer_state.attachments.iter().enumerate() {
+            let mut chip = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .pl_2()
+                .pr_1()
+                .py_0p5()
+                .rounded_md()
+                .bg(theme::user_bubble())
+                .border_1()
+                .border_color(theme::border())
+                .text_xs();
+            match (&attachment.kind, &attachment.thumbnail) {
+                (AttachmentKind::Image { .. }, Some(thumbnail)) => {
+                    let thumbnail = thumbnail.clone();
+                    let for_overlay = thumbnail.clone();
+                    let name = attachment.name.clone();
+                    chip = chip.child(
+                        div()
+                            .id(("attach-thumb", index))
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex_none()
+                            .rounded_sm()
+                            .overflow_hidden()
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            // Click expands into the image overlay.
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                let Some(view) = app_view(window) else {
+                                    return;
+                                };
+                                view.update(cx, |this, cx| {
+                                    this.expanded_image = Some(ExpandedImage {
+                                        name: name.clone(),
+                                        image: for_overlay.clone(),
+                                    });
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                img(gpui::ImageSource::Render(thumbnail))
+                                    .size_full()
+                                    .object_fit(ObjectFit::Cover),
+                            ),
+                    );
+                }
+                (AttachmentKind::Image { .. }, None) => {
+                    // Decode failed — neutral block, no expand target.
+                    chip = chip.child(
+                        div()
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex_none()
+                            .rounded_sm()
+                            .bg(theme::selected())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme::fg_muted())
+                            .child("img"),
+                    );
+                }
+                _ => {}
+            }
             strip = strip.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pl_2()
-                    .pr_1()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(theme::user_bubble())
-                    .border_1()
-                    .border_color(theme::border())
-                    .text_xs()
+                chip
                     .child(attachment.name.clone())
                     .child(
                         div()
@@ -779,12 +1085,9 @@ impl AppView {
         let state = &self.composer_state;
         let composer = self.composer.clone();
         // While a turn runs, the send button becomes a stop square (web parity).
-        let running = self.state.selected_thread().is_some_and(|t| {
-            !matches!(
-                t.status.as_ref(),
-                "idle" | "completed" | "failed" | "stopped" | "interrupted"
-            )
-        });
+        let running = self.selected_thread_busy();
+        let project_key = self.composer_project_key();
+        let stashed = self.client_config.stash_count(&project_key);
 
         let mut root = div()
             .p_4()
@@ -793,6 +1096,18 @@ impl AppView {
             .gap_2()
             .relative()
             .key_context("Composer")
+            // External file drops stage as File attachments; gpui translates
+            // the platform drop into a MouseUp carrying `ExternalPaths`.
+            .can_drop(|value, _window, _cx| value.is::<ExternalPaths>())
+            .drag_over::<ExternalPaths>(|style, _paths, _window, _cx| {
+                style.bg(theme::hover())
+            })
+            .on_drop::<ExternalPaths>(|paths, window, cx| {
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| this.stage_dropped_paths(paths.paths(), cx));
+            })
             .on_key_down(|_event, window, cx| {
                 ensure_composer_hooks(window, cx);
             })
@@ -952,8 +1267,96 @@ impl AppView {
                 PickerKind::RuntimeMode,
                 state.picker,
             ))
+            // Reasoning-effort cycle: Default → low → medium → high, sent as
+            // modelSelection.options[{id:"effort"}] when not Default.
+            .child(
+                div()
+                    .id("composer-effort")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_xs()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            let current = EFFORT_LEVELS
+                                .iter()
+                                .position(|level| *level == this.composer_state.effort)
+                                .unwrap_or(0);
+                            this.composer_state.effort =
+                                EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
+                            cx.notify();
+                        });
+                    })
+                    .child(format!("{} effort", effort_label(&state.effort))),
+            )
             .child(div().flex_1());
 
+        // Draft stash chips: Stash while there's content, Stashed (n) while
+        // entries wait to be restored.
+        if !state.draft.is_empty() || !state.attachments.is_empty() {
+            footer = footer.child(
+                div()
+                    .id("composer-stash")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| this.stash_draft(window, cx));
+                    })
+                    .child("Stash"),
+            );
+        }
+        if stashed > 0 {
+            footer = footer.child(
+                div()
+                    .id("composer-stashed")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_xs()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| this.restore_stash(window, cx));
+                    })
+                    .child(format!("Stashed ({stashed})")),
+            );
+        }
+
+        if running {
+            footer = footer.child(
+                div()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("⏎ queues behind the current run"),
+            );
+        }
         if self.state.selected.is_none() {
             footer = footer.child(
                 div()
@@ -970,12 +1373,72 @@ impl AppView {
 /// Data for the expanded-image overlay (set when a thumbnail is clicked).
 pub struct ExpandedImage {
     pub name: String,
-    pub bytes: std::sync::Arc<Vec<u8>>,
-    pub mime: String,
+    /// Decoded attachment pixels, shared with the staged thumbnail.
+    pub image: Arc<RenderImage>,
 }
 
 impl AppView {
-    pub(crate) fn render_image_overlay(&self, _cx: &mut Context<Self>) -> gpui::Div {
+    /// Centered modal for a staged image attachment — dim backdrop click or
+    /// Esc closes. Rendered last in the root so it sits above other overlays.
+    pub(crate) fn render_image_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(expanded) = &self.expanded_image else {
+            return div();
+        };
+        // Fit the image inside a fixed box, preserving aspect ratio.
+        let native = expanded.image.size(0);
+        let (w, h) = (native.width.0 as f32, native.height.0 as f32);
+        let (fit_w, fit_h) = if w > 0. && h > 0. {
+            let scale = (680. / w).min(440. / h);
+            (px((w * scale).max(1.)), px((h * scale).max(1.)))
+        } else {
+            (px(320.), px(240.))
+        };
         div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x000000b3))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.expanded_image = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_lg()
+                    .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
+                    .p_4()
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        img(gpui::ImageSource::Render(expanded.image.clone()))
+                            .w(fit_w)
+                            .h(fit_h)
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(expanded.name.clone())
+                            .child("esc to close"),
+                    ),
+            )
     }
 }

@@ -1,7 +1,7 @@
 //! Right-side inspector panel hosting tabbed panes (files, terminals, PRs).
 //! Owns `impl AppView` panel render + `right_panel::State`.
 
-use gpui::{div, prelude::*, Context, Div};
+use gpui::{div, prelude::*, px, Context, Div};
 
 use crate::AppView;
 
