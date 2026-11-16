@@ -1,14 +1,17 @@
 //! Sidebar: project grouping, thread rows, status indicators, context menus.
 //! Owns `impl AppView` sidebar render methods and `sidebar::State`.
 
+use std::cmp::Reverse;
+
 use gpui::{
-    Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, SharedString, Subscription,
-    Window, anchored, deferred, div, point, prelude::*, px, rgb,
+    AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, SharedString,
+    Subscription, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::model::{ConnectionStatus, Project, Thread};
+use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
 use crate::AppView;
@@ -26,6 +29,8 @@ pub struct State {
     pub delete_confirm: Option<SharedString>,
     /// Inline new-project form is open.
     pub new_project_open: bool,
+    /// Thread id the snooze overlay is open for.
+    pub snooze_target: Option<SharedString>,
     /// Scroll position for the thread list.
     pub scroll: gpui::ScrollHandle,
     rename_field: Option<Entity<TextField>>,
@@ -58,6 +63,177 @@ fn status_dot_color(thread: &Thread) -> gpui::Rgba {
             _ => theme::fg_muted(),
         }
     }
+}
+
+/// Seconds since the Unix epoch. The app has no chrono/time dep, so snooze
+/// presets are computed in UTC.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Days since epoch -> (year, month, day); Howard Hinnant's civil algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// (year, month, day) -> days since epoch; inverse of `civil_from_days`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.000Z` — the wire `IsoDateTime` shape.
+fn iso_from_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Parse the `YYYY-MM-DDTHH:MM:SS` prefix of an ISO timestamp back to Unix
+/// seconds. Anything after the seconds field (fraction, zone) is ignored —
+/// our payloads always write `Z`.
+fn unix_from_iso(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let num = |i: usize, n: usize| -> Option<i64> { s.get(i..i + n)?.parse().ok() };
+    let days = days_from_civil(num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    Some(days * 86_400 + num(11, 2)? * 3600 + num(14, 2)? * 60 + num(17, 2)?)
+}
+
+/// Now as a wire `IsoDateTime` string.
+fn iso_now() -> String {
+    iso_from_unix(unix_now())
+}
+
+/// Snooze presets mirroring the web defaults
+/// (`packages/contracts/settings.ts` DEFAULT_SNOOZE_PRESETS): durations plus
+/// fixed wake times. With no timezone database in the app, fixed times
+/// resolve in UTC.
+fn snooze_presets(now: i64) -> Vec<(&'static str, i64)> {
+    const DAY: i64 = 86_400;
+    let today = now.div_euclid(DAY);
+    // Weekday of `today`: 0=Sun…6=Sat. Day 0 (1970-01-01) was a Thursday.
+    let weekday = (today + 4).rem_euclid(7);
+    // Days until next Monday — a Monday counts as next week's, like the web.
+    let days_to_monday = (1 - weekday).rem_euclid(7);
+    let monday_ahead = if days_to_monday == 0 {
+        7
+    } else {
+        days_to_monday
+    };
+    let mut presets = vec![
+        ("In 1 hour", now + 3_600),
+        ("In 4 hours", now + 14_400),
+        ("Tomorrow", (today + 1) * DAY + 9 * 3_600),
+        ("Next week", (today + monday_ahead) * DAY + 9 * 3_600),
+    ];
+    // "This evening" (today 18:00) only while it's still ahead, like the web.
+    let tonight = today * DAY + 18 * 3_600;
+    if tonight > now {
+        presets.push(("This evening", tonight));
+    }
+    presets.sort_by_key(|(_, until)| *until);
+    presets
+}
+
+/// `a`-`z` fraction digits for order keys — the same keyspace the web uses
+/// (`client-runtime/state/threadSort.ts` pinOrderKeyBetween).
+const PIN_ORDER_DIGITS: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// Spread slot key for position `i` in a run of `count` rows — a single
+/// entry of `generateSpreadPinOrderKeys`. Used by the reorder fallback that
+/// rewrites a pinned block whose keys are missing or not fraction keys.
+fn spread_slot_key(i: usize, count: usize) -> String {
+    let mut width = 2usize;
+    let mut space = PIN_ORDER_DIGITS.len() * PIN_ORDER_DIGITS.len();
+    while space <= (count + 1) * 2 {
+        width += 1;
+        space *= PIN_ORDER_DIGITS.len();
+    }
+    let step = space / (count + 1);
+    let mut value = step * (i + 1);
+    if value % PIN_ORDER_DIGITS.len() == 0 {
+        value += 1;
+    }
+    let mut chars = vec!['a'; width];
+    for digit in (0..width).rev() {
+        chars[digit] = PIN_ORDER_DIGITS[value % PIN_ORDER_DIGITS.len()] as char;
+        value /= PIN_ORDER_DIGITS.len();
+    }
+    chars.into_iter().collect()
+}
+
+/// Midpoint of two a-z digit strings interpreted as fractions in (0,1);
+/// "" stands for the open bound on either side and requires a < b.
+/// Port of `pinOrderMidpoint` (keys here are ASCII digits, so byte math is
+/// equivalent to the JS char math).
+fn pin_order_midpoint(a: &str, b: &str) -> String {
+    if !b.is_empty() {
+        let mut n = 0;
+        while n < b.len() && a.as_bytes().get(n).copied().unwrap_or(b'a') == b.as_bytes()[n] {
+            n += 1;
+        }
+        if n > 0 {
+            let a_rest = if n < a.len() { &a[n..] } else { "" };
+            return format!("{}{}", &b[..n], pin_order_midpoint(a_rest, &b[n..]));
+        }
+    }
+    let digit_a = if a.is_empty() {
+        0i64
+    } else {
+        (a.as_bytes()[0] - b'a') as i64
+    };
+    let digit_b = if b.is_empty() {
+        PIN_ORDER_DIGITS.len() as i64
+    } else {
+        (b.as_bytes()[0] - b'a') as i64
+    };
+    if digit_b - digit_a > 1 {
+        return ((b'a' + ((digit_a + digit_b + 1) / 2) as u8) as char).to_string();
+    }
+    if b.len() > 1 {
+        return (b.as_bytes()[0] as char).to_string();
+    }
+    let head = a.as_bytes().first().copied().unwrap_or(b'a');
+    let rest = if a.len() > 1 { &a[1..] } else { "" };
+    format!("{}{}", head as char, pin_order_midpoint(rest, ""))
+}
+
+/// Key that sorts strictly between two neighbor keys; `None` is an open
+/// bound (top/bottom of the keyed run).
+fn order_key_between(before: Option<&str>, after: Option<&str>) -> String {
+    pin_order_midpoint(before.unwrap_or(""), after.unwrap_or(""))
+}
+
+/// Web `isValidPinOrderKey`: every char a-z and no trailing `a` (a trailing
+/// minimum digit leaves no room to sort immediately before it).
+fn is_valid_order_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|b| PIN_ORDER_DIGITS.contains(&b))
+        && key.bytes().last() != Some(b'a')
 }
 
 /// Read a text field's contents during effects (observers/subscribers), when
@@ -349,7 +525,241 @@ impl AppView {
             runtime_mode: None,
             interaction_mode: None,
         });
-        self.select_thread(thread_id.into(), cx);
+        self.select_and_visit(thread_id.into(), cx);
+    }
+
+    /// Select a thread and tell the server it was opened — `thread.visit`
+    /// moves the read watermark (`visitedAt`) and clears `markedUnreadAt`
+    /// server-side, so the optimistic update does both.
+    fn select_and_visit(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
+        let now = iso_now();
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.visited_at = Some(now.clone().into());
+            thread.marked_unread_at = None;
+        }
+        self.dispatch(json!({
+            "type": "thread.visit",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id.to_string(),
+            "visitedAt": now,
+            "opened": true,
+        }));
+        self.select_thread(thread_id, cx);
+    }
+
+    /// "Mark unread" menu action — `thread.mark-unread`.
+    fn mark_unread(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.marked_unread_at = Some(iso_now().into());
+        }
+        self.dispatch(json!({
+            "type": "thread.mark-unread",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id.to_string(),
+        }));
+        cx.notify();
+    }
+
+    /// "Mark read": `thread.visit` clears `markedUnreadAt`; `opened:false`
+    /// keeps it a watermark update rather than a selection.
+    fn mark_read(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
+        let now = iso_now();
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.visited_at = Some(now.clone().into());
+            thread.marked_unread_at = None;
+        }
+        self.dispatch(json!({
+            "type": "thread.visit",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id.to_string(),
+            "visitedAt": now,
+            "opened": false,
+        }));
+        cx.notify();
+    }
+
+    /// Unread state, matching the web row: an explicit `markedUnreadAt` or a
+    /// run that started after the last visit. ISO strings compare
+    /// lexicographically.
+    fn is_unread(&self, thread: &Thread) -> bool {
+        thread.marked_unread_at.is_some()
+            || thread.latest_run_started_at.as_ref().is_some_and(|started| {
+                thread
+                    .visited_at
+                    .as_ref()
+                    .is_none_or(|visited| started.as_ref() > visited.as_ref())
+            })
+    }
+
+    /// True while `snoozedUntil` is still ahead of the clock — the web's
+    /// `effectiveSnoozed` check (an expired snooze is already awake).
+    fn is_snoozed(&self, thread: &Thread) -> bool {
+        thread.snoozed_until.as_ref().is_some_and(|until| {
+            unix_from_iso(until.as_ref()).is_some_and(|t| t > unix_now())
+        })
+    }
+
+    /// Dispatch `thread.snooze` and optimistically mark the row.
+    fn snooze_thread(&mut self, thread_id: SharedString, until: String, cx: &mut Context<Self>) {
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.snoozed_until = Some(until.clone().into());
+        }
+        self.sidebar_state.snooze_target = None;
+        self.dispatch(json!({
+            "type": "thread.snooze",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id.to_string(),
+            "snoozedUntil": until,
+        }));
+        // push_toast has no action/callback support — a plain notice, no Undo.
+        self.push_toast(
+            ToastKind::Info,
+            "Thread snoozed",
+            Some(format!("wakes {}", until.get(..16).unwrap_or(&until))),
+            Some(thread_id),
+            cx,
+        );
+    }
+
+    /// Dispatch `thread.unsnooze` (`reason:"user"`, per the contract).
+    fn unsnooze_thread(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.snoozed_until = None;
+        }
+        self.sidebar_state.snooze_target = None;
+        self.dispatch(json!({
+            "type": "thread.unsnooze",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id.to_string(),
+            "reason": "user",
+        }));
+        cx.notify();
+    }
+
+    /// Pinned threads of `project_id` in display order, mirroring the web's
+    /// `sortPinnedThreadsByOrderKey`: keyed rows by `pinOrderKey` ascending,
+    /// then keyless rows by recency.
+    fn pinned_order(&self, project_id: &str) -> Vec<Thread> {
+        let mut pinned: Vec<Thread> = self
+            .state
+            .threads
+            .iter()
+            .filter(|t| t.pinned && t.project_id.as_ref() == project_id)
+            .cloned()
+            .collect();
+        pinned.sort_by_key(|t| {
+            (
+                t.pin_order_key.is_none(),
+                t.pin_order_key.clone().unwrap_or_default(),
+                Reverse(t.updated_at.clone()),
+            )
+        });
+        pinned
+    }
+
+    /// Optimistically set a `pinOrderKey` and send `thread.pin.reorder`.
+    fn set_pin_key(&mut self, thread_id: &str, order_key: String) {
+        if let Some(thread) = self
+            .state
+            .threads
+            .iter_mut()
+            .find(|t| t.id.as_ref() == thread_id)
+        {
+            thread.pin_order_key = Some(order_key.clone().into());
+        }
+        self.dispatch(json!({
+            "type": "thread.pin.reorder",
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+            "orderKey": order_key,
+        }));
+    }
+
+    /// "Move up/down" on a pinned row. With usable neighbor keys the moved
+    /// row takes the midpoint key; with missing/corrupt keys the whole block
+    /// is respread — the same fallback as the web's `planPinnedReorder`.
+    fn move_pinned(&mut self, thread_id: SharedString, dir: i32, cx: &mut Context<Self>) {
+        let Some(project_id) = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .map(|t| t.project_id.clone())
+        else {
+            return;
+        };
+        let mut ordered = self.pinned_order(project_id.as_ref());
+        let Some(ix) = ordered.iter().position(|t| t.id == thread_id) else {
+            return;
+        };
+        let target = ix as i32 + dir;
+        if target < 0 || target as usize >= ordered.len() {
+            return;
+        }
+        let target = target as usize;
+        let n = ordered.len();
+        // Neighbors of the moved row in the *final* order, expressed as
+        // indexes into the pre-swap list (the displaced row is one of them).
+        let (before_index, after_index) = if dir > 0 {
+            (Some(target), (target + 1 < n).then_some(target + 1))
+        } else {
+            ((target > 0).then_some(target - 1), Some(target))
+        };
+        // An existing neighbor is only usable when it carries a valid
+        // fraction key; missing bounds are open ends.
+        let usable = |index: Option<usize>| {
+            index.is_none_or(|i| {
+                ordered[i]
+                    .pin_order_key
+                    .as_deref()
+                    .is_some_and(is_valid_order_key)
+            })
+        };
+        if usable(before_index) && usable(after_index) {
+            let before = before_index
+                .and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
+            let after = after_index
+                .and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
+            let order_key = order_key_between(before.as_deref(), after.as_deref());
+            self.set_pin_key(thread_id.as_ref(), order_key);
+        } else {
+            // Respread: fresh slot keys across the whole pinned block in its
+            // new order — also heals non-fraction (e.g. ISO) legacy keys.
+            ordered.swap(ix, target);
+            for (i, row) in ordered.iter().enumerate() {
+                let order_key = spread_slot_key(i, n);
+                if row.pin_order_key.as_deref() != Some(order_key.as_str()) {
+                    self.set_pin_key(row.id.as_ref(), order_key);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// One context-menu row — shared so every item keeps the same styling.
+    fn menu_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        danger: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .px_3()
+            .py_1p5()
+            .cursor_pointer()
+            .when(danger, |el| el.text_color(rgb(0xf87171)))
+            .hover(|s| s.bg(theme::hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, window, cx| {
+                    cx.stop_propagation();
+                    on_click(this, window, cx);
+                }),
+            )
+            .child(label)
     }
 
     fn render_thread_row(
@@ -361,6 +771,8 @@ impl AppView {
     ) -> impl IntoElement {
         let active = self.state.selected.as_ref() == Some(&thread.id);
         let renaming = self.sidebar_state.renaming.as_ref() == Some(&thread.id);
+        let unread = self.is_unread(thread);
+        let snoozed = self.is_snoozed(thread);
         let select_id = thread.id.clone();
         let menu_id = thread.id.clone();
 
@@ -386,7 +798,7 @@ impl AppView {
                     if this.sidebar_state.renaming.as_ref() != Some(&select_id) {
                         this.sidebar_state.renaming = None;
                     }
-                    this.select_thread(select_id.clone(), cx);
+                    this.select_and_visit(select_id.clone(), cx);
                 }),
             )
             .on_mouse_down(
@@ -400,7 +812,7 @@ impl AppView {
                     if let Some(focus) = this.sidebar_state.menu_focus.clone() {
                         focus.focus(window, cx);
                     }
-                    this.select_thread(menu_id.clone(), cx);
+                    this.select_and_visit(menu_id.clone(), cx);
                 }),
             )
             .child(
@@ -424,6 +836,10 @@ impl AppView {
                     .whitespace_nowrap()
                     .overflow_x_hidden()
                     .text_ellipsis()
+                    .when(unread, |s| {
+                        s.font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::fg())
+                    })
                     .child(thread.title.clone()),
             );
         }
@@ -435,6 +851,35 @@ impl AppView {
                     .text_xs()
                     .text_color(theme::fg_muted())
                     .child(name),
+            );
+        }
+        if unread {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(theme::primary()),
+            );
+        }
+        if snoozed {
+            row = row.child(div().flex_none().text_xs().child("😴"));
+        }
+        if thread
+            .linked_pull_request
+            .as_ref()
+            .and_then(|pr| pr.get("url"))
+            .and_then(|url| url.as_str())
+            .is_some()
+        {
+            // GPUI rows have no tooltip support — the glyph only.
+            row = row.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("⧉"),
             );
         }
         if thread.has_pending_request {
@@ -479,17 +924,15 @@ impl AppView {
             .find(|t| t.id == menu.thread_id)
             .cloned();
         let pinned = thread.as_ref().is_some_and(|t| t.pinned);
+        let snoozed = thread.as_ref().is_some_and(|t| self.is_snoozed(t));
+        let unread = thread.as_ref().is_some_and(|t| self.is_unread(t));
         let confirming = self.sidebar_state.delete_confirm.as_ref() == Some(&menu.thread_id);
-
-        let rename_id = menu.thread_id.clone();
-        let pin_id = menu.thread_id.clone();
-        let archive_id = menu.thread_id.clone();
-        let delete_id = menu.thread_id.clone();
+        let separator = || div().h(px(1.)).mx_2().my_1().bg(theme::border());
 
         let mut menu_el = div()
             .flex()
             .flex_col()
-            .w(px(190.))
+            .w(px(200.))
             .py_1()
             .rounded_md()
             .bg(theme::raised())
@@ -501,119 +944,171 @@ impl AppView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_this, _ev, _window, cx| cx.stop_propagation()),
-            )
-            .child(
-                div()
-                    .id(("mi", 0usize))
-                    .px_3()
-                    .py_1p5()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, window, cx| {
-                            cx.stop_propagation();
-                            this.sidebar_state.context_menu = None;
-                            this.start_rename(rename_id.clone(), window, cx);
-                        }),
-                    )
-                    .child("Rename"),
-            )
-            .child(
-                div()
-                    .id(("mi", 1usize))
-                    .px_3()
-                    .py_1p5()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            cx.stop_propagation();
-                            this.sidebar_state.context_menu = None;
-                            if let Some(t) =
-                                this.state.threads.iter_mut().find(|t| t.id == pin_id)
-                            {
-                                t.pinned = !pinned;
-                            }
-                            this.dispatch(json!({
-                                "type": if pinned { "thread.unpin" } else { "thread.pin" },
-                                "commandId": Uuid::new_v4().to_string(),
-                                "threadId": pin_id.to_string(),
-                            }));
-                            cx.notify();
-                        }),
-                    )
-                    .child(if pinned { "Unpin" } else { "Pin" }),
-            )
-            .child(
-                div()
-                    .id(("mi", 2usize))
-                    .px_3()
-                    .py_1p5()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            cx.stop_propagation();
-                            this.sidebar_state.context_menu = None;
-                            this.state.threads.retain(|t| t.id != archive_id);
-                            this.dispatch(json!({
-                                "type": "thread.archive",
-                                "commandId": Uuid::new_v4().to_string(),
-                                "threadId": archive_id.to_string(),
-                            }));
-                            cx.notify();
-                        }),
-                    )
-                    .child("Archive"),
-            )
-            .child(
-                div()
-                    .h(px(1.))
-                    .mx_2()
-                    .my_1()
-                    .bg(theme::border()),
             );
 
+        let rename_id = menu.thread_id.clone();
+        menu_el = menu_el.child(self.menu_item(
+            "mi-rename",
+            "Rename",
+            false,
+            cx,
+            move |this, window, cx| {
+                this.sidebar_state.context_menu = None;
+                this.start_rename(rename_id.clone(), window, cx);
+            },
+        ));
+
+        let pin_id = menu.thread_id.clone();
+        menu_el = menu_el.child(self.menu_item(
+            "mi-pin",
+            if pinned { "Unpin" } else { "Pin" },
+            false,
+            cx,
+            move |this, _window, cx| {
+                this.sidebar_state.context_menu = None;
+                if let Some(thread) = this.state.threads.iter_mut().find(|t| t.id == pin_id) {
+                    thread.pinned = !pinned;
+                    if pinned {
+                        thread.pin_order_key = None;
+                    }
+                }
+                this.dispatch(json!({
+                    "type": if pinned { "thread.unpin" } else { "thread.pin" },
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": pin_id.to_string(),
+                }));
+                cx.notify();
+            },
+        ));
+
+        // Pinned rows can be nudged within the pinned block.
+        if pinned
+            && let Some(project_id) = thread.as_ref().map(|t| t.project_id.clone())
+        {
+            let ordered = self.pinned_order(project_id.as_ref());
+            if let Some(index) = ordered.iter().position(|t| t.id == menu.thread_id) {
+                if index > 0 {
+                    let move_id = menu.thread_id.clone();
+                    menu_el = menu_el.child(self.menu_item(
+                        "mi-move-up",
+                        "Move up",
+                        false,
+                        cx,
+                        move |this, _window, cx| {
+                            this.sidebar_state.context_menu = None;
+                            this.move_pinned(move_id.clone(), -1, cx);
+                        },
+                    ));
+                }
+                if index + 1 < ordered.len() {
+                    let move_id = menu.thread_id.clone();
+                    menu_el = menu_el.child(self.menu_item(
+                        "mi-move-down",
+                        "Move down",
+                        false,
+                        cx,
+                        move |this, _window, cx| {
+                            this.sidebar_state.context_menu = None;
+                            this.move_pinned(move_id.clone(), 1, cx);
+                        },
+                    ));
+                }
+            }
+        }
+
+        let read_id = menu.thread_id.clone();
+        menu_el = menu_el.child(self.menu_item(
+            if unread { "mi-mark-read" } else { "mi-mark-unread" },
+            if unread { "Mark read" } else { "Mark unread" },
+            false,
+            cx,
+            move |this, _window, cx| {
+                this.sidebar_state.context_menu = None;
+                if unread {
+                    this.mark_read(read_id.clone(), cx);
+                } else {
+                    this.mark_unread(read_id.clone(), cx);
+                }
+            },
+        ));
+
+        let snooze_id = menu.thread_id.clone();
+        menu_el = menu_el.child(self.menu_item(
+            "mi-snooze",
+            "Snooze…",
+            false,
+            cx,
+            move |this, _window, cx| {
+                this.sidebar_state.context_menu = None;
+                this.sidebar_state.snooze_target = Some(snooze_id.clone());
+                cx.notify();
+            },
+        ));
+        if snoozed {
+            let unsnooze_id = menu.thread_id.clone();
+            menu_el = menu_el.child(self.menu_item(
+                "mi-unsnooze",
+                "Unsnooze",
+                false,
+                cx,
+                move |this, _window, cx| {
+                    this.sidebar_state.context_menu = None;
+                    this.unsnooze_thread(unsnooze_id.clone(), cx);
+                },
+            ));
+        }
+
+        let archive_id = menu.thread_id.clone();
+        let archive_title = thread.as_ref().map(|t| t.title.to_string());
+        menu_el = menu_el
+            .child(separator())
+            .child(self.menu_item("mi-archive", "Archive", false, cx, move |this, _window, cx| {
+                this.sidebar_state.context_menu = None;
+                this.state.threads.retain(|t| t.id != archive_id);
+                this.dispatch(json!({
+                    "type": "thread.archive",
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": archive_id.to_string(),
+                }));
+                // push_toast has no action/callback support — a plain notice,
+                // no Undo button.
+                this.push_toast(ToastKind::Info, "Thread archived", archive_title.clone(), None, cx);
+                cx.notify();
+            }))
+            .child(separator());
+
+        let delete_id = menu.thread_id.clone();
+        let delete_title = thread.as_ref().map(|t| t.title.to_string());
         let delete_label = if confirming {
             "Confirm delete"
         } else {
             "Delete"
         };
-        menu_el = menu_el.child(
-            div()
-                .id(("mi", 4usize))
-                .px_3()
-                .py_1p5()
-                .cursor_pointer()
-                .text_color(rgb(0xf87171))
-                .hover(|s| s.bg(theme::hover()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _window, cx| {
-                        cx.stop_propagation();
-                        if confirming {
-                            this.sidebar_state.context_menu = None;
-                            this.sidebar_state.delete_confirm = None;
-                            this.state.threads.retain(|t| t.id != delete_id);
-                            if this.state.selected.as_ref() == Some(&delete_id) {
-                                this.state.selected = None;
-                            }
-                            this.dispatch(json!({
-                                "type": "thread.delete",
-                                "commandId": Uuid::new_v4().to_string(),
-                                "threadId": delete_id.to_string(),
-                            }));
-                        } else {
-                            this.sidebar_state.delete_confirm = Some(delete_id.clone());
-                        }
-                        cx.notify();
-                    }),
-                )
-                .child(delete_label),
-        );
+        menu_el = menu_el.child(self.menu_item(
+            "mi-delete",
+            delete_label,
+            true,
+            cx,
+            move |this, _window, cx| {
+                if confirming {
+                    this.sidebar_state.context_menu = None;
+                    this.sidebar_state.delete_confirm = None;
+                    this.state.threads.retain(|t| t.id != delete_id);
+                    if this.state.selected.as_ref() == Some(&delete_id) {
+                        this.state.selected = None;
+                    }
+                    this.dispatch(json!({
+                        "type": "thread.delete",
+                        "commandId": Uuid::new_v4().to_string(),
+                        "threadId": delete_id.to_string(),
+                    }));
+                    this.push_toast(ToastKind::Info, "Thread deleted", delete_title.clone(), None, cx);
+                } else {
+                    this.sidebar_state.delete_confirm = Some(delete_id.clone());
+                }
+                cx.notify();
+            },
+        ));
 
         deferred(
             anchored()
@@ -757,7 +1252,9 @@ impl AppView {
                 .filter(|t| t.title.to_lowercase().contains(&query))
                 .cloned()
                 .collect();
-            hits.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            hits.sort_by_key(|t| {
+                (self.is_snoozed(t), Reverse(t.updated_at.clone()))
+            });
             if hits.is_empty() {
                 list = list.child(
                     div()
@@ -873,10 +1370,16 @@ impl AppView {
                         .filter(|t| t.project_id == project.id)
                         .cloned()
                         .collect();
-                    threads.sort_by(|a, b| {
-                        b.pinned
-                            .cmp(&a.pinned)
-                            .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    // Pinned first (ordered by pinOrderKey like the web's
+                    // pinned block), then awake threads, snoozed last.
+                    threads.sort_by_key(|t| {
+                        (
+                            !t.pinned,
+                            t.pin_order_key.is_none(),
+                            t.pin_order_key.clone().unwrap_or_default(),
+                            self.is_snoozed(t),
+                            Reverse(t.updated_at.clone()),
+                        )
                     });
                     if threads.is_empty() {
                         section = section.child(
@@ -916,8 +1419,10 @@ impl AppView {
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
                 if ev.keystroke.key == "escape" {
                     this.sidebar_state.context_menu = None;
+                    this.sidebar_state.delete_confirm = None;
                     this.sidebar_state.renaming = None;
                     this.sidebar_state.new_project_open = false;
+                    this.sidebar_state.snooze_target = None;
                     cx.notify();
                 }
             }))
@@ -1078,8 +1583,173 @@ impl AppView {
 }
 
 impl AppView {
-    /// Snooze/thread-action overlay rendered above the sidebar.
-    pub(crate) fn render_snooze_overlay(&self, _cx: &mut Context<Self>) -> gpui::Div {
+    /// Snooze modal: preset wake times (plus "Unsnooze" while snoozed),
+    /// rendered at AppView level above everything else.
+    pub(crate) fn render_snooze_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(thread_id) = self.sidebar_state.snooze_target.clone() else {
+            return div().into_any_element();
+        };
+        let now = unix_now();
+        let title = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .map(|t| t.title.to_string())
+            .unwrap_or_default();
+        let current = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .and_then(|t| t.snoozed_until.clone())
+            .filter(|until| unix_from_iso(until.as_ref()).is_some_and(|t| t > now));
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .w(px(320.))
+            .py_1()
+            .rounded_md()
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::border())
+            .text_sm()
+            .text_color(theme::fg())
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _ev, _window, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::fg_muted())
+                            .child("Snooze thread"),
+                    )
+                    .when(!title.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::fg())
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(title),
+                        )
+                    }),
+            )
+            .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()));
+
+        if let Some(until) = current {
+            let unsnooze_id = thread_id.clone();
+            card = card
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(format!("Snoozed until {}", until.get(..16).unwrap_or(&until))),
+                )
+                .child(
+                    div()
+                        .id("snooze-unsnooze")
+                        .px_3()
+                        .py_1p5()
+                        .cursor_pointer()
+                        .text_color(theme::primary())
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                this.unsnooze_thread(unsnooze_id.clone(), cx);
+                            }),
+                        )
+                        .child("Unsnooze"),
+                )
+                .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()));
+        }
+
+        for (index, (label, until)) in snooze_presets(now).into_iter().enumerate() {
+            let until_iso = iso_from_unix(until);
+            let when = format!("{} {} UTC", &until_iso[5..10], &until_iso[11..16]);
+            let preset_id = thread_id.clone();
+            card = card.child(
+                div()
+                    .id(("snooze-preset", index))
+                    .px_3()
+                    .py_1p5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            this.snooze_thread(preset_id.clone(), until_iso.clone(), cx);
+                        }),
+                    )
+                    .child(div().flex_none().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(when),
+                    ),
+            );
+        }
+
+        card = card
+            .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()))
+            .child(
+                div()
+                    .id("snooze-cancel")
+                    .px_3()
+                    .py_1p5()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_state.snooze_target = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("Cancel"),
+            );
+
         div()
+            .id("snooze-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x000000b3))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.sidebar_state.snooze_target = None;
+                    cx.notify();
+                }),
+            )
+            .child(card)
+            .into_any_element()
     }
 }
