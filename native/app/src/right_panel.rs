@@ -31,6 +31,7 @@ impl AppView {
         };
         div()
             .w(px(380.))
+            .flex_none()
             .h_full()
             .border_l_1()
             .border_color(crate::theme::border())
