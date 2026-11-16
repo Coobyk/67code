@@ -41,7 +41,7 @@ requires a new `native/server` handler matching the TS wire shape.
 | Citations on assistant messages                   | ❌     | citation chips/sources                                                                                                                |
 | Message feedback / copy                           | ❌     | no per-message actions                                                                                                                |
 | Expanded image viewer dialog                      | ❌     | inline images not decoded yet                                                                                                         |
-| Canvas/right-panel layout                         | ❌     | right panel tabs (files/PR/terminal) — major shell work                                                                               |
+| Canvas/right-panel layout                         | 🟡     | right panel renders Files/Terminals/PR panes; Terminals tab lists metadata + close/new; PR pane functional                            |
 
 ## Sidebar
 
@@ -60,55 +60,55 @@ requires a new `native/server` handler matching the TS wire shape.
 
 ## Terminal drawer
 
-| Feature                                   | Status | Notes                                                                                                                                                  |
-| ----------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Persistent per-thread terminals           | ❌     | needs `terminal.open/attach/write/resize/close/clear/observe` + `subscribeTerminalMetadata` — server PTY (portable-pty) + xterm-grade renderer in GPUI |
-| Agent-owned terminal contexts in composer | ❌     | ComposerPendingTerminalContexts                                                                                                                        |
+| Feature                                   | Status | Notes                                                                                                                                                                                                                                                     |
+| ----------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Persistent per-thread terminals           | 🟡     | `terminal.open/attach/write/resize/clear/close` + `subscribeTerminalMetadata` wired; ~200KB scrollback, small VT emulator (SGR colors, cursor ops, erase, scroll regions, alt screen); no live resize tracking, no drag-resize, `terminal.observe` unused |
+| Agent-owned terminal contexts in composer | ❌     | ComposerPendingTerminalContexts                                                                                                                                                                                                                           |
 
 ## Files / previews
 
-| Feature                                       | Status | Notes                                                                                              |
-| --------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- |
-| File explorer pane                            | ❌     | needs `projects.listEntries`/`listIgnoredFiles`/`filesystem.browse` RPCs                           |
-| Text file preview                             | ❌     | needs `projects.readFile` (+ `filesystem.getMetadata`)                                             |
-| Markdown preview                              | ❌     | renderer exists (markdown.rs); needs readFile                                                      |
-| Image preview                                 | ❌     | needs readFile/binary + image decode (image crate)                                                 |
-| File write/save                               | ❌     | `projects.writeFile`                                                                               |
-| Project content search dialog                 | ❌     | `projects.searchContents`                                                                          |
-| PDF/office/notebook/font/audio/video previews | 🚫     | GPUI has no document renderers; note: could open externally — degraded-by-design                   |
-| Agent browser preview panes                   | 🚫     | `preview.*` sessions need an embedded webview; no webview in GPUI — open in system browser instead |
+| Feature                                       | Status | Notes                                                                                                   |
+| --------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------- |
+| File explorer pane                            | ✅     | right-panel Files tab: lazy `projects.listEntries` tree, expand/collapse, explorer_reveal               |
+| Text file preview                             | ✅     | `projects.readFile` bottom-split preview with byte size + truncation notice                             |
+| Markdown preview                              | ✅     | readFile → markdown.rs render for .md paths                                                             |
+| Image preview                                 | ✅     | `assets.createUrl` + bearer GET → image decode (image crate)                                            |
+| File write/save                               | ❌     | `projects.writeFile` RPC exists; no editor UI                                                           |
+| Project content search dialog                 | ✅     | ctrl-shift-f: `projects.searchContents`/`searchEntries`, case/word/regex toggles, Enter→explorer reveal |
+| PDF/office/notebook/font/audio/video previews | 🚫     | GPUI has no document renderers; note: could open externally — degraded-by-design                        |
+| Agent browser preview panes                   | 🚫     | `preview.*` sessions need an embedded webview; no webview in GPUI — open in system browser instead      |
 
 ## Source control & PRs
 
-| Feature                     | Status | Notes                                                                            |
-| --------------------------- | ------ | -------------------------------------------------------------------------------- |
-| Branch picker in composer   | ❌     | needs `vcs.listRefs`/`switchRef`/`createRef` + `subscribeVcsBranch`              |
-| Worktree create/remove      | ❌     | `vcs.createWorktree`/`removeWorktree` + settings.worktrees                       |
-| VCS status chips            | ❌     | `subscribeVcsStatus`                                                             |
-| Git actions (pull, init)    | ❌     | `vcs.pull`/`vcs.init`, `git.runStackedAction`                                    |
-| Pull requests list/detail   | ❌     | ~25 `pullRequests.*` RPCs — GitHub-backed; feasible via `gh` CLI proxy on server |
-| PR diff/review sheets       | ❌     | `review.getDiff*` + `pullRequests.diffFileContents`; large                       |
-| Link PR to thread           | ❌     | `git.resolvePullRequest`, `pullRequests.linkedThreads`                           |
-| Source-control sign-in flow | 🟡     | could shell out to `gh auth`; OAuth device flow exists in TS server              |
+| Feature                     | Status | Notes                                                                                                                                                             |
+| --------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Branch picker in composer   | 🟡     | `vcs.listRefs`/`switchRef`/`createRef` picker + inline new-branch input live in the Pull Requests pane (vcs.rs); composer hookup pending                          |
+| Worktree create/remove      | ❌     | `vcs.createWorktree`/`removeWorktree` + settings.worktrees                                                                                                        |
+| VCS status chips            | 🟡     | `subscribeVcsStatus` snapshot + local/remote diffs drive the PRs-pane header (ref, upstream, ↑/↓, working-tree changes); no composer chips                        |
+| Git actions (pull, init)    | ❌     | `vcs.pull`/`vcs.init`, `git.runStackedAction`                                                                                                                     |
+| Pull requests list/detail   | ✅     | `pullRequests.list` (+`subscribeRefreshes` invalidation) with expandable rows: `pullRequests.detail` checks/reviewers/mergeability + `pullRequests.linkedThreads` |
+| PR diff/review sheets       | ❌     | `review.getDiff*` + `pullRequests.diffFileContents`; large                                                                                                        |
+| Link PR to thread           | 🟡     | thread's `linked_pull_request` badge pinned atop the PRs pane + `pullRequests.linkedThreads` rows in detail; no link/unlink action                                |
+| Source-control sign-in flow | 🟡     | could shell out to `gh auth`; OAuth device flow exists in TS server                                                                                               |
 
 ## Settings (web has ~30 routes; native has 9 sections)
 
-| Section                                                                                                               | Status | Notes                                                                               |
-| --------------------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------- |
-| Connection / Environments / Appearance / Providers / ACP Sessions / Authorized Clients / Archived / Shortcuts / About | ✅     |                                                                                     |
-| Notifications                                                                                                         | ❌     | NotificationSettings (per-event toggles) — client-persisted                         |
-| Chat defaults (mode/model defaults)                                                                                   | ❌     | settings.chat                                                                       |
-| Keybindings editor                                                                                                    | ❌     | `server.upsertKeybinding`/`removeKeybinding`                                        |
-| Projects (icons, defaults, scripts, actions)                                                                          | ❌     | `projects.mutate`, projectScripts, favicon picker                                   |
-| Secrets                                                                                                               | ❌     | `secrets.*` + SecretsSettings providers                                             |
-| Scheduled tasks                                                                                                       | ❌     | `scheduledTasks.*` (8 methods)                                                      |
-| Usage limits                                                                                                          | ❌     | `server.getUsageSummary`/`refreshUsageRates` + usage page                           |
-| Source control                                                                                                        | ❌     | `sourceControl.*`, `server.discoverSourceControl`                                   |
-| Integrations (MCP)                                                                                                    | ❌     | `mcpApps.*` — server MCP bridge, large                                              |
-| Devices (mobile labs)                                                                                                 | 🚫     | `device.*` — EAS/simulator hosts; desktop app is the wrong host for this UX (noted) |
-| Diagnostics / storage / maintenance                                                                                   | ❌     | `server.get*Diagnostics`/`getHostResources`/`getDatabaseStorage`/cleanup            |
-| Threads / diffs / worktrees / browser / access / beta / labs / voice / licenses                                       | ❌     | mostly client-persisted toggles or small sections                                   |
-| Scoped (env/local) settings axes                                                                                      | ❌     | settingsScope machinery — large                                                     |
+| Section                                                                                                               | Status | Notes                                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Connection / Environments / Appearance / Providers / ACP Sessions / Authorized Clients / Archived / Shortcuts / About | ✅     |                                                                                                                                                                   |
+| Notifications                                                                                                         | ❌     | NotificationSettings (per-event toggles) — client-persisted                                                                                                       |
+| Chat defaults (mode/model defaults)                                                                                   | ❌     | settings.chat                                                                                                                                                     |
+| Keybindings editor                                                                                                    | ❌     | `server.upsertKeybinding`/`removeKeybinding`                                                                                                                      |
+| Projects (icons, defaults, scripts, actions)                                                                          | ❌     | `projects.mutate`, projectScripts, favicon picker                                                                                                                 |
+| Secrets                                                                                                               | 🟡     | pending `secret_request` items answer via `secrets.answerRequest` (save/decline); web's provider (1Password) management not ported — server resolves answers only |
+| Scheduled tasks                                                                                                       | ✅     | `scheduledTasks.subscribe` stream + upsert/setEnabled/delete/runNow; compact schedule spec (interval/fixed_time/once/webhook — no cron type on the wire)          |
+| Usage limits                                                                                                          | 🟡     | `server.getUsageSummary`/`refreshUsageRates` day-bucketed table + period chips; no pricing/cost (server reports unpriced)                                         |
+| Source control                                                                                                        | ❌     | `sourceControl.*`, `server.discoverSourceControl`                                                                                                                 |
+| Integrations (MCP)                                                                                                    | ❌     | `mcpApps.*` — server MCP bridge, large                                                                                                                            |
+| Devices (mobile labs)                                                                                                 | 🚫     | `device.*` — EAS/simulator hosts; desktop app is the wrong host for this UX (noted)                                                                               |
+| Diagnostics / storage / maintenance                                                                                   | ✅     | `server.getProcessDiagnostics`/`getHostResources`/`getDatabaseStorage` stat table + `runStorageCleanup`/`reclaimDatabaseSpace`                                    |
+| Threads / diffs / worktrees / browser / access / beta / labs / voice / licenses                                       | ❌     | mostly client-persisted toggles or small sections                                                                                                                 |
+| Scoped (env/local) settings axes                                                                                      | ❌     | settingsScope machinery — large                                                                                                                                   |
 
 ## Other routes / features
 
