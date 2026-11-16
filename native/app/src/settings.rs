@@ -153,11 +153,13 @@ impl AppView {
 
     fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut nav = div()
+            .id("settings-nav-scroll")
             .flex()
             .flex_col()
             .w(px(180.))
             .flex_none()
             .h_full()
+            .overflow_y_scroll()
             .border_r_1()
             .border_color(theme::border())
             .px_2()
