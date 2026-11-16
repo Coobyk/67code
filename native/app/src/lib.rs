@@ -108,6 +108,10 @@ struct AppView {
     /// Live endpoint (url + token) for authenticated HTTP calls from
     /// settings surfaces; env switching updates both this and endpoint_label.
     active_endpoint: Option<net::ServerEndpoint>,
+    /// First snapshot already auto-selected a thread. `selected == None`
+    /// after that means a deliberate new-thread draft — a later snapshot
+    /// (reconnect) must not hijack it by re-picking `threads.first()`.
+    did_auto_select: bool,
     /// When the selected thread started running, for the "Working for …"
     /// row at the bottom of the timeline. `None` while idle.
     turn_started_at: Option<std::time::Instant>,
@@ -225,6 +229,7 @@ impl AppView {
                 .map(|e| e.http_url.clone())
                 .unwrap_or_else(|| "offline".to_string()),
             active_endpoint: config.endpoint.clone(),
+            did_auto_select: false,
             turn_started_at: None,
             working_pulse: 0,
             welcome_state: welcome::State::default(),
@@ -274,10 +279,12 @@ impl AppView {
                     .map(model::Thread::from_shell)
                     .collect();
                 if self.state.selected.is_none()
+                    && !self.did_auto_select
                     && let Some(first) = self.state.threads.first()
                 {
                     let id = first.id.clone();
                     self.state.selected = Some(id.clone());
+                    self.did_auto_select = true;
                     self.thread_items.clear();
                     if let Some(commands) = &self.commands {
                         let _ = commands.send(ClientCommand::SubscribeThread {
@@ -730,6 +737,7 @@ impl Render for AppView {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .child(
                         div()
