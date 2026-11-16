@@ -15,6 +15,7 @@ mod sidebar;
 mod text_field;
 mod theme;
 mod timeline;
+mod welcome;
 
 use gpui::{AppContext, Focusable, prelude::*,
     App, Bounds, Context, Entity, IntoElement, KeyBinding, Render,
@@ -102,6 +103,10 @@ struct AppView {
     turn_started_at: Option<std::time::Instant>,
     /// Half-second tick counter driving the working row's pulsing dot.
     working_pulse: u64,
+    /// First-run onboarding overlay (welcome.rs).
+    welcome_state: welcome::State,
+    /// Expanded image attachment viewer overlay (composer.rs).
+    expanded_image: Option<composer::ExpandedImage>,
 }
 
 impl AppView {
@@ -190,6 +195,8 @@ impl AppView {
             active_endpoint: config.endpoint.clone(),
             turn_started_at: None,
             working_pulse: 0,
+            welcome_state: welcome::State::default(),
+            expanded_image: None,
         }
     }
 
@@ -590,6 +597,9 @@ impl Render for AppView {
             .child(self.render_palette(cx))
             .child(self.render_settings(cx))
             .child(self.render_notifications(cx))
+            .child(self.render_welcome(cx))
+            .child(self.render_snooze_overlay(cx))
+            .child(self.render_image_overlay(cx))
     }
 }
 

@@ -1067,3 +1067,10 @@ impl AppView {
         root
     }
 }
+
+impl AppView {
+    /// Snooze/thread-action overlay rendered above the sidebar.
+    pub(crate) fn render_snooze_overlay(&self, _cx: &mut Context<Self>) -> gpui::Div {
+        div()
+    }
+}

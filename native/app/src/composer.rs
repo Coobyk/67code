@@ -966,3 +966,16 @@ impl AppView {
         root.child(footer)
     }
 }
+
+/// Data for the expanded-image overlay (set when a thumbnail is clicked).
+pub struct ExpandedImage {
+    pub name: String,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub mime: String,
+}
+
+impl AppView {
+    pub(crate) fn render_image_overlay(&self, _cx: &mut Context<Self>) -> gpui::Div {
+        div()
+    }
+}
