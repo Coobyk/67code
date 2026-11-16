@@ -127,6 +127,11 @@ pub enum ShellEvent {
     /// Raw auth-access stream value (`{type:"clientUpserted"|"clientRemoved"|
     /// "snapshot"|…, payload}`); the clients surface folds these into state.
     AuthAccessChange { value: Value },
+    /// Chunk values from a `ClientCommand::Subscribe` stream, raw and
+    /// unparsed — the owning surface decodes its own event shapes.
+    StreamChunk { stream_id: String, values: Vec<Value> },
+    /// The stream exited (success, failure, or socket drop).
+    StreamEnd { stream_id: String },
     Error(String),
     Disconnected(String),
 }
@@ -148,6 +153,16 @@ pub enum ClientCommand {
         payload: Value,
         reply: smol::channel::Sender<Value>,
     },
+    /// Open a windowed RPC stream (`terminal.attach`, `subscribeVcsStatus`, …).
+    /// Chunks arrive as `ShellEvent::StreamChunk` keyed by `stream_id`; the
+    /// Exit arrives as `ShellEvent::StreamEnd`.
+    Subscribe {
+        tag: String,
+        payload: Value,
+        stream_id: String,
+    },
+    /// Interrupt an open `Subscribe` stream by its `stream_id`.
+    InterruptStream { stream_id: String },
     /// Drop the current socket (or pending backoff) and reconnect now.
     Reconnect,
     /// Point the connection loop at a different server (environment switch).
@@ -579,6 +594,8 @@ enum SubKind {
     Thread,
     OlderSettled,
     AuthAccess,
+    /// Client-driven RPC stream; the string is the caller's `stream_id`.
+    Dynamic(String),
 }
 
 fn send_command(
@@ -613,6 +630,25 @@ fn send_command(
                 ));
             }
             subscriptions.insert(id, SubKind::Thread);
+        }
+        ClientCommand::Subscribe { stream_id, .. } => {
+            subscriptions.insert(id, SubKind::Dynamic(stream_id.clone()));
+        }
+        ClientCommand::InterruptStream { stream_id } => {
+            let rid = subscriptions
+                .iter()
+                .find_map(|(rid, kind)| {
+                    matches!(kind, SubKind::Dynamic(s) if s == stream_id).then_some(*rid)
+                });
+            if let Some(rid) = rid {
+                subscriptions.remove(&rid);
+                return socket.send(tungstenite::Message::Text(
+                    json!({"_tag": "Interrupt", "requestId": rid, "interruptors": []})
+                        .to_string()
+                        .into(),
+                ));
+            }
+            return Ok(());
         }
         _ => {}
     }
@@ -662,10 +698,19 @@ fn send_command(
             "payload": payload,
             "headers": [],
         }),
+        ClientCommand::Subscribe { tag, payload, .. } => json!({
+            "_tag": "Request",
+            "id": id,
+            "tag": tag,
+            "payload": payload,
+            "headers": [],
+        }),
         // Handled in the run loop — they never produce a frame.
         ClientCommand::Reconnect | ClientCommand::SwitchEndpoint { .. } => {
             unreachable!("control commands are handled in the run loop")
         },
+        // InterruptStream emits its frame in the subscription match above.
+        ClientCommand::InterruptStream { .. } => unreachable!(),
         ClientCommand::Interrupt { request_id } => json!({
             "_tag": "Interrupt",
             "requestId": request_id,
@@ -714,11 +759,22 @@ fn handle_frame(
                 let is_thread = matches!(subscriptions.get(&request_id), Some(SubKind::Thread));
                 let is_auth_access =
                     matches!(subscriptions.get(&request_id), Some(SubKind::AuthAccess));
+                let dynamic_stream = match subscriptions.get(&request_id) {
+                    Some(SubKind::Dynamic(s)) => Some(s.clone()),
+                    _ => None,
+                };
                 if std::env::var("C67_DEBUG").is_ok() {
                     eprintln!("[chunk] req={request_id} is_thread={is_thread} kinds={:?}",
                         frame["values"].as_array().map(|a| a.iter().map(|v| v["kind"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>()));
                 }
                 if let Some(values) = frame["values"].as_array() {
+                    if let Some(sid) = dynamic_stream {
+                        let _ = events.send_blocking(ShellEvent::StreamChunk {
+                            stream_id: sid,
+                            values: values.clone(),
+                        });
+                        continue;
+                    }
                     for value in values {
                         if is_auth_access {
                             let _ = events.send_blocking(ShellEvent::AuthAccessChange {
@@ -751,6 +807,12 @@ fn handle_frame(
                     continue;
                 }
                 let kind = request_id.and_then(|rid| subscriptions.remove(&rid));
+                if let Some(SubKind::Dynamic(sid)) = &kind {
+                    let _ = events.send_blocking(ShellEvent::StreamEnd {
+                        stream_id: sid.clone(),
+                    });
+                    continue;
+                }
                 if frame["exit"]["_tag"].as_str() == Some("Success")
                     && matches!(kind, Some(SubKind::OlderSettled))
                 {

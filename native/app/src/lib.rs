@@ -131,6 +131,11 @@ struct AppView {
     misc_settings_state: settings_misc::State,
     /// Tasks/Secrets/Diagnostics/Usage settings (settings_backend.rs).
     backend_settings_state: settings_backend::State,
+    /// Dynamic RPC streams opened by surfaces (terminal, vcs, tasks):
+    /// stream_id → chunk sink. Chunks arrive via `ShellEvent::StreamChunk`.
+    stream_sinks: std::collections::HashMap<String, smol::channel::Sender<serde_json::Value>>,
+    /// Counter minting unique stream ids.
+    next_stream_id: u64,
 }
 
 impl AppView {
@@ -228,6 +233,8 @@ impl AppView {
             search_state: search_dialog::State::default(),
             misc_settings_state: settings_misc::State::default(),
             backend_settings_state: settings_backend::State::default(),
+            stream_sinks: std::collections::HashMap::new(),
+            next_stream_id: 0,
         }
     }
 
@@ -350,6 +357,17 @@ impl AppView {
             }
             ShellEvent::AuthAccessChange { value } => {
                 self.observe_auth_access(&value, cx);
+            }
+            ShellEvent::StreamChunk { stream_id, values } => {
+                if let Some(tx) = self.stream_sinks.get(&stream_id) {
+                    for v in values {
+                        let _ = tx.try_send(v);
+                    }
+                }
+            }
+            ShellEvent::StreamEnd { stream_id } => {
+                // Dropping the sink closes the surface's receiver.
+                self.stream_sinks.remove(&stream_id);
             }
             ShellEvent::Disconnected(reason) => {
                 self.state.connection = ConnectionStatus::Disconnected(reason.into());
@@ -538,6 +556,40 @@ impl AppView {
     fn dispatch(&mut self, command: serde_json::Value) {
         if let Some(commands) = &self.commands {
             let _ = commands.send(ClientCommand::Dispatch { command });
+        }
+    }
+
+    /// Open a windowed RPC stream (`terminal.attach`, `subscribeVcsStatus`,
+    /// `scheduledTasks.subscribe`, …). Returns the stream id plus a receiver
+    /// that yields each raw chunk value; the receiver closes on stream end.
+    /// Surfaces drive their own `cx.spawn` loops on the receiver.
+    fn open_stream(
+        &mut self,
+        tag: &str,
+        payload: serde_json::Value,
+    ) -> Option<(String, smol::channel::Receiver<serde_json::Value>)> {
+        self.next_stream_id += 1;
+        let stream_id = format!("s{}", self.next_stream_id);
+        let (tx, rx) = smol::channel::unbounded();
+        self.stream_sinks.insert(stream_id.clone(), tx);
+        self.commands
+            .as_ref()?
+            .send(ClientCommand::Subscribe {
+                tag: tag.to_string(),
+                payload,
+                stream_id: stream_id.clone(),
+            })
+            .ok()?;
+        Some((stream_id, rx))
+    }
+
+    /// Interrupt an open dynamic stream (no-op if it already ended).
+    fn close_stream(&mut self, stream_id: &str) {
+        self.stream_sinks.remove(stream_id);
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(ClientCommand::InterruptStream {
+                stream_id: stream_id.to_string(),
+            });
         }
     }
 
