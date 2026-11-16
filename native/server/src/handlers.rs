@@ -21,6 +21,23 @@ pub fn is_windowed_tag(tag: &str) -> bool {
             | "orchestration.subscribeThread"
             | "orchestration.subscribeServerConfig"
             | "subscribeAuthAccess"
+            | "subscribeServerConfig"
+            | "subscribeVcsStatus"
+            | "subscribeVcsBranch"
+            | "subscribeTerminalMetadata"
+            | "subscribeServerLifecycle"
+            | "subscribeDiscoveredLocalServers"
+            | "subscribeProjectClones"
+            | "subscribePreviewEvents"
+            | "subscribeResourceTelemetry"
+            | "subscribeWorktreeSetup"
+            | "subscribeDeviceState"
+            | "scheduledTasks.subscribe"
+            | "provider.auth.subscribe"
+            | "provider.install.subscribe"
+            | "provider.chatgpt.handoff.subscribe"
+            | "pullRequests.subscribeRefreshes"
+            | "bedtimeReminder.subscribe"
     )
 }
 
@@ -87,10 +104,27 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
                 "ACP provider configuration is not supported by this driver.",
             ))
         }
-        other => RpcResult::err(json!({
-            "_tag": "RpcClientError",
-            "message": format!("unknown rpc tag: {other}"),
-        })),
+        other => {
+            if other.starts_with("filesystem.") || other.starts_with("projects.") {
+                crate::rpc_fs::handle(state, other, payload).await
+            } else if other.starts_with("vcs.") || other.starts_with("git.") {
+                crate::rpc_vcs::handle(state, other, payload).await
+            } else if other.starts_with("terminal.") || other.starts_with("worktreeSetup.") {
+                crate::rpc_terminal::handle(state, other, payload).await
+            } else if other.starts_with("scheduledTasks.") || other.starts_with("agentSessions.")
+                || other.starts_with("projectClone.")
+            {
+                crate::rpc_tasks::handle(state, other, payload).await
+            } else if other.starts_with("assets.") || other.starts_with("attachments.") {
+                crate::rpc_assets::handle(state, other, payload).await
+            } else if other.starts_with("pullRequests.") || other.starts_with("review.")
+                || other.starts_with("sourceControl.")
+            {
+                crate::rpc_prs::handle(state, other, payload).await
+            } else {
+                crate::rpc_misc::handle(state, other, payload).await
+            }
+        }
     }
 }
 
@@ -230,7 +264,25 @@ pub async fn run_stream(
                 )
                 .await;
         }
-        _ => {}
+        other => {
+            // Module-owned streams; each returns true if it claimed the tag.
+            let _ = crate::rpc_vcs::handle_subscription(
+                state.clone(), out.clone(), request_id, other, payload.clone(), window.clone(),
+            )
+            .await
+                || crate::rpc_terminal::handle_subscription(
+                    state.clone(), out.clone(), request_id, other, payload.clone(), window.clone(),
+                )
+                .await
+                || crate::rpc_tasks::handle_subscription(
+                    state.clone(), out.clone(), request_id, other, payload.clone(), window.clone(),
+                )
+                .await
+                || crate::rpc_misc::handle_subscription(
+                    state, out, request_id, other, payload, window,
+                )
+                .await;
+        }
     }
 }
 

@@ -1610,6 +1610,7 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
         | "thread.marked-unread"
         | "thread.metadata-updated"
         | "thread.pull-request-synced"
+        | "thread.pull-request-link-updated"
         | "thread.runtime-mode-updated"
         | "thread.interaction-mode-updated"
         | "thread.model-selection-updated"
@@ -2047,7 +2048,13 @@ fn apply_command(conn: &Connection, command: &Value) -> Result<ApplyResult, Stri
         "thread.stop" => apply_thread_stop(conn, command, &command_id),
         "thread.archive" | "thread.unarchive" | "thread.delete" | "thread.pin"
         | "thread.unpin" | "thread.metadata.update" | "thread.runtime-mode.set"
-        | "thread.interaction-mode.set" => apply_thread_mutation(conn, command, &command_id),
+        | "thread.interaction-mode.set" | "thread.snooze" | "thread.unsnooze"
+        | "thread.settle" | "thread.unsettle" | "thread.mark-unread" | "thread.visit"
+        | "thread.auto-settle.set" | "thread.tag.set" | "thread.pin.reorder"
+        | "thread.active.reorder" | "thread.model-selection.set"
+        | "thread.pull-request.link" | "thread.pull-request.unlink" => {
+            apply_thread_mutation(conn, command, &command_id)
+        }
         "runtime-request.respond" => apply_runtime_respond(conn, command, &command_id),
         "project.create" => apply_project_create(conn, command, &command_id),
         other => Err(format!("unsupported command type: {other}")),
@@ -2110,7 +2117,101 @@ fn apply_thread_mutation(
             if let Some(t) = command.get("title").and_then(Value::as_str) {
                 payload["title"] = json!(t);
             }
+            if let Some(b) = command.get("branch") {
+                payload["branch"] = b.clone();
+            }
+            if let Some(w) = command.get("worktreePath") {
+                payload["worktreePath"] = w.clone();
+            }
             "thread.metadata-updated"
+        }
+        "thread.snooze" => {
+            payload["snoozedUntil"] = command.get("snoozedUntil").cloned().unwrap_or(json!(now));
+            "thread.snoozed"
+        }
+        "thread.unsnooze" => {
+            payload["snoozedUntil"] = Value::Null;
+            "thread.unsnoozed"
+        }
+        "thread.settle" => {
+            payload["settledAt"] = command
+                .get("settledAt")
+                .cloned()
+                .unwrap_or(json!(now));
+            "thread.settled"
+        }
+        "thread.unsettle" => {
+            payload["settledAt"] = Value::Null;
+            "thread.unsettled"
+        }
+        "thread.mark-unread" => {
+            payload["markedUnreadAt"] = json!(now);
+            "thread.marked-unread"
+        }
+        "thread.visit" => {
+            payload["visitedAt"] = command
+                .get("visitedAt")
+                .cloned()
+                .unwrap_or(json!(now));
+            payload["markedUnreadAt"] = Value::Null;
+            "thread.visited"
+        }
+        "thread.auto-settle.set" => {
+            payload["autoSettleEnabled"] = command
+                .get("enabled")
+                .cloned()
+                .unwrap_or(json!(true));
+            "thread.auto-settle-set"
+        }
+        "thread.tag.set" => {
+            let tag = command.get("tag").cloned().unwrap_or(Value::Null);
+            let tagged = command.get("tagged").and_then(Value::as_bool).unwrap_or(true);
+            let mut tags: Vec<Value> = payload
+                .get("tags")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            tags.retain(|t| t != &tag);
+            if tagged && !tag.is_null() {
+                tags.push(tag);
+            }
+            payload["tags"] = Value::Array(tags);
+            "thread.tags-updated"
+        }
+        "thread.pin.reorder" => {
+            if let Some(k) = command.get("orderKey") {
+                payload["pinOrderKey"] = k.clone();
+            }
+            "thread.pin-reordered"
+        }
+        "thread.active.reorder" => {
+            if let Some(k) = command.get("orderKey") {
+                payload["activeOrderKey"] = k.clone();
+            }
+            "thread.active-reordered"
+        }
+        "thread.model-selection.set" => {
+            if let Some(ms) = command.get("modelSelection") {
+                payload["modelSelection"] = ms.clone();
+                if let Some(iid) = ms.get("instanceId") {
+                    payload["providerInstanceId"] = iid.clone();
+                }
+            }
+            "thread.model-selection-updated"
+        }
+        "thread.pull-request.link" => {
+            let mut link = command.clone();
+            if let Some(o) = link.as_object_mut() {
+                o.remove("type");
+                o.remove("commandId");
+                o.remove("threadId");
+            }
+            payload["linkedPullRequest"] = link;
+            "thread.pull-request-link-updated"
+        }
+        "thread.pull-request.unlink" => {
+            payload["linkedPullRequest"] = Value::Null;
+            "thread.pull-request-link-updated"
         }
         "thread.runtime-mode.set" => {
             if let Some(m) = command.get("runtimeMode").and_then(Value::as_str) {

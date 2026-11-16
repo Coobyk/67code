@@ -2,6 +2,13 @@ pub mod auth;
 pub mod domain;
 pub mod handlers;
 pub mod provider;
+pub mod rpc_assets;
+pub mod rpc_fs;
+pub mod rpc_misc;
+pub mod rpc_prs;
+pub mod rpc_tasks;
+pub mod rpc_terminal;
+pub mod rpc_vcs;
 pub mod store;
 pub mod ws_rpc;
 
@@ -167,6 +174,7 @@ pub async fn run(
             "/api/auth/clients/revoke-others",
             post(auth::revoke_other_clients),
         )
+        .route("/api/assets/{*key}", get(rpc_assets::serve_asset))
         .route("/ws", get(ws_rpc::ws_upgrade))
         .with_state(state);
 
