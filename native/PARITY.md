@@ -45,18 +45,18 @@ requires a new `native/server` handler matching the TS wire shape.
 
 ## Sidebar
 
-| Feature                                          | Status | Notes                                                                       |
-| ------------------------------------------------ | ------ | --------------------------------------------------------------------------- |
-| Projects + threads list                          | ✅     |                                                                             |
-| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                                             |
-| Status indicators (running dot, PR link, unread) | ✅     | running dot, ⧉ PR glyph, 😴 snoozed, unread markers                         |
-| Drag-reorder threads                             | 🟡     | `thread.pin.reorder`/`thread.active.reorder` dispatched; no pointer-drag UX |
-| Snooze + custom snooze                           | 🟡     | presets + overlay; no custom datetime picker                                |
-| Undo-notice toasts on archive/delete             | ❌     | needs toast action buttons (push_toast callback support)                    |
-| Draft threads block                              | ❌     | drafts are client-side in web                                               |
-| Project icons/favicons                           | ❌     | ProjectFaviconPickerDialog; monogram exists?                                |
-| Settings gear                                    | ✅     | footer gear + ctrl-,                                                        |
-| Update pills / server version                    | 🚫     | Electron/desktop-update surface                                             |
+| Feature                                          | Status | Notes                                                                                                 |
+| ------------------------------------------------ | ------ | ----------------------------------------------------------------------------------------------------- |
+| Projects + threads list                          | ✅     |                                                                                                       |
+| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                                                                       |
+| Status indicators (running dot, PR link, unread) | ✅     | running dot, ⧉ PR glyph, 😴 snoozed, unread markers                                                   |
+| Drag-reorder threads                             | ✅     | pointer drag on pinned rows with spread order keys → `thread.pin.reorder`                             |
+| Snooze + custom snooze                           | ✅     | presets + custom "snooze until" field (relative durations / ISO parse) → `thread.snooze.until`        |
+| Undo-notice toasts on archive/delete             | ✅     | toast action buttons — Undo archive (`thread.unarchive`) / unsnooze                                   |
+| Draft threads block                              | ✅     | client-side drafts persisted on `ClientConfig.draft_threads`; sidebar block with open/delete/collapse |
+| Project icons/favicons                           | 🟡     | `projectIcon` chips in sidebar + icon picker in Projects settings; no favicon-image rendering         |
+| Settings gear                                    | ✅     | footer gear + ctrl-,                                                                                  |
+| Update pills / server version                    | 🚫     | Electron/desktop-update surface                                                                       |
 
 ## Terminal drawer
 
