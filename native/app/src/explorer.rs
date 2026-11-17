@@ -4,7 +4,9 @@
 //! lazy one-level `projects.listEntries {cwd, directoryPath}` directory loads
 //! on expand, `projects.readFile` for text/markdown preview, and
 //! `assets.createUrl` (`workspace-file` resource) + `GET /api/assets/<key>`
-//! for image previews. Binary files show a placeholder.
+//! for image previews. Files the inline preview can't render (pdf, office
+//! docs, notebooks, fonts, audio, video, other binaries) get a small card
+//! with an "Open externally" button that hands the file to `xdg-open`.
 //!
 //! `render_explorer_pane` is `&self` (right_panel.rs calls it that way), so
 //! state changes driven from render — project sync, reconnect retries — go
@@ -35,6 +37,99 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", 
 const PREVIEW_CHAR_CAP: usize = 200_000;
 /// GET /api/assets body limit for images.
 const IMAGE_FETCH_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Extensions routed to the "open externally" card without a readFile —
+/// grouped by the label the card shows. Anything not listed (and not an
+/// image) is tried as text; a `binary_file` read failure lands on the same
+/// card.
+const OFFICE_EXTENSIONS: &[&str] = &[
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "pages", "numbers", "key",
+];
+const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2", "eot", "pfb"];
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "wav", "ogg", "flac", "m4a", "aac", "opus", "aiff", "mid", "midi",
+];
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "webm", "mov", "mkv", "avi", "m4v", "mpg", "mpeg", "wmv",
+];
+const BINARY_EXTENSIONS: &[&str] = &[
+    "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "jar", "war", "exe", "dll", "so", "dylib",
+    "bin", "dat", "db", "sqlite", "sqlite3", "wasm", "class", "pyc", "o", "a", "dmg", "iso", "apk",
+    "aar", "pack", "idx",
+];
+
+/// Files the inline preview can't render — shown as an "open externally"
+/// card instead of attempting a text read.
+#[derive(Clone, Copy)]
+enum ExternalKind {
+    Pdf,
+    Office,
+    Notebook,
+    Font,
+    Audio,
+    Video,
+    Binary,
+}
+
+impl ExternalKind {
+    fn emoji(self) -> &'static str {
+        match self {
+            Self::Pdf => "📕",
+            Self::Office => "📄",
+            Self::Notebook => "📓",
+            Self::Font => "🔤",
+            Self::Audio => "🎵",
+            Self::Video => "🎬",
+            Self::Binary => "📦",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pdf => "PDF document",
+            Self::Office => "Office document",
+            Self::Notebook => "Jupyter notebook",
+            Self::Font => "Font file",
+            Self::Audio => "Audio file",
+            Self::Video => "Video file",
+            Self::Binary => "Binary file",
+        }
+    }
+}
+
+/// Extension-based external-file classification. Unknown extensions return
+/// None and still go through `projects.readFile` — the server's `binary_file`
+/// failure is the backstop for unlisted binaries.
+fn external_kind(path: &str) -> Option<ExternalKind> {
+    let (_, ext) = path.rsplit_once('.')?;
+    match ext.to_ascii_lowercase().as_str() {
+        "pdf" => Some(ExternalKind::Pdf),
+        "ipynb" => Some(ExternalKind::Notebook),
+        e if OFFICE_EXTENSIONS.contains(&e) => Some(ExternalKind::Office),
+        e if FONT_EXTENSIONS.contains(&e) => Some(ExternalKind::Font),
+        e if AUDIO_EXTENSIONS.contains(&e) => Some(ExternalKind::Audio),
+        e if VIDEO_EXTENSIONS.contains(&e) => Some(ExternalKind::Video),
+        e if BINARY_EXTENSIONS.contains(&e) => Some(ExternalKind::Binary),
+        _ => None,
+    }
+}
+
+/// Fire-and-forget `xdg-open` on a path or URL, with `gio open` as fallback.
+/// Only meaningful when the app shares the server's filesystem/browser —
+/// remote workspaces keep the button (it opens locally) rather than faking
+/// support.
+pub(crate) fn open_external(target: &str) {
+    if std::process::Command::new("xdg-open")
+        .arg(target)
+        .spawn()
+        .is_err()
+    {
+        let _ = std::process::Command::new("gio")
+            .arg("open")
+            .arg(target)
+            .spawn();
+    }
+}
 
 #[derive(Clone)]
 struct Entry {
@@ -75,7 +170,12 @@ enum PreviewKind {
         image: Arc<RenderImage>,
         byte_length: u64,
     },
-    Binary,
+    /// Non-inline-previewable file — emoji/name/size card + "Open externally".
+    External {
+        kind: ExternalKind,
+        /// On-disk size when the workspace root is statable locally.
+        byte_length: Option<u64>,
+    },
     Error {
         message: String,
     },
@@ -322,7 +422,7 @@ fn parse_entries(value: &Value) -> Vec<Entry> {
 
 /// Pull `(failure, message)` out of an Exit failure frame. Server errors land
 /// at `exit.cause.error` (RpcResult::err values) or `exit.cause.failure`.
-fn rpc_error(exit: &Value) -> (Option<String>, String) {
+pub(crate) fn rpc_error(exit: &Value) -> (Option<String>, String) {
     let cause = &exit["cause"];
     for err in [
         &cause["error"],
@@ -348,7 +448,7 @@ fn rpc_error(exit: &Value) -> (Option<String>, String) {
 
 /// Decode image bytes into a gpui-renderable image. gpui's software buffers
 /// are BGRA, so R and B are swapped (same as composer.rs::decode_thumbnail).
-fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let mut data = image::load_from_memory(bytes).ok()?.into_rgba8();
     for pixel in data.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -357,7 +457,10 @@ fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
 }
 
 /// Blocking bearer-authed GET → decoded image (runs inside `smol::unblock`).
-fn fetch_image(endpoint: &ServerEndpoint, url: &str) -> Result<(Arc<RenderImage>, u64), String> {
+pub(crate) fn fetch_image(
+    endpoint: &ServerEndpoint,
+    url: &str,
+) -> Result<(Arc<RenderImage>, u64), String> {
     let mut response = ureq::get(url)
         .header("authorization", format!("Bearer {}", endpoint.token))
         .call()
@@ -539,9 +642,35 @@ impl AppView {
         cx.notify();
         if is_image_path(&path) {
             self.explorer_load_image(path, cx);
+        } else if let Some(kind) = external_kind(&path) {
+            let byte_length = self.explorer_stat_len(&path);
+            self.explorer_state.preview = Some(Preview {
+                path,
+                kind: PreviewKind::External { kind, byte_length },
+            });
+            cx.notify();
         } else {
             self.explorer_read_file(path, cx);
         }
+    }
+
+    /// Absolute host path for a workspace-relative file. Only meaningful
+    /// when the server shares this machine's filesystem — the same caveat
+    /// `xdg-open` carries.
+    fn explorer_abs_path(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.explorer_state.project_root.trim_end_matches('/'),
+            path
+        )
+    }
+
+    /// Local stat of the workspace file, for the external card's size line.
+    /// None when the root isn't on this machine (remote environment).
+    fn explorer_stat_len(&self, path: &str) -> Option<u64> {
+        std::fs::metadata(self.explorer_abs_path(path))
+            .ok()
+            .map(|m| m.len())
     }
 
     fn explorer_read_file(&mut self, path: String, cx: &mut Context<Self>) {
@@ -610,7 +739,11 @@ impl AppView {
         } else {
             let (failure, message) = rpc_error(&exit);
             if failure.as_deref() == Some("binary_file") {
-                PreviewKind::Binary
+                let byte_length = self.explorer_stat_len(&path);
+                PreviewKind::External {
+                    kind: ExternalKind::Binary,
+                    byte_length,
+                }
             } else {
                 PreviewKind::Error { message }
             }
@@ -1168,6 +1301,7 @@ impl AppView {
                 ..
             } => (*byte_length, *truncated || *display_capped),
             PreviewKind::Image { byte_length, .. } => (*byte_length, false),
+            PreviewKind::External { byte_length, .. } => (byte_length.unwrap_or(0), false),
             _ => (0, false),
         };
         let editing = self
@@ -1320,17 +1454,40 @@ impl AppView {
                     ),
             );
         if truncated {
+            let abs = self.explorer_abs_path(&preview.path);
             pane = pane.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
                     .py_1()
                     .text_color(theme::fg_muted())
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(format!(
-                        "Preview limited to the first part of a {} file.",
+                    .child(div().flex_1().min_w_0().child(format!(
+                        "File truncated — preview shows the first part of a {} file.",
                         format_bytes(byte_length)
-                    )),
+                    )))
+                    .child(
+                        div()
+                            .id("explorer-truncated-open")
+                            .flex_none()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(theme::raised())
+                            .text_color(theme::fg())
+                            .hover(|s| s.bg(theme::hover()))
+                            .child("Open externally")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_this, _ev, _w, _cx| {
+                                    open_external(&abs);
+                                }),
+                            ),
+                    ),
             );
         }
         let body = div()
@@ -1349,16 +1506,46 @@ impl AppView {
                 .justify_center()
                 .text_color(theme::fg_muted())
                 .child("Loading…"),
-            PreviewKind::Binary => body
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .p_4()
-                .text_color(theme::fg_muted())
-                .child("Binary file — can't display as text.")
-                .child(div().font_family("monospace").child(preview.path.clone())),
+            PreviewKind::External { kind, byte_length } => {
+                let abs = self.explorer_abs_path(&preview.path);
+                body.flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .p_4()
+                    .text_color(theme::fg_muted())
+                    .child(div().text_xl().child(kind.emoji()))
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(theme::fg())
+                            .child(file_name(&preview.path).to_string()),
+                    )
+                    .child(div().child(match byte_length {
+                        Some(n) => format!("{} · {}", kind.label(), format_bytes(*n)),
+                        None => kind.label().to_string(),
+                    }))
+                    .child(
+                        div()
+                            .id("explorer-open-external")
+                            .mt_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .bg(theme::raised())
+                            .text_color(theme::fg())
+                            .hover(|s| s.bg(theme::hover()))
+                            .child("Open externally")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_this, _ev, _w, _cx| {
+                                    open_external(&abs);
+                                }),
+                            ),
+                    )
+            }
             PreviewKind::Error { message } => body
                 .flex()
                 .flex_col()

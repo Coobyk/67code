@@ -3,10 +3,12 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, Render,
-    SharedString, Subscription, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
+    AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, ObjectFit,
+    RenderImage, SharedString, Subscription, Window, anchored, deferred, div, img, point,
+    prelude::*, px, rgb, rgba,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -41,6 +43,17 @@ pub struct State {
     /// Project shell `icon` values keyed by project id. `net::parse_project`
     /// drops `icon`, so `load_project_icons` harvests it out-of-band.
     pub project_icons: HashMap<String, Value>,
+    /// Project shell `faviconPath` values keyed by project id, harvested by
+    /// the same out-of-band query as `project_icons`.
+    pub project_favicons: HashMap<String, String>,
+    /// project id → (favicon path loaded, decoded image). Loaded through
+    /// `assets.createUrl` (`project-favicon` resource) + bearer GET.
+    pub favicon_images: HashMap<String, (String, Arc<RenderImage>)>,
+    /// project id → favicon path with a fetch in flight.
+    pub favicon_loading: HashMap<String, String>,
+    /// project id → favicon path whose fetch/decode failed; not retried
+    /// until the harvested path changes.
+    pub favicon_failed: HashMap<String, String>,
     /// Whether the project-icon query already ran since the last shell event
     /// that could change it.
     pub icons_queried: bool,
@@ -451,6 +464,19 @@ fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
         }
         _ => None,
     }
+}
+
+/// 14px image chip for a decoded project favicon — same slot as
+/// `project_icon_chip`, shown when the project record carries a
+/// `faviconPath` that fetched and decoded cleanly.
+fn favicon_chip(image: &Arc<RenderImage>) -> AnyElement {
+    img(gpui::ImageSource::Render(image.clone()))
+        .flex_none()
+        .w(px(14.))
+        .h(px(14.))
+        .rounded_sm()
+        .object_fit(ObjectFit::Contain)
+        .into_any_element()
 }
 
 /// Drag payload for pointer-reordering pinned threads (dropped on another
@@ -1028,20 +1054,128 @@ impl AppView {
                 }
                 let value = &exit["value"];
                 let mut icons = HashMap::new();
+                let mut favicons = HashMap::new();
                 if let Some(projects) = value.get("projects").and_then(Value::as_array) {
                     for project in projects {
                         let id = project.get("id").and_then(Value::as_str);
-                        let icon = project.get("icon").filter(|v| !v.is_null());
+                        // `icon` is the legacy alias; the shell contract
+                        // field is `projectIcon`.
+                        let icon = project
+                            .get("icon")
+                            .or_else(|| project.get("projectIcon"))
+                            .filter(|v| !v.is_null());
                         if let (Some(id), Some(icon)) = (id, icon) {
                             icons.insert(id.to_string(), icon.clone());
+                        }
+                        let favicon = project
+                            .get("faviconPath")
+                            .and_then(Value::as_str)
+                            .filter(|p| !p.is_empty());
+                        if let (Some(id), Some(path)) = (id, favicon) {
+                            favicons.insert(id.to_string(), path.to_string());
                         }
                     }
                 }
                 this.sidebar_state.project_icons = icons;
+                // Drop cached favicon state whose path changed or went away;
+                // surviving entries keep their loaded image.
+                let favicon_state = &mut this.sidebar_state;
+                favicon_state
+                    .favicon_images
+                    .retain(|id, (path, _)| favicons.get(id) == Some(path));
+                favicon_state
+                    .favicon_loading
+                    .retain(|id, path| favicons.get(id) == Some(path));
+                favicon_state
+                    .favicon_failed
+                    .retain(|id, path| favicons.get(id) == Some(path));
+                favicon_state.project_favicons = favicons;
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Kick off favicon fetches for projects whose harvested `faviconPath`
+    /// isn't cached, in flight, or known-failed. Each load is the web's
+    /// `project-favicon` asset flow: `assets.createUrl {cwd, path}` then a
+    /// bearer-authed GET decoded through explorer's image pipeline. Runs
+    /// from `render_sidebar` (which has `&mut self`).
+    fn load_project_favicons(&mut self, cx: &mut Context<Self>) {
+        let Some(endpoint) = self.active_endpoint.clone() else {
+            return;
+        };
+        for project in &self.state.projects {
+            let id = project.id.to_string();
+            let Some(path) = self.sidebar_state.project_favicons.get(&id).cloned() else {
+                continue;
+            };
+            if self
+                .sidebar_state
+                .favicon_images
+                .get(&id)
+                .is_some_and(|(p, _)| p == &path)
+                || self.sidebar_state.favicon_loading.get(&id) == Some(&path)
+                || self.sidebar_state.favicon_failed.get(&id) == Some(&path)
+            {
+                continue;
+            }
+            self.sidebar_state
+                .favicon_loading
+                .insert(id.clone(), path.clone());
+            let Some(rx) = self.send_query(
+                "assets.createUrl",
+                json!({
+                    "resource": {
+                        "_tag": "project-favicon",
+                        "cwd": project.path.to_string(),
+                        "path": path,
+                    }
+                }),
+            ) else {
+                self.sidebar_state.favicon_loading.remove(&id);
+                continue;
+            };
+            let ep = endpoint.clone();
+            cx.spawn(async move |this, cx| {
+                let exit = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+                let result = if exit["_tag"].as_str() == Some("Success") {
+                    match exit["value"]["relativeUrl"].as_str() {
+                        Some(rel) => {
+                            let url = format!("{}{}", ep.http_url.trim_end_matches('/'), rel);
+                            smol::unblock(move || crate::explorer::fetch_image(&ep, &url))
+                                .await
+                                .map(|(image, _)| image)
+                                .map_err(|_| ())
+                        }
+                        None => Err(()),
+                    }
+                } else {
+                    Err(())
+                };
+                let _ = this.update(cx, |this, cx| {
+                    // A newer harvest may have changed the path or removed
+                    // the project — only land the image when the in-flight
+                    // marker still matches what we fetched.
+                    if this.sidebar_state.favicon_loading.get(&id) == Some(&path) {
+                        this.sidebar_state.favicon_loading.remove(&id);
+                        match result {
+                            Ok(image) => {
+                                this.sidebar_state.favicon_images.insert(id, (path, image));
+                            }
+                            Err(()) => {
+                                this.sidebar_state.favicon_failed.insert(id, path);
+                            }
+                        }
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// Pinned threads of `project_id` in display order, mirroring the web's
@@ -1937,6 +2071,7 @@ impl AppView {
     pub fn render_sidebar(&mut self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         self.wire_sidebar(cx);
         self.load_project_icons(cx);
+        self.load_project_favicons(cx);
 
         let query = self.sidebar_state.query.trim().to_lowercase();
         let filtering = !query.is_empty();
@@ -2032,10 +2167,18 @@ impl AppView {
                             .child(chevron),
                     )
                     .when_some(
+                        // A loaded favicon beats the icon chip; failures and
+                        // in-flight fetches fall back to the icon/monogram.
                         self.sidebar_state
-                            .project_icons
+                            .favicon_images
                             .get(project.id.as_ref())
-                            .and_then(|icon| project_icon_chip(icon, project.name.as_ref())),
+                            .map(|(_, image)| favicon_chip(image))
+                            .or_else(|| {
+                                self.sidebar_state
+                                    .project_icons
+                                    .get(project.id.as_ref())
+                                    .and_then(|icon| project_icon_chip(icon, project.name.as_ref()))
+                            }),
                         |row, chip| row.child(chip),
                     )
                     .child(
