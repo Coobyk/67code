@@ -152,14 +152,16 @@ fn os_notify(mode: &str, title: &str, body: Option<&str>) {
     if mode.contains("sound") {
         for (bin, args) in [
             ("canberra-gtk-play", vec!["-i", "complete"]),
-            ("paplay", vec!["/usr/share/sounds/freedesktop/stereo/complete.oga"]),
-            ("aplay", vec!["/usr/share/sounds/freedesktop/stereo/complete.wav"]),
+            (
+                "paplay",
+                vec!["/usr/share/sounds/freedesktop/stereo/complete.oga"],
+            ),
+            (
+                "aplay",
+                vec!["/usr/share/sounds/freedesktop/stereo/complete.wav"],
+            ),
         ] {
-            if std::process::Command::new(bin)
-                .args(&args)
-                .spawn()
-                .is_ok()
-            {
+            if std::process::Command::new(bin).args(&args).spawn().is_ok() {
                 break;
             }
         }
@@ -325,15 +327,17 @@ impl AppView {
                     _ => return,
                 };
                 let detail = truncate(&thread.title, 60);
-                os_notify(
-                    &self.client_config.notification_mode,
-                    title,
-                    Some(&detail),
-                );
+                os_notify(&self.client_config.notification_mode, title, Some(&detail));
                 if !self.in_app_notifications_enabled() {
                     return;
                 }
-                self.push_toast(kind, title, Some(detail), Some(thread.id.clone().into()), cx);
+                self.push_toast(
+                    kind,
+                    title,
+                    Some(detail),
+                    Some(thread.id.clone().into()),
+                    cx,
+                );
             }
             ShellEvent::ThreadItemUpdated { item } => {
                 let kind = item.kind.as_str();
