@@ -10,13 +10,14 @@
 //! keymap/action dispatch, which is what lets Enter apply a slash command
 //! instead of submitting the raw text.
 
-use std::sync::Arc;
+use std::io::Read as _;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    ClipboardEntry, Context, Entity, EntityInputHandler, ExternalPaths, Focusable, KeystrokeEvent,
-    MouseButton, ObjectFit, RenderImage, SharedString, Subscription, Window, div, img, prelude::*,
-    px, rgb, rgba,
+    ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths, Focusable,
+    KeystrokeEvent, MouseButton, ObjectFit, RenderImage, SharedString, Subscription, Window, div,
+    img, prelude::*, px, rgb, rgba,
 };
 use serde_json::json;
 
@@ -120,6 +121,33 @@ pub struct State {
     /// Staged `TerminalContextRecord`s for `message.dispatch.context`.
     pub terminal_contexts: Vec<TerminalContext>,
 
+    /// Provider rows from `server.getConfig` — feeds the usage banner's
+    /// real limit percentages and prompt-link driver names.
+    pub config_providers: Vec<serde_json::Value>,
+    /// `usageLimitSources` snapshots when the server reports them (accounts
+    /// whose limits supplement the provider rows).
+    pub usage_limit_sources: Vec<serde_json::Value>,
+    config_loading: bool,
+    config_fetched_at: Option<Instant>,
+
+    /// Active dictation capture (mic recording), toggled by the footer chip
+    /// or the `composer.dictation` chord.
+    pub dictation: Option<Dictation>,
+    /// `environment.transcribePcm` in flight — the chip reads "…".
+    dictation_transcribing: bool,
+    /// Half-second counter while recording; alternates the chip's red pulse.
+    pub dictation_pulse: u64,
+
+    /// Last `guestShare.create` URL (Share menu shows it with Copy/Open).
+    pub share_url: Option<String>,
+    /// Thread `share_url` belongs to — a stale link never renders for a
+    /// different selection.
+    pub share_thread: String,
+    /// `guestShare.create` in flight.
+    pub share_creating: bool,
+    /// Last create error, shown inside the Share menu.
+    pub share_error: Option<String>,
+
     /// The 10s background refresh (branch status, usage) is running.
     tick_started: bool,
     attach_subscription: Option<Subscription>,
@@ -172,6 +200,17 @@ impl Default for State {
             terminals: Vec::new(),
             ctx_fetching: None,
             terminal_contexts: Vec::new(),
+            config_providers: Vec::new(),
+            usage_limit_sources: Vec::new(),
+            config_loading: false,
+            config_fetched_at: None,
+            dictation: None,
+            dictation_transcribing: false,
+            dictation_pulse: 0,
+            share_url: None,
+            share_thread: String::new(),
+            share_creating: false,
+            share_error: None,
             tick_started: false,
             attach_subscription: None,
             branch_subscription: None,
@@ -237,6 +276,8 @@ pub enum PickerKind {
     Branch,
     /// Running terminals to attach as message context.
     Terminals,
+    /// Guest-share link + hosted prompt link.
+    Share,
 }
 
 /// A staged terminal context — serialized as a `TerminalContextRecord` inside
@@ -287,6 +328,68 @@ pub enum AttachmentKind {
     Image { bytes: Vec<u8>, mime: String },
     File { path: String },
     Text { content: String },
+}
+
+/// A live microphone capture: a recorder child writing raw s16 mono PCM at
+/// 16 kHz to stdout, drained by a reader thread into `pcm`.
+pub struct Dictation {
+    child: std::process::Child,
+    pcm: Arc<Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    started: Instant,
+}
+
+/// Recorder commands tried in order — PipeWire, PulseAudio, then ALSA. All
+/// emit raw s16 mono PCM at 16 kHz on stdout, which is what
+/// `environment.transcribePcm` expects.
+const RECORDERS: &[(&str, &[&str])] = &[
+    (
+        "pw-record",
+        &[
+            "--target",
+            "0",
+            "--rate",
+            "16000",
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-",
+        ],
+    ),
+    (
+        "parecord",
+        &["--rate=16000", "--channels=1", "--format=s16le", "--raw"],
+    ),
+    (
+        "arecord",
+        &["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-"],
+    ),
+];
+
+/// ~16 minutes of 16 kHz s16 mono audio — the reader stops collecting past
+/// this so a forgotten recording cannot grow without bound.
+const DICTATION_MAX_BYTES: usize = 32_000_000;
+
+/// Hosted app origin for generated prompt links (`DEFAULT_HOSTED_APP_URL`
+/// in packages/shared/src/connectAuth.ts); `C67_HOSTED_APP_URL` overrides.
+const DEFAULT_HOSTED_APP_URL: &str = "https://app.t3.codes";
+
+/// `PROMPT_LINK_MAX_PROMPT_LENGTH` in packages/shared/src/promptLinks.ts.
+const PROMPT_LINK_MAX_PROMPT_LENGTH: usize = 8_000;
+
+/// Percent-encode for a URL query value (unreserved characters only).
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Static provider/model catalog for the model picker (the web client resolves
@@ -486,6 +589,19 @@ fn rpc_error(exit: &serde_json::Value) -> String {
     "The request failed.".to_string()
 }
 
+/// Failure detail for `environment.transcribePcm` — the `VoiceInputErrorPill`
+/// equivalent: a CloudSpeechError key reason appends the settings hint.
+fn dictation_error_detail(exit: &serde_json::Value) -> String {
+    let message = rpc_error(exit);
+    let reason = exit["cause"]["error"]["reason"].as_str().unwrap_or("");
+    match reason {
+        "missing-key" | "unreadable-key" | "rejected-key" => {
+            format!("{message} Configure cloud speech keys in Settings → Voice.")
+        }
+        _ => message,
+    }
+}
+
 /// Strip ANSI escape sequences (CSI, OSC, and two-byte ESC sequences) from
 /// raw PTY scrollback so the terminal-context record is plain text.
 fn strip_terminal_escapes(input: &str) -> String {
@@ -577,6 +693,29 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
     let Some(view) = app_view(window) else {
         return;
     };
+
+    // `composer.dictation` — the shared default is mod+shift+d with
+    // `when: "!terminalFocus"` (packages/shared/src/keybindings.ts), so a
+    // focused terminal keeps the chord for itself (splitVertical there).
+    if event.keystroke.key.eq_ignore_ascii_case("d")
+        && event.keystroke.modifiers.shift
+        && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+        && !event.keystroke.modifiers.alt
+    {
+        let terminal_focus = {
+            let this = view.read(cx);
+            this.terminal_state.drawer_open
+                && window
+                    .focused(cx)
+                    .is_some_and(|handle| !this.composer_field_focused(&handle, cx))
+        };
+        if !terminal_focus {
+            view.update(cx, |this, cx| this.toggle_dictation(window, cx));
+            cx.stop_propagation();
+        }
+        return;
+    }
+
     let (
         slash_open,
         picker_open,
@@ -993,6 +1132,21 @@ impl AppView {
         self.state.selected_thread().is_some_and(|t| t.running())
     }
 
+    /// True when `handle` is the focus of one of the composer's own text
+    /// fields (input, attach path, branch name) — the `composer.dictation`
+    /// chord's `!terminalFocus` guard treats anything else under an open
+    /// terminal drawer as terminal focus.
+    fn composer_field_focused(&self, handle: &gpui::FocusHandle, cx: &gpui::App) -> bool {
+        [
+            Some(&self.composer),
+            self.composer_state.attach_field.as_ref(),
+            self.composer_state.branch_field.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|field| field.read(cx).focus_handle(cx) == *handle)
+    }
+
     /// Staged terminal-context records belonging to the selected thread.
     fn staged_ctx_count(&self) -> usize {
         let Some(id) = self.state.selected_thread().map(|t| t.id.to_string()) else {
@@ -1103,6 +1257,376 @@ impl AppView {
                 thumbnail: None,
             });
         }
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // Dictation
+    // ------------------------------------------------------------------
+
+    /// Mic chip / `composer.dictation` chord: first click records, second
+    /// click stops and sends the PCM to `environment.transcribePcm`.
+    fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_state.dictation.is_some() {
+            self.finish_dictation(window, cx);
+        } else {
+            self.start_dictation(cx);
+        }
+    }
+
+    /// Spawn the first available recorder (`pw-record` → `parecord` →
+    /// `arecord`) and drain its PCM stdout on a reader thread. The button
+    /// stays enabled with no recorder installed — the user gets a toast
+    /// naming the packages instead of a silently dead control.
+    fn start_dictation(&mut self, cx: &mut Context<Self>) {
+        if self.composer_state.dictation.is_some() || self.composer_state.dictation_transcribing {
+            return;
+        }
+        if self.state.connection != ConnectionStatus::Connected {
+            self.push_toast(
+                ToastKind::Error,
+                "Dictation needs a connected server",
+                Some("The transcript is sent to the server for speech-to-text.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        }
+        let mut spawned = None;
+        for (bin, args) in RECORDERS {
+            if let Ok(child) = std::process::Command::new(bin)
+                .args(*args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                spawned = Some(child);
+                break;
+            }
+        }
+        let Some(mut child) = spawned else {
+            self.push_toast(
+                ToastKind::Error,
+                "No audio recorder found",
+                Some(
+                    "Install pipewire-utils (pw-record), pulseaudio-utils (parecord), or alsa-utils (arecord)."
+                        .to_string(),
+                ),
+                None,
+                cx,
+            );
+            return;
+        };
+        let pcm: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let reader = child.stdout.take().map(|mut stdout| {
+            let sink = pcm.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut data) = sink.lock() {
+                                if data.len() < DICTATION_MAX_BYTES {
+                                    data.extend_from_slice(&buffer[..n]);
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        self.composer_state.dictation = Some(Dictation {
+            child,
+            pcm,
+            reader,
+            started: Instant::now(),
+        });
+        self.composer_state.dictation_pulse = 0;
+        cx.notify();
+        // Half-second repaint for the pulsing chip + elapsed readout.
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(Duration::from_millis(500)).await;
+                let recording = this
+                    .update(cx, |this, cx| {
+                        this.composer_state.dictation_pulse =
+                            this.composer_state.dictation_pulse.wrapping_add(1);
+                        cx.notify();
+                        this.composer_state.dictation.is_some()
+                    })
+                    .unwrap_or(false);
+                if !recording {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Stop the recorder, base64 the collected PCM, and send
+    /// `environment.transcribePcm`. A Success transcript is appended to the
+    /// draft; a Failure toasts the server message plus a settings hint when
+    /// the failure looks like an unconfigured cloud key.
+    fn finish_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut dictation) = self.composer_state.dictation.take() else {
+            return;
+        };
+        if let Err(error) = dictation.child.kill() {
+            eprintln!("[dictation] recorder kill failed: {error}");
+        }
+        if let Err(error) = dictation.child.wait() {
+            eprintln!("[dictation] recorder wait failed: {error}");
+        }
+        if let Some(reader) = dictation.reader.take() {
+            if reader.join().is_err() {
+                eprintln!("[dictation] reader thread panicked");
+            }
+        }
+        let bytes = std::mem::take(&mut *dictation.pcm.lock().unwrap_or_else(|e| e.into_inner()));
+        cx.notify();
+        if bytes.is_empty() {
+            self.push_toast(
+                ToastKind::Error,
+                "No audio captured",
+                Some("Check microphone permissions and the default input source.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        }
+        // The wire also accepts `provider`/`model`; the server resolves its
+        // own cloud-speech defaults when they are omitted (this client has
+        // no voice-destination settings yet).
+        let Some(rx) = self.send_query(
+            "environment.transcribePcm",
+            json!({ "pcm": base64_encode(&bytes) }),
+        ) else {
+            self.push_toast(
+                ToastKind::Error,
+                "Dictation failed",
+                Some("Not connected to a server.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        };
+        self.composer_state.dictation_transcribing = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.composer_state.dictation_transcribing = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    let text = exit["value"]["text"]
+                        .as_str()
+                        .or_else(|| exit["value"]["transcript"].as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if text.is_empty() {
+                        this.push_toast(ToastKind::Info, "No speech detected", None, None, cx);
+                    } else {
+                        let mut draft = this.composer_state.draft.clone();
+                        if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
+                            draft.push(' ');
+                        }
+                        draft.push_str(&text);
+                        this.composer_state.draft = draft.clone();
+                        this.composer_state.slash_open = false;
+                        this.composer_state.mention_open = false;
+                        this.set_composer_text(&draft, window, cx);
+                    }
+                } else {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Dictation failed",
+                        Some(dictation_error_detail(&exit)),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------------------
+    // Server config (provider usage limits)
+    // ------------------------------------------------------------------
+
+    /// `server.getConfig` — `providers[].usageLimits` feeds the banner's
+    /// real "X% of limit" numbers; `instanceId → driver` feeds prompt
+    /// links. Same ~5 min cadence as `getUsageSummary`.
+    fn fetch_provider_config(&mut self, cx: &mut Context<Self>) {
+        if self.composer_state.config_loading {
+            return;
+        }
+        let Some(rx) = self.send_query("server.getConfig", json!({})) else {
+            return;
+        };
+        self.composer_state.config_loading = true;
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.composer_state;
+                s.config_loading = false;
+                s.config_fetched_at = Some(Instant::now());
+                if exit["_tag"].as_str() == Some("Success") {
+                    if let Some(providers) = exit["value"]["providers"].as_array() {
+                        s.config_providers = providers.clone();
+                    }
+                    // `usageLimitSources` is stream-only opt-in on the real
+                    // server; servers that include it still populate it.
+                    if let Some(sources) = exit["value"]["usageLimitSources"].as_array() {
+                        s.usage_limit_sources = sources.clone();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `server.getConfig → providers[].driver` for an instanceId, when the
+    /// config stream has delivered providers.
+    fn provider_driver(&self, instance_id: &str) -> Option<String> {
+        self.composer_state
+            .config_providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == Some(instance_id))
+            .and_then(|p| p["driver"].as_str())
+            .map(str::to_string)
+    }
+
+    // ------------------------------------------------------------------
+    // Share menu (guest link + hosted prompt link)
+    // ------------------------------------------------------------------
+
+    /// `guestShare.create` for the selected thread — the result URL is
+    /// copied to the clipboard and kept in `share_url` so the menu offers
+    /// Copy/Open afterwards.
+    fn create_guest_share(&mut self, cx: &mut Context<Self>) {
+        if self.composer_state.share_creating {
+            return;
+        }
+        let Some(thread_id) = self.state.selected_thread().map(|t| t.id.to_string()) else {
+            return;
+        };
+        let Some(rx) = self.send_query("guestShare.create", json!({ "threadId": thread_id }))
+        else {
+            self.push_toast(
+                ToastKind::Error,
+                "Guest link failed",
+                Some("Not connected to a server.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        };
+        self.composer_state.share_creating = true;
+        self.composer_state.share_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.composer_state;
+                s.share_creating = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    let url = exit["value"]["url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    if url.is_empty() {
+                        s.share_error = Some("The server returned an empty link.".to_string());
+                    } else {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        s.share_url = Some(url);
+                        s.share_thread = thread_id;
+                        s.share_error = None;
+                        this.push_toast(
+                            ToastKind::Success,
+                            "Guest link copied",
+                            Some(
+                                "Anyone with the link can watch this thread for 24 hours."
+                                    .to_string(),
+                            ),
+                            None,
+                            cx,
+                        );
+                    }
+                } else {
+                    let message = rpc_error(&exit);
+                    s.share_error = Some(message.clone());
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Guest link failed",
+                        Some(message),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Build the hosted `app.t3.codes/new?prompt=…` link for the current
+    /// draft (the web client's `buildNewThreadLink`, including its
+    /// provider/model params when the config stream names the driver) and
+    /// copy it to the clipboard.
+    fn copy_prompt_link(&mut self, cx: &mut Context<Self>) {
+        let prompt = self.composer_state.draft.trim().to_string();
+        if prompt.is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Type a prompt first",
+                Some("A prompt link shares the composer draft.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        }
+        if prompt.chars().count() > PROMPT_LINK_MAX_PROMPT_LENGTH {
+            self.push_toast(
+                ToastKind::Error,
+                "Prompt is too long to link",
+                Some(format!(
+                    "Prompt links carry at most {PROMPT_LINK_MAX_PROMPT_LENGTH} characters."
+                )),
+                None,
+                cx,
+            );
+            return;
+        }
+        let origin = std::env::var("C67_HOSTED_APP_URL")
+            .ok()
+            .filter(|o| !o.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_HOSTED_APP_URL.to_string());
+        let mut url = format!("{origin}/new?prompt={}", url_encode(&prompt));
+        // `provider` names the driver, not the instance; the web looks the
+        // driver up by instanceId and drops both params when unknown.
+        if let Some(driver) = self.provider_driver(&self.provider) {
+            url.push_str(&format!(
+                "&provider={}&model={}",
+                url_encode(&driver),
+                url_encode(&self.model)
+            ));
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        self.composer_state.picker = None;
+        self.push_toast(ToastKind::Success, "Prompt link copied", None, None, cx);
         cx.notify();
     }
 
@@ -1440,11 +1964,20 @@ impl AppView {
     }
 
     /// Slow background refresh driven by the composer tick: branch status
-    /// (~20 s), usage summary (~5 min), and a stray terminal-meta stream
-    /// if the ctx picker closed without its own teardown.
+    /// (~20 s), usage summary (~5 min), the server-config stream behind the
+    /// usage banner, and a stray terminal-meta stream if the ctx picker
+    /// closed without its own teardown.
     fn composer_periodic(&mut self, cx: &mut Context<Self>) {
         if self.state.connection != ConnectionStatus::Connected {
             return;
+        }
+        if !self.composer_state.config_loading
+            && self
+                .composer_state
+                .config_fetched_at
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(300))
+        {
+            self.fetch_provider_config(cx);
         }
         let scope = self.composer_project().map(|(id, _)| id);
         if scope != self.composer_state.branch_scope {
@@ -1528,24 +2061,90 @@ impl AppView {
         .detach();
     }
 
-    /// Compact banner over the composer when today's buckets carry usage.
-    /// `getUsageSummary` exposes token totals, not provider limit
-    /// percentages — the web's usage-limit bars have no wire equivalent —
-    /// so this shows a totals notice that warns on heavy use.
+    /// A `usageLimits` row that is actually usable: no `unavailable`
+    /// marker and at least one window (`limitsNotice` in
+    /// packages/shared/src/usageLimits.ts treats both as "no data").
+    fn usable_limits(limits: &serde_json::Value) -> Option<&serde_json::Value> {
+        if limits.is_null()
+            || !limits["unavailable"].is_null()
+            || limits["windows"].as_array().is_none_or(|w| w.is_empty())
+        {
+            return None;
+        }
+        Some(limits)
+    }
+
+    /// "(label, usedPercent, resetsAt)" for the fullest reported window on
+    /// the selected provider — its own `usageLimits` first, then a matching
+    /// `usageLimitSources` account (mirrors `collectProviderUsageLimits`).
+    fn usage_limit_window(&self) -> Option<(String, f64, Option<String>)> {
+        let provider = self
+            .composer_state
+            .config_providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == Some(self.provider.as_str()))?;
+        let limits = Self::usable_limits(&provider["usageLimits"]).or_else(|| {
+            let driver = provider["driver"].as_str().unwrap_or_default();
+            self.composer_state
+                .usage_limit_sources
+                .iter()
+                .flat_map(|source| source["accounts"].as_array().into_iter().flatten())
+                .find(|account| account["driver"].as_str() == Some(driver))
+                .and_then(|account| Self::usable_limits(&account["usageLimits"]))
+        })?;
+        let window = limits["windows"]
+            .as_array()?
+            .iter()
+            .filter_map(|w| w["usedPercent"].as_f64().map(|pct| (w, pct)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+        let label = window.0["label"].as_str().unwrap_or("usage").to_string();
+        let resets = window.0["resetsAt"].as_str().map(str::to_string);
+        Some((label, window.1, resets))
+    }
+
+    /// Compact banner over the composer when the wire has usage data.
+    /// `subscribeServerConfig → providers[].usageLimits.windows` gives real
+    /// "X% of limit" numbers; when no provider reports limits the banner
+    /// falls back to `getUsageSummary` token/cost totals and warns on the
+    /// same heavy-use threshold as before.
     fn render_usage_banner(&self) -> gpui::Div {
         let mut banner = div();
-        let Some(summary) = &self.composer_state.usage_summary else {
-            return banner;
-        };
-        let (tokens, cost, sessions) = usage_totals(summary);
-        if tokens == 0 {
-            return banner;
-        }
         let today = day_string(unix_now());
         if self.composer_state.usage_dismissed_day.as_deref() == Some(today.as_str()) {
             return banner;
         }
-        let heavy = tokens >= 2_000_000 || cost >= 5.0;
+        let limit = self.usage_limit_window();
+        let (tokens, cost, sessions) = self
+            .composer_state
+            .usage_summary
+            .as_ref()
+            .map(usage_totals)
+            .unwrap_or_default();
+        if limit.is_none() && tokens == 0 {
+            return banner;
+        }
+        let heavy = limit
+            .as_ref()
+            .map(|(_, pct, _)| *pct >= 80.)
+            .unwrap_or_else(|| tokens >= 2_000_000 || cost >= 5.0);
+        let mut text = String::new();
+        if let Some((label, pct, resets)) = &limit {
+            text.push_str(&format!("{pct:.0}% of {label} limit"));
+            // ISO timestamps arrive as `…THH:MM…Z`; show the clock time.
+            if let Some(hm) = resets.as_deref().and_then(|iso| iso.get(11..16)) {
+                text.push_str(&format!(" · resets {hm}"));
+            }
+            if tokens > 0 {
+                text.push_str(" · ");
+            }
+        }
+        if tokens > 0 {
+            text.push_str(&format!(
+                "{} · ${cost:.2} · {sessions} session{} today",
+                compact_tokens(tokens),
+                if sessions == 1 { "" } else { "s" },
+            ));
+        }
         banner = banner
             .flex()
             .items_center()
@@ -1566,11 +2165,7 @@ impl AppView {
                     .text_color(theme::fg_muted())
             })
             .child("◔")
-            .child(div().flex_1().child(format!(
-                "Usage today: {} · ${cost:.2} · {sessions} session{}",
-                compact_tokens(tokens),
-                if sessions == 1 { "" } else { "s" },
-            )))
+            .child(div().flex_1().child(text))
             .child(
                 div()
                     .id("usage-dismiss")
@@ -2528,6 +3123,159 @@ impl AppView {
                     );
                 }
             }
+            PickerKind::Share => {
+                let s = &self.composer_state;
+                let thread_id = self.state.selected_thread().map(|t| t.id.to_string());
+                // Guest share — `guestShare.create` makes a 24 h link that
+                // lets an unauthenticated browser watch the thread and
+                // propose messages (web: GuestShareDialog).
+                match &thread_id {
+                    Some(tid) => {
+                        let share_here = s
+                            .share_url
+                            .as_ref()
+                            .filter(|_| s.share_thread == *tid)
+                            .cloned();
+                        if let Some(url) = share_here {
+                            panel = panel.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .child(url.clone()),
+                            );
+                            panel = panel.child(
+                                menu_row(
+                                    "share-copy",
+                                    "Copy guest link",
+                                    Some("Copied when the link was created".into()),
+                                    false,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_event, window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            url.clone(),
+                                        ));
+                                        let Some(view) = app_view(window) else {
+                                            return;
+                                        };
+                                        view.update(cx, |this, cx| {
+                                            this.push_toast(
+                                                ToastKind::Success,
+                                                "Guest link copied",
+                                                None,
+                                                None,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ),
+                            );
+                            let open_url = s.share_url.clone().unwrap_or_default();
+                            panel = panel.child(
+                                menu_row(
+                                    "share-open",
+                                    "Open in browser",
+                                    Some("Opens the guest link".into()),
+                                    false,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_event, _window, cx| {
+                                        cx.open_url(&open_url);
+                                    },
+                                ),
+                            );
+                            panel = panel.child(
+                                menu_row(
+                                    "share-new",
+                                    "Create new link",
+                                    Some("A new link ends the current one".into()),
+                                    false,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_event, window, cx| {
+                                        let Some(view) = app_view(window) else {
+                                            return;
+                                        };
+                                        view.update(cx, |this, cx| this.create_guest_share(cx));
+                                    },
+                                ),
+                            );
+                        } else {
+                            panel = panel.child(
+                                menu_row(
+                                    "share-create",
+                                    if s.share_creating {
+                                        "Creating guest link…"
+                                    } else {
+                                        "Create guest link"
+                                    },
+                                    Some(
+                                        "Guests watch this thread and propose messages · 24 h"
+                                            .into(),
+                                    ),
+                                    false,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_event, window, cx| {
+                                        let Some(view) = app_view(window) else {
+                                            return;
+                                        };
+                                        view.update(cx, |this, cx| this.create_guest_share(cx));
+                                    },
+                                ),
+                            );
+                        }
+                        if let Some(error) = &s.share_error {
+                            panel = panel.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_xs()
+                                    .text_color(danger())
+                                    .child(error.clone()),
+                            );
+                        }
+                    }
+                    None => {
+                        panel = panel.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child("Select a thread to create a guest link"),
+                        );
+                    }
+                }
+                // Hosted prompt link — built client-side like the web's
+                // `buildNewThreadLink`; carries the draft plus provider/model
+                // when the config stream names the driver.
+                panel = panel.child(div().h(px(1.)).mx_1().bg(theme::border()));
+                panel = panel.child(
+                    menu_row(
+                        "share-prompt",
+                        "Copy prompt link",
+                        Some("app.t3.codes link that opens a new thread with this draft".into()),
+                        false,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |_event, window, cx| {
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| this.copy_prompt_link(cx));
+                        },
+                    ),
+                );
+            }
         }
         panel
     }
@@ -2892,7 +3640,54 @@ impl AppView {
                         });
                     })
                     .child(format!("{} effort", effort_label(&state.effort))),
-            );
+            )
+            // Dictation toggle — spawn a recorder, then send the PCM to
+            // `environment.transcribePcm`. Red pulsing chip + elapsed while
+            // recording, "…" while the transcript is in flight.
+            .child({
+                let recording = state.dictation.is_some();
+                let transcribing = state.dictation_transcribing;
+                let pulse = state.dictation_pulse % 2 == 0;
+                let label = if let Some(dictation) = &state.dictation {
+                    let elapsed = dictation.started.elapsed().as_secs();
+                    format!("● {}:{:02}", elapsed / 60, elapsed % 60)
+                } else if transcribing {
+                    "Mic …".to_string()
+                } else {
+                    "Mic".to_string()
+                };
+                div()
+                    .id("composer-dictation")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if recording { danger() } else { theme::border() })
+                    .text_xs()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .when(recording, |s| {
+                        s.text_color(danger()).bg(if pulse {
+                            rgba(0xff5a5a14)
+                        } else {
+                            rgba(0xff5a5a2e)
+                        })
+                    })
+                    .when(!recording, |s| {
+                        s.text_color(theme::fg_muted())
+                            .hover(|s| s.bg(theme::hover()))
+                    })
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| this.toggle_dictation(window, cx));
+                    })
+                    .child(label)
+            });
 
         // Branch chip — selected thread's project; opens the ref picker.
         // Hidden until `vcs.refreshStatus` confirms the root is a git repo.
@@ -2931,6 +3726,17 @@ impl AppView {
                     format!("ctx ({ctx_count})")
                 },
                 PickerKind::Terminals,
+                state.picker,
+            ));
+        }
+
+        // Share chip — guest link for the selected thread plus a hosted
+        // prompt link for the current draft.
+        if self.state.connection == ConnectionStatus::Connected {
+            footer = footer.child(footer_chip(
+                "composer-share",
+                "Share",
+                PickerKind::Share,
                 state.picker,
             ));
         }
