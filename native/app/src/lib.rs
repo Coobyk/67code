@@ -5,15 +5,15 @@ mod clients;
 mod composer;
 mod config;
 mod envs;
+mod explorer;
+mod integrations;
 mod markdown;
 mod model;
 pub mod net;
-mod explorer;
 mod notifications;
 mod palette;
 mod right_panel;
 mod search_dialog;
-mod integrations;
 mod settings;
 mod settings_backend;
 mod settings_extra;
@@ -26,9 +26,9 @@ mod timeline;
 mod vcs;
 mod welcome;
 
-use gpui::{AppContext, Focusable, prelude::*,
-    App, Bounds, Context, Entity, IntoElement, KeyBinding, Render,
-    ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, px, size,
+use gpui::{
+    App, AppContext, Bounds, Context, Entity, Focusable, IntoElement, KeyBinding, Render,
+    ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use model::{AppState, ConnectionStatus, Role};
@@ -46,6 +46,12 @@ gpui::actions!(
         NewThread,
         CloseOverlay,
         FocusSearch,
+        OpenFilePicker,
+        ClosePanel,
+        PrevThread,
+        NextThread,
+        TogglePin,
+        ToggleModelPicker,
     ]
 );
 
@@ -76,8 +82,7 @@ impl AppConfig {
         });
         Self {
             endpoint,
-            provider: std::env::var("C67_PROVIDER")
-                .unwrap_or_else(|_| "devReplay".to_string()),
+            provider: std::env::var("C67_PROVIDER").unwrap_or_else(|_| "devReplay".to_string()),
             model: std::env::var("C67_MODEL").unwrap_or_else(|_| "showcase".to_string()),
         }
     }
@@ -133,6 +138,8 @@ struct AppView {
     vcs_state: vcs::State,
     /// Project content-search dialog (search_dialog.rs).
     search_state: search_dialog::State,
+    /// Integrations (MCP apps) settings (integrations.rs).
+    integrations_state: integrations::State,
     /// Notifications/Chat/Projects settings (settings_misc.rs).
     misc_settings_state: settings_misc::State,
     /// Tasks/Secrets/Diagnostics/Usage settings (settings_backend.rs).
@@ -241,6 +248,7 @@ impl AppView {
             terminal_state: terminal_drawer::State::default(),
             vcs_state: vcs::State::default(),
             search_state: search_dialog::State::default(),
+            integrations_state: integrations::State::default(),
             misc_settings_state,
             backend_settings_state: settings_backend::State::default(),
             stream_sinks: std::collections::HashMap::new(),
@@ -302,7 +310,12 @@ impl AppView {
                     path: p.workspace_root.into(),
                     expanded: true,
                 };
-                match self.state.projects.iter().position(|e| e.id.as_ref() == p.id) {
+                match self
+                    .state
+                    .projects
+                    .iter()
+                    .position(|e| e.id.as_ref() == p.id)
+                {
                     Some(i) => self.state.projects[i] = project,
                     None => self.state.projects.push(project),
                 }
@@ -315,7 +328,12 @@ impl AppView {
                     self.state.threads.retain(|t| t.id.as_ref() != thread.id);
                 } else {
                     let entry = model::Thread::from_shell(&thread);
-                    match self.state.threads.iter().position(|e| e.id.as_ref() == thread.id) {
+                    match self
+                        .state
+                        .threads
+                        .iter()
+                        .position(|e| e.id.as_ref() == thread.id)
+                    {
                         Some(i) => self.state.threads[i] = entry,
                         None => self.state.threads.push(entry),
                     }
@@ -343,7 +361,12 @@ impl AppView {
                         path: p.workspace_root.into(),
                         expanded: true,
                     };
-                    match self.state.projects.iter().position(|e| e.id.as_ref() == p.id) {
+                    match self
+                        .state
+                        .projects
+                        .iter()
+                        .position(|e| e.id.as_ref() == p.id)
+                    {
                         Some(i) => self.state.projects[i] = entry,
                         None => self.state.projects.push(entry),
                     }
@@ -352,7 +375,11 @@ impl AppView {
             ShellEvent::OlderSettledThreads { threads } => {
                 for thread in threads {
                     if thread.deleted
-                        || self.state.threads.iter().any(|t| t.id.as_ref() == thread.id)
+                        || self
+                            .state
+                            .threads
+                            .iter()
+                            .any(|t| t.id.as_ref() == thread.id)
                     {
                         continue;
                     }
@@ -412,22 +439,20 @@ impl AppView {
                         return;
                     };
                     let thread_id = uuid::Uuid::new_v4().to_string();
-                    self.dispatch(
-                        serde_json::json!({
-                            "type": "thread.create",
-                            "commandId": uuid::Uuid::new_v4().to_string(),
-                            "threadId": thread_id,
-                            "projectId": project.id.to_string(),
-                            "title": text.chars().take(60).collect::<String>(),
-                            "modelSelection": self.model_selection(),
-                            "runtimeMode": self.composer_state.runtime_mode.clone(),
-                            "interactionMode": self.composer_state.interaction_mode.clone(),
-                            "branch": null,
-                            "worktreePath": null,
-                            "createdBy": "user",
-                            "creationSource": "web",
-                        }),
-                    );
+                    self.dispatch(serde_json::json!({
+                        "type": "thread.create",
+                        "commandId": uuid::Uuid::new_v4().to_string(),
+                        "threadId": thread_id,
+                        "projectId": project.id.to_string(),
+                        "title": text.chars().take(60).collect::<String>(),
+                        "modelSelection": self.model_selection(),
+                        "runtimeMode": self.composer_state.runtime_mode.clone(),
+                        "interactionMode": self.composer_state.interaction_mode.clone(),
+                        "branch": null,
+                        "worktreePath": null,
+                        "createdBy": "user",
+                        "creationSource": "web",
+                    }));
                     self.state.selected = Some(thread_id.clone().into());
                     if let Some(commands) = &self.commands {
                         let _ = commands.send(ClientCommand::SubscribeThread {
@@ -438,9 +463,7 @@ impl AppView {
                 }
             };
 
-            let attachments = serde_json::Value::Array(
-                self.composer_state.drain_attachments(),
-            );
+            let attachments = serde_json::Value::Array(self.composer_state.drain_attachments());
             // A busy thread queues the message behind the active run instead
             // of interrupting it (web parity); `dispatch_override` is the
             // composer's run-options pick (steer/restart/queue).
@@ -458,20 +481,18 @@ impl AppView {
                 }
                 None => serde_json::json!({ "type": "start_immediately" }),
             };
-            self.dispatch(
-                serde_json::json!({
-                    "type": "message.dispatch",
-                    "commandId": uuid::Uuid::new_v4().to_string(),
-                    "threadId": thread_id,
-                    "messageId": uuid::Uuid::new_v4().to_string(),
-                    "text": text.to_string(),
-                    "modelSelection": self.model_selection(),
-                    "attachments": attachments,
-                    "dispatchMode": dispatch_mode,
-                    "createdBy": "user",
-                    "creationSource": "web",
-                }),
-            );
+            self.dispatch(serde_json::json!({
+                "type": "message.dispatch",
+                "commandId": uuid::Uuid::new_v4().to_string(),
+                "threadId": thread_id,
+                "messageId": uuid::Uuid::new_v4().to_string(),
+                "text": text.to_string(),
+                "modelSelection": self.model_selection(),
+                "attachments": attachments,
+                "dispatchMode": dispatch_mode,
+                "createdBy": "user",
+                "creationSource": "web",
+            }));
         } else {
             self.state.messages.push(model::Message {
                 role: Role::Agent,
@@ -522,10 +543,7 @@ impl AppView {
     ) {
         self.terminal_state.drawer_open = open;
         if !open {
-            self.composer
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window, cx);
+            self.composer.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
     }
@@ -856,7 +874,56 @@ pub fn run(config: AppConfig) {
             KeyBinding::new("ctrl-`", ToggleTerminalDrawer, Some("App")),
             KeyBinding::new("ctrl-b", TogglePanel, Some("App")),
             KeyBinding::new("escape", CloseOverlay, Some("App")),
+            // Web-parity additions (web `mod` ≈ native `ctrl`):
+            KeyBinding::new("ctrl-j", ToggleTerminalDrawer, Some("App")),
+            KeyBinding::new("ctrl-alt-b", TogglePanel, Some("App")),
+            KeyBinding::new("ctrl-p", OpenFilePicker, Some("App")),
+            KeyBinding::new("ctrl-w", ClosePanel, Some("App")),
+            KeyBinding::new("ctrl-{", PrevThread, Some("App")),
+            KeyBinding::new("ctrl-}", NextThread, Some("App")),
+            KeyBinding::new("ctrl-shift-p", TogglePin, Some("App")),
+            KeyBinding::new("ctrl-shift-m", ToggleModelPicker, Some("App")),
+            KeyBinding::new("ctrl-shift-o", NewThread, Some("App")),
+            KeyBinding::new("ctrl-shift-n", NewThread, Some("App")),
         ]);
+        // Global handlers for the parity bindings above; the element-level
+        // `on_action`s on the root view handle the original set.
+        macro_rules! app_handler {
+            ($action:ty, $body:expr) => {
+                cx.on_action::<$action>(move |_action, app| {
+                    let Some(handle) = app.active_window() else {
+                        return;
+                    };
+                    let _ = handle.update(app, move |root, window, app| {
+                        if let Ok(view) = root.downcast::<AppView>() {
+                            view.update(app, |this, cx| {
+                                let body: fn(&mut AppView, &mut Window, &mut Context<AppView>) =
+                                    $body;
+                                body(this, window, cx);
+                            });
+                        }
+                    });
+                });
+            };
+        }
+        app_handler!(OpenFilePicker, |this, _window, cx| {
+            this.open_file_picker(cx)
+        });
+        app_handler!(ClosePanel, |this, window, cx| {
+            this.close_panel_or_drawer(window, cx)
+        });
+        app_handler!(PrevThread, |this, _window, cx| {
+            this.step_thread_selection(-1, cx)
+        });
+        app_handler!(NextThread, |this, _window, cx| {
+            this.step_thread_selection(1, cx)
+        });
+        app_handler!(TogglePin, |this, _window, _cx| {
+            this.toggle_selected_thread_pin()
+        });
+        app_handler!(ToggleModelPicker, |this, _window, cx| {
+            this.toggle_model_picker(cx)
+        });
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         cx.open_window(
             WindowOptions {
