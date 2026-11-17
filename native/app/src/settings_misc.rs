@@ -12,6 +12,13 @@
 //!   `defaultAutoPull`. All are ServerSettings written through
 //!   `server.updateSettings {patch:{…}}`; the mirror loads lazily from
 //!   `server.getConfig → settings` (Cell-flag lazy-load like archived.rs).
+//! - **Scope** — a Global/Project selector (`scope_project`, persisted on
+//!   `ClientConfig.settings_scope_project`) mirrors the web's scoped
+//!   settings: `PROJECT_SCOPED_SERVER_SETTING_KEYS` rows write
+//!   `settings.projectSettingsOverrides[projectId][key]` via
+//!   `update_scoped_setting`/`clear_scoped_override` (merge by project, like
+//!   `planScopedSettingsPatch`), and each scoped row shows an
+//!   "override"/"inherited" chip in project scope.
 //! - **Projects** lists `state.projects` with inline rename
 //!   (`project.update`), two-stage delete (`project.delete`), add-existing-
 //!   folder (`project.create`) and scaffold-new (`projects.createNew`, which
@@ -72,6 +79,11 @@ const RUNTIME_MODES: &[(&str, &str, &str)] = &[
 /// `resolveEnvModeLabel` in apps/web/src/components/BranchToolbar.logic.ts.
 const ENV_MODES: &[(&str, &str)] = &[("local", "Current checkout"), ("worktree", "New worktree")];
 
+/// `ProjectScript.icon` literals — the enum in
+/// packages/contracts/src/project.ts.
+pub(crate) const PROJECT_SCRIPT_ICONS: &[&str] =
+    &["play", "test", "lint", "configure", "build", "debug"];
+
 /// Project-icon emoji choices — `PROJECT_EMOJIS` in
 /// apps/web/src/projectIconOptions.ts (same order).
 const PROJECT_EMOJIS: &[&str] = &[
@@ -92,6 +104,8 @@ pub(crate) fn pack_model(instance: &str, model: &str) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenList {
     NotificationMode,
+    /// Global/Project scope selector rendered above the scoped sections.
+    SettingsScope,
     DefaultModel,
     FallbackModel,
     RuntimeMode,
@@ -113,6 +127,7 @@ impl State {
     pub(crate) fn seed_from_config(&mut self, cfg: &crate::config::ClientConfig) {
         self.notification_mode = cfg.notification_mode.clone();
         self.in_app_notifications = cfg.in_app_notifications;
+        self.scope_project = cfg.settings_scope_project.clone();
     }
 }
 
@@ -121,6 +136,7 @@ impl OpenList {
     pub(crate) fn prefix(self) -> &'static str {
         match self {
             OpenList::NotificationMode => "misc-notif-mode",
+            OpenList::SettingsScope => "misc-settings-scope",
             OpenList::DefaultModel => "misc-default-model",
             OpenList::FallbackModel => "misc-fallback-model",
             OpenList::RuntimeMode => "misc-runtime-mode",
@@ -150,10 +166,33 @@ pub struct State {
     pub(crate) settings_error: Option<String>,
     /// Expanded option list, if any.
     open_list: Option<OpenList>,
+    /// Settings scope: `Some(project_id)` makes scoped rows write
+    /// `settings.projectSettingsOverrides[project_id]` instead of the global
+    /// setting. Mirrors the web's Global/Project scope selector
+    /// (`PROJECT_SCOPED_SERVER_SETTING_KEYS` decides which rows scope).
+    /// Persisted on `ClientConfig.settings_scope_project`.
+    pub(crate) scope_project: Option<String>,
+    /// `server.getConfig → environment.serverVersion` (About & updates row).
+    pub(crate) server_version: Option<String>,
     /// Wave-3 sections (Keybindings / Source Control / Threads) — the
     /// AppView field list lives in lib.rs, so extra-section state hangs off
     /// this struct instead.
     pub(crate) extra: crate::settings_extra::ExtraState,
+
+    // ── Project scripts (`defaultProjectScripts`, scoped) ───────────────
+    /// Add/edit form visible in the Projects section.
+    script_form_open: bool,
+    /// Script id being edited; `None` = the form adds a new script.
+    script_editing: Option<String>,
+    script_name_draft: String,
+    script_command_draft: String,
+    /// `ProjectScript.icon` literal for the form.
+    script_icon: String,
+    script_on_create: bool,
+    script_on_settle: bool,
+    script_name_field: Option<Entity<TextField>>,
+    script_command_field: Option<Entity<TextField>>,
+    script_subs: Vec<Subscription>,
 
     // ── Notification prefs (client/device-local in the web) ─────────
     // Persisted via `ClientConfig.notification_mode` / `.in_app_notifications`
@@ -386,6 +425,11 @@ impl AppView {
                         match reply {
                             Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
                                 state.settings = exit["value"]["settings"].clone();
+                                state.server_version =
+                                    exit["value"]["environment"]["serverVersion"]
+                                        .as_str()
+                                        .or_else(|| exit["value"]["version"].as_str())
+                                        .map(str::to_string);
                                 state.settings_error = None;
                                 this.apply_server_defaults();
                                 this.seed_extra_fields(cx);
@@ -452,6 +496,19 @@ impl AppView {
             && let Value::Object(patch) = &patch
         {
             for (key, value) in patch {
+                // Per-project override entries merge by project id so one
+                // scoped write can't drop a sibling project's overrides.
+                if key == "projectSettingsOverrides"
+                    && let Value::Object(src) = value
+                {
+                    let dst = settings.entry(key.clone()).or_insert_with(|| json!({}));
+                    if let Value::Object(dst) = dst {
+                        for (pid, entry) in src {
+                            dst.insert(pid.clone(), entry.clone());
+                        }
+                    }
+                    continue;
+                }
                 settings.insert(key.clone(), value.clone());
             }
         }
@@ -485,6 +542,283 @@ impl AppView {
         cx.notify();
     }
 
+    // ─── Settings scope (Global / Project overrides) ──────────────────────
+
+    /// Scoped override keys where `null` is a stored value (not "inherit") —
+    /// `NULLABLE_PROJECT_SETTINGS_OVERRIDES` in packages/contracts/settings.ts.
+    const NULLABLE_OVERRIDE_KEYS: &[&str] = &[
+        "defaultModelSelection",
+        "sourceControlWriterModelSelection",
+        "reviewGuideModelSelection",
+        "pullRequestMergeMethod",
+        "sidebarAutoSettleAfterDays",
+    ];
+
+    /// The project the scope selector points at, when it still exists.
+    pub(crate) fn scope_project_id(&self) -> Option<&str> {
+        let id = self.misc_settings_state.scope_project.as_deref()?;
+        self.state
+            .projects
+            .iter()
+            .any(|p| p.id.as_ref() == id)
+            .then_some(id)
+    }
+
+    /// The project's `projectSettingsOverrides` entry (empty object when none).
+    fn scope_override_entry(&self, project_id: &str) -> serde_json::Map<String, Value> {
+        self.misc_settings_state.settings["projectSettingsOverrides"][project_id]
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Effective value of a scoped setting: the project override when one is
+    /// set (including an explicit `null`), else the global value.
+    pub(crate) fn scoped_value(&self, key: &str) -> Value {
+        if let Some(pid) = self.scope_project_id()
+            && let Some(value) = self.scope_override_entry(pid).get(key)
+        {
+            return value.clone();
+        }
+        self.misc_settings_state.settings[key].clone()
+    }
+
+    /// Whether the scoped project explicitly overrides `key`.
+    pub(crate) fn scope_has_override(&self, key: &str) -> bool {
+        self.scope_project_id()
+            .map(|pid| self.scope_override_entry(pid).contains_key(key))
+            .unwrap_or(false)
+    }
+
+    /// Write `key = value` in the active scope. Global scope sends a plain
+    /// settings patch; project scope merges into
+    /// `projectSettingsOverrides[project_id]` like the web's
+    /// `planScopedSettingsPatch` — `null` for a key that cannot store null
+    /// removes the override (inherit) instead.
+    pub(crate) fn update_scoped_setting(
+        &mut self,
+        key: &str,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pid) = self.scope_project_id().map(str::to_string) else {
+            self.update_server_settings(json!({ key: value }), cx);
+            return;
+        };
+        let mut entry = self.scope_override_entry(&pid);
+        if value.is_null() && !Self::NULLABLE_OVERRIDE_KEYS.contains(&key) {
+            entry.remove(key);
+        } else {
+            entry.insert(key.to_string(), value);
+        }
+        self.update_server_settings(
+            json!({ "projectSettingsOverrides": { pid: Value::Object(entry) } }),
+            cx,
+        );
+    }
+
+    /// Drop `key` from the project's override entry — inherit the global
+    /// value again (web `clearProjectSettingsOverrides` per key).
+    pub(crate) fn clear_scoped_override(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(pid) = self.scope_project_id().map(str::to_string) else {
+            return;
+        };
+        let mut entry = self.scope_override_entry(&pid);
+        entry.remove(key);
+        self.update_server_settings(
+            json!({ "projectSettingsOverrides": { pid: Value::Object(entry) } }),
+            cx,
+        );
+    }
+
+    /// "override"/"inherited" chip shown next to a scoped row's control in
+    /// project scope. Clicking `override` clears the override back to
+    /// inherited; clicking `inherited` pins the effective value as an
+    /// explicit override.
+    pub(crate) fn scope_chip(
+        &self,
+        key: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        self.scope_project_id()?;
+        let overridden = self.scope_has_override(key);
+        Some(
+            div()
+                .id(format!("scope-chip-{key}"))
+                .px_1p5()
+                .py_0p5()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .when(overridden, |s| {
+                    s.bg(theme::selected()).text_color(theme::primary())
+                })
+                .when(!overridden, |s| {
+                    s.bg(theme::hover())
+                        .text_color(theme::fg_muted())
+                        .hover(|s| s.bg(theme::selected()))
+                })
+                .child(if overridden { "override" } else { "inherited" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        if this.scope_has_override(key) {
+                            this.clear_scoped_override(key, cx);
+                        } else {
+                            let value = this.scoped_value(key);
+                            this.update_scoped_setting(key, value, cx);
+                        }
+                    }),
+                ),
+        )
+    }
+
+    /// The Global/Project scope selector rendered above sections whose rows
+    /// support `projectSettingsOverrides`.
+    pub(crate) fn render_scope_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let pid = self.scope_project_id().map(str::to_string);
+        let label: SharedString = match &pid {
+            Some(id) => {
+                let name = self
+                    .state
+                    .projects
+                    .iter()
+                    .find(|p| p.id.as_ref() == id.as_str())
+                    .map(|p| p.name.to_string())
+                    .unwrap_or_else(|| id.clone());
+                format!("Project: {name}").into()
+            }
+            None => "Global".into(),
+        };
+        let current = pid.clone().unwrap_or_default();
+        let mut options = vec![(
+            String::new(),
+            "Global".to_string(),
+            Some("Server-wide defaults every project inherits.".to_string()),
+        )];
+        for project in &self.state.projects {
+            options.push((
+                project.id.to_string(),
+                project.name.to_string(),
+                Some("Override the marked rows for this project.".to_string()),
+            ));
+        }
+        self.select_setting(
+            "Apply settings to",
+            "Scoped rows show an “override”/“inherited” chip in project scope.",
+            OpenList::SettingsScope,
+            label,
+            &current,
+            options,
+            cx,
+        )
+    }
+
+    /// A select row with the scope chip beside the trigger (for
+    /// `PROJECT_SCOPED_SERVER_SETTING_KEYS` rows); option lists render the
+    /// same as `select_setting`.
+    pub(crate) fn scoped_select_setting(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        list: OpenList,
+        scoped_key: &'static str,
+        current: SharedString,
+        current_value: &str,
+        options: Vec<(String, String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let open = self.misc_settings_state.open_list == Some(list);
+        let mut control = div().flex().items_center().gap_2();
+        if let Some(chip) = self.scope_chip(scoped_key, cx) {
+            control = control.child(chip);
+        }
+        control = control.child(self.select_trigger(list, current, cx));
+        let mut out = div()
+            .flex()
+            .flex_col()
+            .child(setting_row(title, description, control));
+        if open {
+            let mut list_div = div().flex().flex_col().pb_1();
+            for (index, (value, label, detail)) in options.iter().enumerate() {
+                let value = value.clone();
+                let selected = value == current_value;
+                list_div = list_div.child(
+                    div()
+                        .id((list.prefix(), index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(theme::fg())
+                        .when(selected, |s| s.bg(theme::selected()))
+                        .when(!selected, |s| s.hover(|s| s.bg(theme::hover())))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.misc_pick(list, value.clone(), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .text_color(theme::primary())
+                                .child(if selected { "✓" } else { "" }),
+                        )
+                        .child(div().flex_none().child(label.clone()))
+                        .when_some(detail.clone(), |s, detail| {
+                            s.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .child(detail),
+                            )
+                        }),
+                );
+            }
+            out = out.child(list_div);
+        }
+        out
+    }
+
+    /// A boolean scoped row (switch + scope chip) — the same write path as
+    /// the select rows.
+    pub(crate) fn scoped_switch_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        scoped_key: &'static str,
+        element_id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let on = self.scoped_value(scoped_key).as_bool() == Some(true);
+        let mut control = div().flex().items_center().gap_2();
+        if let Some(chip) = self.scope_chip(scoped_key, cx) {
+            control = control.child(chip);
+        }
+        control = control.child(
+            div()
+                .id(element_id)
+                .cursor_pointer()
+                .child(switch_control(on))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        this.update_scoped_setting(scoped_key, json!(!on), cx);
+                    }),
+                ),
+        );
+        setting_row(title, description, control)
+    }
+
     /// Fold an expanded select list's pick into state / server settings.
     pub(crate) fn misc_pick(&mut self, list: OpenList, value: String, cx: &mut Context<Self>) {
         self.misc_settings_state.open_list = None;
@@ -494,16 +828,24 @@ impl AppView {
                 self.client_config.notification_mode = value;
                 self.client_config.save();
             }
+            OpenList::SettingsScope => {
+                self.misc_settings_state.scope_project =
+                    if value.is_empty() { None } else { Some(value) };
+                self.client_config.settings_scope_project =
+                    self.misc_settings_state.scope_project.clone();
+                self.client_config.save();
+            }
             OpenList::DefaultModel => {
-                let patch = if value == AUTO_VALUE {
-                    json!({ "defaultModelSelection": null })
+                let selection = if value == AUTO_VALUE {
+                    Value::Null
                 } else {
                     let (instance, model) = value.split_once(PACK_SEP).unwrap_or(("", ""));
-                    json!({ "defaultModelSelection": { "instanceId": instance, "model": model } })
+                    json!({ "instanceId": instance, "model": model })
                 };
-                self.update_server_settings(patch, cx);
+                self.update_scoped_setting("defaultModelSelection", selection, cx);
             }
             OpenList::FallbackModel => {
+                // Not a project-scoped key — always writes the global setting.
                 let patch = if value == AUTO_VALUE {
                     json!({ "fallbackModelSelection": null })
                 } else {
@@ -513,7 +855,7 @@ impl AppView {
                 self.update_server_settings(patch, cx);
             }
             OpenList::RuntimeMode => {
-                self.update_server_settings(json!({ "defaultRuntimeMode": value }), cx);
+                self.update_scoped_setting("defaultRuntimeMode", Value::String(value), cx);
             }
             OpenList::EnvMode => {
                 let mode = if value == "inherit" {
@@ -521,7 +863,7 @@ impl AppView {
                 } else {
                     Value::String(value)
                 };
-                self.update_server_settings(json!({ "defaultThreadEnvMode": mode }), cx);
+                self.update_scoped_setting("defaultThreadEnvMode", mode, cx);
             }
             // ── settings_extra lists (Threads / Source Control) ────────────
             OpenList::DiffLayout => {
@@ -538,7 +880,7 @@ impl AppView {
                 } else {
                     Value::String(value)
                 };
-                self.update_server_settings(json!({ "worktreeSubmodules": submodules }), cx);
+                self.update_scoped_setting("worktreeSubmodules", submodules, cx);
             }
             OpenList::AutoSettleDays => {
                 let days = if value == "off" {
@@ -546,42 +888,40 @@ impl AppView {
                 } else {
                     value.parse::<i64>().map(Value::from).unwrap_or(Value::Null)
                 };
-                self.update_server_settings(json!({ "sidebarAutoSettleAfterDays": days }), cx);
+                self.update_scoped_setting("sidebarAutoSettleAfterDays", days, cx);
             }
             OpenList::TextGenModel => {
-                let patch = if value == AUTO_VALUE {
-                    json!({ "textGenerationModelSelection": null })
+                let selection = if value == AUTO_VALUE {
+                    Value::Null
                 } else {
                     let (instance, model) = value.split_once(PACK_SEP).unwrap_or(("", ""));
-                    json!({ "textGenerationModelSelection": { "instanceId": instance, "model": model } })
+                    json!({ "instanceId": instance, "model": model })
                 };
-                self.update_server_settings(patch, cx);
+                self.update_scoped_setting("textGenerationModelSelection", selection, cx);
             }
             OpenList::ResponseStreaming => {
-                self.update_server_settings(json!({ "responseStreamingMode": value }), cx);
+                self.update_scoped_setting("responseStreamingMode", Value::String(value), cx);
             }
             OpenList::ScWritingMode => {
                 // `sourceControlWritingStyle` is one object server-side; send
                 // the merged value so sibling fields (customInstructions,
                 // followChangeRequestTemplates) are not lost.
-                let mut style = self.misc_settings_state.settings["sourceControlWritingStyle"]
+                let mut style = self
+                    .scoped_value("sourceControlWritingStyle")
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
                 style.insert("mode".into(), json!(value));
-                self.update_server_settings(
-                    json!({ "sourceControlWritingStyle": Value::Object(style) }),
-                    cx,
-                );
+                self.update_scoped_setting("sourceControlWritingStyle", Value::Object(style), cx);
             }
             OpenList::ScWriterModel => {
-                let patch = if value == AUTO_VALUE {
-                    json!({ "sourceControlWriterModelSelection": null })
+                let selection = if value == AUTO_VALUE {
+                    Value::Null
                 } else {
                     let (instance, model) = value.split_once(PACK_SEP).unwrap_or(("", ""));
-                    json!({ "sourceControlWriterModelSelection": { "instanceId": instance, "model": model } })
+                    json!({ "instanceId": instance, "model": model })
                 };
-                self.update_server_settings(patch, cx);
+                self.update_scoped_setting("sourceControlWriterModelSelection", selection, cx);
             }
         }
         cx.notify();
@@ -797,11 +1137,16 @@ impl AppView {
             );
         }
 
-        // ── Default model (defaultModelSelection) ────────────────────────
-        // `apply_server_defaults` pushes this into the composer whenever the
-        // user hasn't explicitly picked a model — the chip then shows the
-        // server default for new threads.
-        let default_selection = &settings["defaultModelSelection"];
+        if connected {
+            section = section.child(self.render_scope_selector(cx));
+        }
+
+        // ── Default model (defaultModelSelection, scoped) ────────────────
+        // `apply_server_defaults` pushes the global value into the composer
+        // whenever the user hasn't explicitly picked a model — the chip then
+        // shows the server default for new threads.
+        let default_selection = self.scoped_value("defaultModelSelection");
+        let default_selection = &default_selection;
         let default_value = if default_selection.is_null() {
             AUTO_VALUE.to_string()
         } else {
@@ -830,10 +1175,11 @@ impl AppView {
         } else {
             Self::selection_label(default_selection).into()
         };
-        section = section.child(self.select_setting(
+        section = section.child(self.scoped_select_setting(
             "Model",
             "Default model for new threads. Projects can override it.",
             OpenList::DefaultModel,
+            "defaultModelSelection",
             default_label,
             &default_value,
             model_options,
@@ -876,22 +1222,25 @@ impl AppView {
             cx,
         ));
 
-        // ── Default permissions (defaultRuntimeMode) ─────────────────────
-        let runtime_mode = settings["defaultRuntimeMode"]
+        // ── Default permissions (defaultRuntimeMode, scoped) ─────────────
+        let runtime_mode = self
+            .scoped_value("defaultRuntimeMode")
             .as_str()
-            .unwrap_or("full-access");
+            .unwrap_or("full-access")
+            .to_string();
         let runtime_label = RUNTIME_MODES
             .iter()
-            .find(|(value, _, _)| *value == runtime_mode)
-            .map(|(_, label, _)| *label)
-            .unwrap_or(runtime_mode);
+            .find(|(value, _, _)| *value == runtime_mode.as_str())
+            .map(|(_, label, _)| (*label).to_string())
+            .unwrap_or_else(|| runtime_mode.clone());
         section = section.child(
-            self.select_setting(
+            self.scoped_select_setting(
                 "Default permissions",
                 "Default permissions for new threads. Projects can override them.",
                 OpenList::RuntimeMode,
+                "defaultRuntimeMode",
                 runtime_label.into(),
-                runtime_mode,
+                &runtime_mode,
                 RUNTIME_MODES
                     .iter()
                     .map(|(value, label, detail)| {
@@ -906,8 +1255,12 @@ impl AppView {
             ),
         );
 
-        // ── Workspace (defaultThreadEnvMode; null inherits) ──────────────
-        let env_mode = settings["defaultThreadEnvMode"].as_str();
+        // ── Workspace (defaultThreadEnvMode; null inherits, scoped) ──────
+        let env_mode = self
+            .scoped_value("defaultThreadEnvMode")
+            .as_str()
+            .map(str::to_string);
+        let env_mode = env_mode.as_deref();
         let env_value = env_mode.unwrap_or("inherit");
         let env_label = match env_mode {
             None => "Inherit",
@@ -923,34 +1276,24 @@ impl AppView {
         for (value, label) in ENV_MODES {
             env_options.push((value.to_string(), label.to_string(), None));
         }
-        section = section.child(self.select_setting(
+        section = section.child(self.scoped_select_setting(
             "Workspace",
             "Where new threads start. Projects and their t3.json can override it.",
             OpenList::EnvMode,
+            "defaultThreadEnvMode",
             env_label.into(),
             env_value,
             env_options,
             cx,
         ));
 
-        // ── Automatically pull (defaultAutoPull) ─────────────────────────
-        let auto_pull = settings["defaultAutoPull"].as_bool() == Some(true);
-        section = section.child(setting_row(
+        // ── Automatically pull (defaultAutoPull, scoped) ─────────────────
+        section = section.child(self.scoped_switch_row(
             "Automatically pull",
             "Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.",
-            div()
-                .id("misc-autopull-switch")
-                .cursor_pointer()
-                .child(switch_control(auto_pull))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _window, cx| {
-                        this.update_server_settings(
-                            json!({ "defaultAutoPull": !auto_pull }),
-                            cx,
-                        );
-                    }),
-                ),
+            "defaultAutoPull",
+            "misc-autopull-switch",
+            cx,
         ));
 
         section
@@ -1014,6 +1357,376 @@ impl AppView {
         state.name_field = Some(name_field);
         state.path_field = Some(path_field);
         state.rename_field = Some(rename_field);
+    }
+
+    /// Lazily create the script-form fields + observers (same deferred-open
+    /// pattern as `ensure_project_fields`).
+    fn ensure_script_fields(&mut self, cx: &mut Context<Self>) {
+        if self.misc_settings_state.script_name_field.is_some() {
+            return;
+        }
+        let name_field = cx.new(|cx| TextField::new("Action name (e.g. Dev server)", cx));
+        let command_field = cx.new(|cx| TextField::new("Command (e.g. vp run dev)", cx));
+        self.misc_settings_state
+            .script_subs
+            .push(cx.observe(&name_field, |this, field, cx| {
+                this.misc_settings_state.script_name_draft = field_text(&field, cx);
+                cx.notify();
+            }));
+        self.misc_settings_state
+            .script_subs
+            .push(cx.observe(&command_field, |this, field, cx| {
+                this.misc_settings_state.script_command_draft = field_text(&field, cx);
+                cx.notify();
+            }));
+        for field in [name_field.clone(), command_field.clone()] {
+            self.misc_settings_state.script_subs.push(cx.subscribe(
+                &field,
+                |this, _field, _event: &PromptSubmitted, cx| {
+                    this.save_script(cx);
+                },
+            ));
+        }
+        let state = &mut self.misc_settings_state;
+        state.script_name_field = Some(name_field);
+        state.script_command_field = Some(command_field);
+    }
+
+    // ─── Project scripts (`defaultProjectScripts`, scoped key) ──────────
+
+    /// Scripts effective for the active scope — project override when set,
+    /// else the global `defaultProjectScripts` array. (The web additionally
+    /// merges `project.scripts` and t3.json tiers; the native mirror only
+    /// sees ServerSettings.)
+    pub(crate) fn effective_scripts(&self) -> Vec<Value> {
+        self.scoped_value("defaultProjectScripts")
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Persist the whole scripts array in the active scope.
+    fn write_scripts(&mut self, scripts: Vec<Value>, cx: &mut Context<Self>) {
+        self.update_scoped_setting("defaultProjectScripts", Value::Array(scripts), cx);
+    }
+
+    /// Slug a script name into a `script.<id>.run`-compatible id (the web's
+    /// `normalizeScriptId` + `nextProjectScriptId`, max 24 chars).
+    fn next_script_id(name: &str, existing: &[Value]) -> String {
+        let mut base = String::new();
+        let mut last_dash = true; // strips a leading dash
+        for ch in name.trim().to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                base.push(ch);
+                last_dash = false;
+            } else if !last_dash {
+                base.push('-');
+                last_dash = true;
+            }
+        }
+        let base = base.trim_end_matches('-');
+        let base = if base.is_empty() { "script" } else { base };
+        let base: String = base.chars().take(24).collect();
+        let base = base.trim_end_matches('-');
+        let base = if base.is_empty() { "script" } else { base };
+        let taken = |id: &str| existing.iter().any(|s| s["id"].as_str() == Some(id));
+        if !taken(base) {
+            return base.to_string();
+        }
+        for suffix in 2..10_000u32 {
+            let suffix_str = suffix.to_string();
+            let keep = 24usize.saturating_sub(suffix_str.len() + 1).max(1);
+            let candidate = format!("{}-{suffix}", base.chars().take(keep).collect::<String>());
+            if !taken(&candidate) {
+                return candidate;
+            }
+        }
+        format!(
+            "{}-{}",
+            base.chars().take(10).collect::<String>(),
+            Uuid::new_v4()
+        )
+        .chars()
+        .take(24)
+        .collect()
+    }
+
+    /// "+ Add action" / "Edit" opener — seed the form (empty for add, the
+    /// script's values for edit) and focus the name field.
+    fn open_script_form(
+        &mut self,
+        script: Option<Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_script_fields(cx);
+        let state = &mut self.misc_settings_state;
+        state.script_form_open = true;
+        state.script_editing = script
+            .as_ref()
+            .and_then(|s| s["id"].as_str())
+            .map(str::to_string);
+        state.script_name_draft = script
+            .as_ref()
+            .and_then(|s| s["name"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        state.script_command_draft = script
+            .as_ref()
+            .and_then(|s| s["command"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        state.script_icon = script
+            .as_ref()
+            .and_then(|s| s["icon"].as_str())
+            .unwrap_or("play")
+            .to_string();
+        state.script_on_create = script
+            .as_ref()
+            .and_then(|s| s["runOnWorktreeCreate"].as_bool())
+            .unwrap_or(false);
+        state.script_on_settle = script
+            .as_ref()
+            .and_then(|s| s["runOnSettle"].as_bool())
+            .unwrap_or(false);
+        for (field, text) in [
+            (
+                state.script_name_field.clone(),
+                state.script_name_draft.clone(),
+            ),
+            (
+                state.script_command_field.clone(),
+                state.script_command_draft.clone(),
+            ),
+        ]
+        .into_iter()
+        {
+            if let Some(field) = field {
+                field.update(cx, |field, cx| {
+                    field.reset(window, cx);
+                    field.replace_text_in_range(Some(0..0), &text, window, cx);
+                });
+            }
+        }
+        if let Some(field) = self.misc_settings_state.script_name_field.clone() {
+            field.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Build a `ProjectScript` from the form and write the array (insert or
+    /// replace on `script_editing`). `projectScriptOverrides`-style writes
+    /// keep sibling keys because `update_scoped_setting` merges the entry.
+    fn save_script(&mut self, cx: &mut Context<Self>) {
+        let state = &self.misc_settings_state;
+        let name = state.script_name_draft.trim().to_string();
+        let command = state.script_command_draft.trim().to_string();
+        if name.is_empty() || command.is_empty() {
+            return;
+        }
+        let mut scripts = self.effective_scripts();
+        let icon = state.script_icon.clone();
+        let icon = if PROJECT_SCRIPT_ICONS.contains(&icon.as_str()) {
+            icon
+        } else {
+            "play".to_string()
+        };
+        // Start from the existing script when editing so optional contract
+        // fields the form doesn't cover (stopOnSettle, async, previewUrl,
+        // autoOpenPreview) round-trip untouched.
+        let mut script = state
+            .script_editing
+            .as_ref()
+            .and_then(|editing| {
+                scripts
+                    .iter()
+                    .find(|s| s["id"].as_str() == Some(editing.as_str()))
+                    .cloned()
+            })
+            .unwrap_or_else(|| json!({}));
+        script["name"] = json!(name);
+        script["command"] = json!(command);
+        script["icon"] = json!(icon);
+        script["runOnWorktreeCreate"] = json!(state.script_on_create);
+        if state.script_on_settle {
+            script["runOnSettle"] = json!(true);
+        } else {
+            script.as_object_mut().map(|o| o.remove("runOnSettle"));
+        }
+        if let Some(editing) = state.script_editing.clone() {
+            script["id"] = json!(editing);
+            let replaced = scripts
+                .iter()
+                .position(|s| s["id"].as_str() == Some(editing.as_str()));
+            match replaced {
+                Some(index) => scripts[index] = script,
+                None => scripts.push(script),
+            }
+        } else {
+            script["id"] = json!(Self::next_script_id(&name, &scripts));
+            scripts.push(script);
+        }
+        self.misc_settings_state.script_form_open = false;
+        self.misc_settings_state.script_editing = None;
+        self.write_scripts(scripts, cx);
+    }
+
+    /// Read the form fields inside a click listener (has `window`), then save.
+    fn save_script_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (field, slot) in [
+            self.misc_settings_state
+                .script_name_field
+                .clone()
+                .map(|f| (f, "name")),
+            self.misc_settings_state
+                .script_command_field
+                .clone()
+                .map(|f| (f, "command")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let text = field_text_in(&field, window, cx);
+            match slot {
+                "name" => self.misc_settings_state.script_name_draft = text,
+                _ => self.misc_settings_state.script_command_draft = text,
+            }
+        }
+        self.save_script(cx);
+    }
+
+    /// Remove a script by id in the active scope.
+    fn remove_script(&mut self, script_id: String, cx: &mut Context<Self>) {
+        let mut scripts = self.effective_scripts();
+        scripts.retain(|s| s["id"].as_str() != Some(script_id.as_str()));
+        self.write_scripts(scripts, cx);
+    }
+
+    /// Run a script in the selected thread's terminal: `terminal.open` a
+    /// dedicated PTY, then `terminal.write` the command, and open the drawer.
+    /// Drawer sessions are owned by terminal_drawer.rs, so we open the
+    /// session server-side; the drawer's `subscribeTerminalMetadata` stream
+    /// picks the new terminal up and attaches on the next render.
+    fn run_project_script(
+        &mut self,
+        name: String,
+        command: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scope_pid = self.scope_project_id().map(str::to_string);
+        // Prefer the selected thread (when it lives in the scoped project),
+        // else any thread of the scoped project, else the selected thread.
+        let selected = self.state.selected_thread();
+        let thread = selected
+            .filter(|t| {
+                scope_pid
+                    .as_deref()
+                    .map(|pid| t.project_id.as_ref() == pid)
+                    .unwrap_or(true)
+            })
+            .or_else(|| {
+                scope_pid.as_deref().and_then(|pid| {
+                    self.state
+                        .threads
+                        .iter()
+                        .find(|t| t.project_id.as_ref() == pid)
+                })
+            })
+            .or(selected);
+        let Some(thread) = thread.cloned() else {
+            self.push_toast(
+                ToastKind::Info,
+                "No thread to run the action in",
+                Some("Open a thread in the project first.".into()),
+                None,
+                cx,
+            );
+            return;
+        };
+        let thread_id = thread.id.to_string();
+        let terminal_id = format!("script-{}", &Uuid::new_v4().to_string()[..8]);
+        // Same payload shape as the drawer's open (terminal_drawer.rs):
+        // `cwd` only when the project path is known.
+        let cwd = self
+            .state
+            .projects
+            .iter()
+            .find(|p| p.id.as_ref() == thread.project_id.as_ref())
+            .map(|p| p.path.to_string())
+            .filter(|path| !path.is_empty());
+        let mut open_payload = json!({
+            "threadId": thread_id,
+            "terminalId": terminal_id,
+            "cols": 120,
+            "rows": 30,
+        });
+        if let Some(cwd) = &cwd {
+            open_payload["cwd"] = json!(cwd);
+        }
+        let Some(rx) = self.send_query("terminal.open", open_payload) else {
+            self.push_toast(
+                ToastKind::Error,
+                "Could not run action",
+                Some("Not connected to a server.".into()),
+                None,
+                cx,
+            );
+            return;
+        };
+        let run_name = name.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                match reply {
+                    Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
+                        let _ = this.send_query(
+                            "terminal.write",
+                            json!({
+                                "threadId": thread_id,
+                                "terminalId": terminal_id,
+                                "data": format!("{command}\r"),
+                            }),
+                        );
+                        if this.state.selected.as_deref() != Some(thread_id.as_str()) {
+                            this.select_thread(thread_id.clone().into(), cx);
+                        }
+                        // No `window` inside `cx.spawn`'s update — opening
+                        // only flips the flag (focus hand-off only happens on
+                        // close, so `terminal_drawer_set_open` isn't needed).
+                        this.terminal_state.drawer_open = true;
+                        this.push_toast(
+                            ToastKind::Success,
+                            format!("Running “{run_name}”"),
+                            Some("Opened a terminal for the action.".into()),
+                            None,
+                            cx,
+                        );
+                    }
+                    Ok(exit) => {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Could not run action",
+                            Some(exit_failure_message(&exit)),
+                            None,
+                            cx,
+                        );
+                    }
+                    Err(_) => {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Could not run action",
+                            Some("Lost connection before the reply arrived.".into()),
+                            None,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// "+ Add project" opener: build fields on first use, clear drafts, and
@@ -1462,6 +2175,10 @@ impl AppView {
                     .text_color(theme::fg_muted())
                     .child("Connect to a server to manage projects."),
             );
+        }
+
+        if connected {
+            section = section.child(self.render_scope_selector(cx));
         }
 
         section = section.child(group_label("Projects"));
@@ -2065,8 +2782,355 @@ impl AppView {
             );
         }
 
+        // ── Actions (`defaultProjectScripts`, scoped) ────────────────────
+        if connected {
+            section = section.child(self.render_scripts_group(cx));
+        }
+
         section
     }
+
+    /// The "Actions" group: a row per `ProjectScript` with Run/Edit/Delete,
+    /// the add/edit form, and a scope chip. Mirrors
+    /// `ProjectScriptsSettingsSection` in the web minus the t3.json tier
+    /// (not part of `ServerSettings`).
+    fn render_scripts_group(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = &self.misc_settings_state;
+        let scripts = self.effective_scripts();
+        let scope_chip = self.scope_chip("defaultProjectScripts", cx);
+        let mut group = div().flex().flex_col();
+
+        group = group.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(group_label(
+                    "Actions — scripts you can run in a thread's terminal",
+                )))
+                .when_some(scope_chip, |s, chip| s.child(chip)),
+        );
+
+        if scripts.is_empty() {
+            group = group.child(
+                div()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("No actions yet — scripts like “Dev server” or “Tests” show up here."),
+            );
+        }
+
+        for (index, script) in scripts.iter().enumerate() {
+            let id = script["id"].as_str().unwrap_or_default().to_string();
+            let name = script["name"].as_str().unwrap_or("script").to_string();
+            let command = script["command"].as_str().unwrap_or_default().to_string();
+            let icon = script["icon"].as_str().unwrap_or("play");
+            let mut detail = format!("{icon} · {command}");
+            if script["runOnWorktreeCreate"].as_bool() == Some(true) {
+                detail.push_str(" · runs on worktree create");
+            }
+            if script["runOnSettle"].as_bool() == Some(true) {
+                detail.push_str(" · runs on settle");
+            }
+            if script["stopOnSettle"].as_bool() == Some(true) {
+                detail.push_str(" · stops on settle");
+            }
+            if script["async"].as_bool() == Some(true) {
+                detail.push_str(" · async");
+            }
+            if script["previewUrl"].as_str().is_some() {
+                detail.push_str(" · preview");
+            }
+
+            let run_name = name.clone();
+            let run_command = command.clone();
+            let edit_script = script.clone();
+            let delete_id = id.clone();
+            group = group.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::fg())
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .truncate()
+                                    .child(detail),
+                            ),
+                    )
+                    .child(script_row_button(
+                        ("script-run", index),
+                        "Run",
+                        cx.listener(move |this, _ev, window, cx| {
+                            this.run_project_script(
+                                run_name.clone(),
+                                run_command.clone(),
+                                window,
+                                cx,
+                            );
+                        }),
+                    ))
+                    .child(script_row_button(
+                        ("script-edit", index),
+                        "Edit",
+                        cx.listener(move |this, _ev, window, cx| {
+                            this.open_script_form(Some(edit_script.clone()), window, cx);
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .id(("script-delete", index))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(danger())
+                            .hover(|s| s.bg(theme::hover()))
+                            .child("Delete")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.remove_script(delete_id.clone(), cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+
+        if state.script_form_open {
+            group = group.child(self.render_script_form(cx));
+        } else {
+            group = group.child(
+                div().pt_1().flex().child(
+                    div()
+                        .id("script-add-open")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(theme::hover())
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::selected()))
+                        .child("+ Add action")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, window, cx| {
+                                this.open_script_form(None, window, cx);
+                            }),
+                        ),
+                ),
+            );
+        }
+
+        group
+    }
+
+    /// The add/edit form for one `ProjectScript` (name, command, icon,
+    /// runOnWorktreeCreate/runOnSettle switches). The optional contract
+    /// fields (`stopOnSettle`, `async`, `previewUrl`, `autoOpenPreview`) are
+    /// not editable yet — the note says so rather than faking controls.
+    fn render_script_form(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let state = &self.misc_settings_state;
+        let editing = state.script_editing.is_some();
+        let mut form = div().flex().flex_col().gap_2().pt_2();
+
+        if let Some(field) = state.script_name_field.clone() {
+            form = form.child(field_box(field));
+        }
+        if let Some(field) = state.script_command_field.clone() {
+            form = form.child(field_box(field));
+        }
+
+        // Icon picker — the six ProjectScript.icon literals.
+        form = form.child(div().flex().items_center().gap_1().children(
+            PROJECT_SCRIPT_ICONS.iter().enumerate().map(|(i, icon)| {
+                let icon = icon.to_string();
+                let selected = state.script_icon == icon;
+                div()
+                    .id(("script-icon", i))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(selected, |s| {
+                        s.bg(theme::selected()).text_color(theme::primary())
+                    })
+                    .when(!selected, |s| {
+                        s.bg(theme::hover())
+                            .text_color(theme::fg_muted())
+                            .hover(|s| s.bg(theme::selected()))
+                    })
+                    .child(icon.clone())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.misc_settings_state.script_icon = icon.clone();
+                            cx.notify();
+                        }),
+                    )
+            }),
+        ));
+
+        for (label, flag, elem) in [
+            (
+                "Run when a worktree is created",
+                state.script_on_create,
+                "script-flag-create",
+            ),
+            (
+                "Run when a thread settles",
+                state.script_on_settle,
+                "script-flag-settle",
+            ),
+        ] {
+            form = form.child(
+                div()
+                    .id(elem)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(switch_control(flag))
+                    .child(div().text_xs().text_color(theme::fg()).child(label))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            let state = &mut this.misc_settings_state;
+                            if elem == "script-flag-create" {
+                                state.script_on_create = !state.script_on_create;
+                            } else {
+                                state.script_on_settle = !state.script_on_settle;
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        form = form.child(
+            div()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .child("stopOnSettle, async, previewUrl and autoOpenPreview aren't editable here yet — set them in the web app."),
+        );
+
+        let can_save = !state.script_name_draft.trim().is_empty()
+            && !state.script_command_draft.trim().is_empty();
+        form = form.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pt_1()
+                .child(
+                    div()
+                        .id("script-form-save")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .when(can_save, |s| {
+                            s.cursor_pointer()
+                                .bg(theme::primary())
+                                .text_color(gpui::white())
+                        })
+                        .when(!can_save, |s| {
+                            s.bg(theme::hover()).text_color(theme::fg_muted())
+                        })
+                        .child(if editing {
+                            "Save changes"
+                        } else {
+                            "Add action"
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, window, cx| {
+                                if can_save {
+                                    this.save_script_click(window, cx);
+                                }
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("script-form-cancel")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(theme::hover())
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::selected()))
+                        .child("Cancel")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.misc_settings_state.script_form_open = false;
+                                this.misc_settings_state.script_editing = None;
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        );
+
+        form
+    }
+}
+
+/// Small bordered action button for script rows.
+fn script_row_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    listener: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(theme::hover())
+        .text_color(theme::fg())
+        .hover(|s| s.bg(theme::selected()))
+        .child(label)
+        .on_mouse_down(MouseButton::Left, listener)
+}
+
+/// Standard bordered field wrapper used across the settings forms.
+fn field_box(field: Entity<TextField>) -> gpui::Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::canvas())
+        .text_color(theme::fg())
+        .text_sm()
+        .child(field)
 }
 
 /// Expand a leading `~` or `~/…` against `$HOME` for the add-folder field.

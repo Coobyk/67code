@@ -108,6 +108,12 @@ pub struct ClientConfig {
     /// web's `ClientSettings.proactivePanelsEnabled` (default false).
     #[serde(default)]
     pub proactive_panels: bool,
+    /// Settings-scope selection: `Some(project_id)` shows the project-override
+    /// axis in the scoped settings sections; `None` edits global server
+    /// settings. Validated against the live project list on use — a stale id
+    /// falls back to Global.
+    #[serde(default)]
+    pub settings_scope_project: Option<String>,
 }
 
 fn default_in_app_notifications() -> bool {
