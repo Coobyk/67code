@@ -208,7 +208,10 @@ fn cap_detail(text: String) -> String {
         return text;
     }
     let kept: String = text.chars().take(OUTPUT_CAP_CHARS).collect();
-    format!("{kept}\n… output truncated ({} more bytes)", text.len() - kept.len())
+    format!(
+        "{kept}\n… output truncated ({} more bytes)",
+        text.len() - kept.len()
+    )
 }
 
 /// "Show output" / "Show detail" affordance next to a collapsible row's
@@ -289,7 +292,10 @@ fn user_input_option(
         (false, false) => "○",
     };
     let mut row = div()
-        .id(("ui-opt", item_index * 4096 + question_index * 64 + option_index))
+        .id((
+            "ui-opt",
+            item_index * 4096 + question_index * 64 + option_index,
+        ))
         .flex()
         .items_start()
         .gap_2()
@@ -342,22 +348,16 @@ fn user_input_option(
                 .child(mark),
         )
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(if selected {
-                            theme::fg()
-                        } else {
-                            theme::fg_muted()
-                        })
-                        .child(label.to_string()),
-                ),
+            div().flex().flex_col().flex_1().min_w_0().gap_1().child(
+                div()
+                    .text_sm()
+                    .text_color(if selected {
+                        theme::fg()
+                    } else {
+                        theme::fg_muted()
+                    })
+                    .child(label.to_string()),
+            ),
         );
     // The contract makes `description` required; the web hides it when it
     // just repeats the label.
@@ -547,18 +547,28 @@ impl AppView {
                 message.text.to_string(),
             );
             let row = match message.role {
-                Role::User => div().group("msg").flex().justify_end().items_end().gap_1().child(
-                    chip,
-                )
-                .child(bubble.bg(theme::user_bubble()).text_color(theme::fg())),
-                Role::Agent => div().group("msg").flex().justify_start().items_end().gap_1().child(
-                    bubble
-                        .bg(theme::raised())
-                        .border_1()
-                        .border_color(theme::border())
-                        .text_color(theme::fg()),
-                )
-                .child(chip),
+                Role::User => div()
+                    .group("msg")
+                    .flex()
+                    .justify_end()
+                    .items_end()
+                    .gap_1()
+                    .child(chip)
+                    .child(bubble.bg(theme::user_bubble()).text_color(theme::fg())),
+                Role::Agent => div()
+                    .group("msg")
+                    .flex()
+                    .justify_start()
+                    .items_end()
+                    .gap_1()
+                    .child(
+                        bubble
+                            .bg(theme::raised())
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_color(theme::fg()),
+                    )
+                    .child(chip),
             };
             list = list.child(div().id(("msg", i)).child(row));
         }
@@ -639,18 +649,17 @@ impl AppView {
             .child(text.clone());
         let attachment_count = item.raw["attachments"].as_array().map_or(0, Vec::len);
         if attachment_count > 0 {
-            bubble = bubble.child(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(format!(
-                        "{attachment_count} attachment{}",
-                        if attachment_count == 1 { "" } else { "s" }
-                    )),
-            );
+            bubble = bubble.child(div().pt_1().text_xs().text_color(theme::fg_muted()).child(
+                format!(
+                    "{attachment_count} attachment{}",
+                    if attachment_count == 1 { "" } else { "s" }
+                ),
+            ));
         }
         let copied = self.timeline_state.copied.as_deref() == Some(item.id.as_str());
+        // Queued turns (web `inputIntent: "queued_turn"`) get a marker chip —
+        // they have not run yet, unlike a normal user message.
+        let queued = raw_str(item, "inputIntent") == Some("queued_turn");
         div()
             .group("msg")
             .flex()
@@ -658,6 +667,19 @@ impl AppView {
             .items_end()
             .gap_1()
             .child(copy_chip("copy-u", index, copied, item.id.clone(), text))
+            .when(queued, |row| {
+                row.child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child("queued"),
+                )
+            })
             .child(bubble)
             .into_any_element()
     }
@@ -814,8 +836,7 @@ impl AppView {
                     .child(format!("exit {code}")),
             );
         }
-        let has_output =
-            output.is_some() || item.raw["outputOmitted"].as_bool() == Some(true);
+        let has_output = output.is_some() || item.raw["outputOmitted"].as_bool() == Some(true);
         if has_output {
             header = header.child(disclosure_chip(expanded, true));
         }
@@ -845,11 +866,11 @@ impl AppView {
             }
             detail = match output {
                 Some(output) => detail.child(div().text_color(theme::fg()).child(output)),
-                None if item.raw["outputOmitted"].as_bool() == Some(true) => detail.child(
-                    div().italic().text_color(theme::fg_muted()).child(
+                None if item.raw["outputOmitted"].as_bool() == Some(true) => {
+                    detail.child(div().italic().text_color(theme::fg_muted()).child(
                         "Output withheld on the wire — fetch it with orchestration.getTurnItem.",
-                    ),
-                ),
+                    ))
+                }
                 None => detail.child(
                     div()
                         .italic()
@@ -943,11 +964,9 @@ impl AppView {
                 detail = detail.child(div().text_color(theme::fg()).child(output.clone()));
             } else if item.raw["outputOmitted"].as_bool() == Some(true) {
                 shown = true;
-                detail = detail.child(
-                    div().italic().text_color(theme::fg_muted()).child(
-                        "Output withheld on the wire — fetch it with orchestration.getTurnItem.",
-                    ),
-                );
+                detail = detail.child(div().italic().text_color(theme::fg_muted()).child(
+                    "Output withheld on the wire — fetch it with orchestration.getTurnItem.",
+                ));
             }
             if let Some(input) = pretty_json(input_value) {
                 shown = true;
@@ -1115,10 +1134,7 @@ impl AppView {
                     .iter()
                     .filter_map(|option| {
                         let decision = option["decision"].as_str()?.to_string();
-                        let label = option["label"]
-                            .as_str()
-                            .unwrap_or(&decision)
-                            .to_string();
+                        let label = option["label"].as_str().unwrap_or(&decision).to_string();
                         Some((decision, label, option["warning"].is_string()))
                     })
                     .collect::<Vec<_>>()
@@ -1187,12 +1203,7 @@ impl AppView {
             );
         }
         if let Some(reason) = reason {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(reason),
-            );
+            card = card.child(div().text_xs().text_color(theme::fg_muted()).child(reason));
         }
 
         if pending {
@@ -1397,7 +1408,12 @@ impl AppView {
                         div()
                             .flex()
                             .flex_col()
-                            .child(div().text_sm().text_color(theme::fg()).child(label.to_string()))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::fg())
+                                    .child(label.to_string()),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -1408,15 +1424,12 @@ impl AppView {
                 }
             } else {
                 card = card.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme::fg())
-                        .child(
-                            item.body
-                                .clone()
-                                .or_else(|| item.title.clone())
-                                .unwrap_or_else(|| "The agent asked a question.".to_string()),
-                        ),
+                    div().text_sm().text_color(theme::fg()).child(
+                        item.body
+                            .clone()
+                            .or_else(|| item.title.clone())
+                            .unwrap_or_else(|| "The agent asked a question.".to_string()),
+                    ),
                 );
                 if pending {
                     card = card.child(
@@ -1424,7 +1437,9 @@ impl AppView {
                             .text_xs()
                             .italic()
                             .text_color(theme::fg_muted())
-                            .child("This question needs a typed answer — respond from another client."),
+                            .child(
+                                "This question needs a typed answer — respond from another client.",
+                            ),
                     );
                 }
             }
@@ -1433,22 +1448,21 @@ impl AppView {
         for (qi, question) in questions.iter().enumerate() {
             let qid = question["id"].as_str().unwrap_or_default().to_string();
             let header = question["header"].as_str().unwrap_or("");
-            let question_text = question["question"]
-                .as_str()
-                .unwrap_or(header);
+            let question_text = question["question"].as_str().unwrap_or(header);
             let multi = question["multiSelect"].as_bool() == Some(true);
-            let selected: Vec<String> = drafts
-                .and_then(|d| d.get(&qid))
-                .cloned()
-                .unwrap_or_else(|| {
-                    // Seed `initialAnswer` as the selection until touched.
-                    let custom_ok = question["allowCustomAnswer"].as_bool() != Some(false);
-                    question["initialAnswer"]
-                        .as_str()
-                        .filter(|_| custom_ok)
-                        .map(|s| vec![s.to_string()])
-                        .unwrap_or_default()
-                });
+            let selected: Vec<String> =
+                drafts
+                    .and_then(|d| d.get(&qid))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // Seed `initialAnswer` as the selection until touched.
+                        let custom_ok = question["allowCustomAnswer"].as_bool() != Some(false);
+                        question["initialAnswer"]
+                            .as_str()
+                            .filter(|_| custom_ok)
+                            .map(|s| vec![s.to_string()])
+                            .unwrap_or_default()
+                    });
 
             let mut block = div().flex().flex_col().gap_1().pt_1();
             if !header.is_empty() && header != question_text {
@@ -1476,22 +1490,35 @@ impl AppView {
                 if custom_ok {
                     if let Some(initial) = question["initialAnswer"].as_str() {
                         option_rows = option_rows.child(user_input_option(
-                            index, qi, option_index, &request_id, &qid,
-                            initial, initial, "", multi,
+                            index,
+                            qi,
+                            option_index,
+                            &request_id,
+                            &qid,
+                            initial,
+                            initial,
+                            "",
+                            multi,
                             selected.iter().any(|v| v.as_str() == initial),
                         ));
                         option_index += 1;
                     }
                 }
-                let options: &[Value] =
-                    question["options"].as_array().map_or(&[], Vec::as_slice);
+                let options: &[Value] = question["options"].as_array().map_or(&[], Vec::as_slice);
                 for option in options {
                     let label = option["label"].as_str().unwrap_or("option");
                     let value = option["value"].as_str().unwrap_or(label);
                     let description = option["description"].as_str().unwrap_or("");
                     option_rows = option_rows.child(user_input_option(
-                        index, qi, option_index, &request_id, &qid,
-                        value, label, description, multi,
+                        index,
+                        qi,
+                        option_index,
+                        &request_id,
+                        &qid,
+                        value,
+                        label,
+                        description,
+                        multi,
                         selected.iter().any(|v| v.as_str() == value),
                     ));
                     option_index += 1;
@@ -1502,7 +1529,9 @@ impl AppView {
                             .text_xs()
                             .italic()
                             .text_color(theme::fg_muted())
-                            .child("This question needs a typed answer — respond from another client."),
+                            .child(
+                                "This question needs a typed answer — respond from another client.",
+                            ),
                     );
                 }
                 block = block.child(option_rows);
@@ -1655,7 +1684,11 @@ impl AppView {
                 summary.chars().take(120).collect::<String>()
             ));
         }
-        let line_color = if failed { danger_border() } else { theme::border() };
+        let line_color = if failed {
+            danger_border()
+        } else {
+            theme::border()
+        };
         div()
             .flex()
             .items_center()
@@ -1778,21 +1811,41 @@ impl AppView {
 
     fn error_row(&self, item: &TurnItemView) -> AnyElement {
         let failure = &item.raw["failure"];
-        let title = raw_str(item, "title")
-            .map(str::to_owned)
-            .or_else(|| failure["class"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| "Error".to_string());
-        let message = failure["message"]
+        // Provider usage-limit failures (`failure.class: "usage_limit"`)
+        // render as the web's usage-limit banner — warning tone, not error.
+        let usage_limit =
+            item.status != "completed" && failure["class"].as_str() == Some("usage_limit");
+        let title = if usage_limit {
+            "Usage limit reached".to_string()
+        } else {
+            raw_str(item, "title")
+                .map(str::to_owned)
+                .or_else(|| failure["class"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "Error".to_string())
+        };
+        let mut message = failure["message"]
             .as_str()
             .map(str::to_owned)
             .or_else(|| item.body.clone())
             .unwrap_or_else(|| title.clone());
+        if usage_limit {
+            if let Some(reset_at) = failure["resetAt"].as_str() {
+                // "2026-11-17T20:22:33.666Z" → "2026-11-17 20:22 UTC".
+                let short = reset_at.get(..16).unwrap_or(reset_at).replace('T', " ");
+                message = format!("{message} Retry after {short} UTC.");
+            }
+        }
         let code = failure["code"].as_str().map(str::to_owned);
+        let (border, bg, title_color) = if usage_limit {
+            (warning_border(), rgba(0xe8b45a14), warning())
+        } else {
+            (danger_border(), danger_bg(), danger())
+        };
         div()
             .rounded_lg()
             .border_1()
-            .border_color(danger_border())
-            .bg(danger_bg())
+            .border_color(border)
+            .bg(bg)
             .px_3()
             .py_2()
             .flex()
@@ -1807,16 +1860,11 @@ impl AppView {
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(danger())
+                            .text_color(title_color)
                             .child(title),
                     )
                     .when_some(code, |d, code| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .child(code),
-                        )
+                        d.child(div().text_xs().text_color(theme::fg_muted()).child(code))
                     }),
             )
             .child(div().text_xs().text_color(theme::fg()).child(message))
@@ -1941,8 +1989,7 @@ impl AppView {
                 .unwrap_or("No detail.")
                 .to_string();
             card = card.child(
-                detail_scroll("subagent", index)
-                    .child(div().text_color(theme::fg()).child(body)),
+                detail_scroll("subagent", index).child(div().text_color(theme::fg()).child(body)),
             );
         }
         card.into_any_element()
@@ -1965,7 +2012,9 @@ impl AppView {
         } else {
             (
                 "File search",
-                raw_str(item, "pattern").map(str::to_owned).unwrap_or_default(),
+                raw_str(item, "pattern")
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
             )
         };
 

@@ -2,19 +2,22 @@
 //! Owns `impl AppView` sidebar render methods and `sidebar::State`.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use gpui::{
-    AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, SharedString,
-    Subscription, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
+    AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, Render,
+    SharedString, Subscription, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::AppView;
+use crate::composer::{Attachment, AttachmentKind};
+use crate::config;
 use crate::model::{ConnectionStatus, Project, Thread};
-use crate::notifications::ToastKind;
+use crate::notifications::{ToastAction, ToastKind};
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
-use crate::AppView;
 
 /// Sidebar-local UI state. Expand freely — this field lives on `AppView`.
 #[derive(Default)]
@@ -31,9 +34,20 @@ pub struct State {
     pub new_project_open: bool,
     /// Thread id the snooze overlay is open for.
     pub snooze_target: Option<SharedString>,
+    /// Parse error shown under the custom "snooze until" field.
+    pub snooze_error: Option<SharedString>,
+    /// Draft-threads block collapsed.
+    pub drafts_collapsed: bool,
+    /// Project shell `icon` values keyed by project id. `net::parse_project`
+    /// drops `icon`, so `load_project_icons` harvests it out-of-band.
+    pub project_icons: HashMap<String, Value>,
+    /// Whether the project-icon query already ran since the last shell event
+    /// that could change it.
+    pub icons_queried: bool,
     /// Scroll position for the thread list.
     pub scroll: gpui::ScrollHandle,
     rename_field: Option<Entity<TextField>>,
+    snooze_field: Option<Entity<TextField>>,
     project_name_field: Option<Entity<TextField>>,
     project_path_field: Option<Entity<TextField>>,
     rename_blur: Option<Subscription>,
@@ -262,7 +276,11 @@ fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
 }
 
 /// Read a text field's contents inside an event listener that has a `window`.
-fn field_text_in(field: &Entity<TextField>, window: &mut Window, cx: &mut Context<AppView>) -> String {
+fn field_text_in(
+    field: &Entity<TextField>,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) -> String {
     field
         .update(cx, |field, cx| {
             field.text_for_range(0..usize::MAX, &mut None, window, cx)
@@ -291,6 +309,177 @@ fn set_field_text(field: &Entity<TextField>, text: &str, cx: &mut Context<AppVie
     });
 }
 
+/// Parse a custom snooze target into Unix seconds: relative durations
+/// ("30m", "2h", "1d", "1w") or a UTC datetime "YYYY-MM-DD[ T]HH:MM[:SS]"
+/// (a bare date means 09:00, matching the fixed-wake presets). With no
+/// timezone database in the app, datetimes resolve in UTC.
+fn parse_custom_snooze(input: &str, now: i64) -> Option<i64> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // "<digits><unit>" durations.
+    if let Some(unit) = s.chars().last().filter(|c| c.is_ascii_alphabetic()) {
+        let digits = &s[..s.len() - unit.len_utf8()];
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let n: i64 = digits.parse().ok()?;
+            let secs = match unit.to_ascii_lowercase() {
+                'm' => 60,
+                'h' => 3_600,
+                'd' => 86_400,
+                'w' => 604_800,
+                _ => return None,
+            };
+            return now.checked_add(n.checked_mul(secs)?);
+        }
+    }
+    // Datetime: "YYYY-MM-DD" plus optional "HH:MM[:SS]" separated by space or T.
+    let normalized = s.replacen('T', " ", 1);
+    let mut parts = normalized.split_whitespace();
+    let date = parts.next()?;
+    let time = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let date_bits: Vec<&str> = date.split('-').collect();
+    if date_bits.len() != 3 {
+        return None;
+    }
+    let year: i64 = date_bits[0].parse().ok()?;
+    let month: i64 = date_bits[1].parse().ok()?;
+    let day: i64 = date_bits[2].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, minute, second) = match time {
+        Some(t) => {
+            let bits: Vec<&str> = t.split(':').collect();
+            if !(2..=3).contains(&bits.len()) {
+                return None;
+            }
+            (
+                bits[0].parse().ok()?,
+                bits[1].parse().ok()?,
+                match bits.get(2) {
+                    Some(b) => b.parse().ok()?,
+                    None => 0,
+                },
+            )
+        }
+        None => (9, 0, 0),
+    };
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// ProjectIconColor name → RGB (tailwind-500 palette, same swatches the web
+/// picker's `projectIconColors.ts` uses).
+fn project_icon_color(name: &str) -> gpui::Rgba {
+    rgb(match name {
+        "red" => 0xef4444,
+        "orange" => 0xf97316,
+        "amber" => 0xf59e0b,
+        "yellow" => 0xeab308,
+        "lime" => 0x84cc16,
+        "green" => 0x22c55e,
+        "emerald" => 0x10b981,
+        "teal" => 0x14b8a6,
+        "cyan" => 0x06b6d4,
+        "sky" => 0x0ea5e9,
+        "blue" => 0x3b82f6,
+        "indigo" => 0x6366f1,
+        "violet" => 0x8b5cf6,
+        "purple" => 0xa855f7,
+        "fuchsia" => 0xd946ef,
+        "pink" => 0xec4899,
+        "rose" => 0xf43f5e,
+        _ => 0x6b7280, // "gray" + unknown
+    })
+}
+
+/// Sidebar chip for a project shell `icon` (`{kind: emoji|monogram|lucide}`).
+/// GPUI has no lucide font, so lucide icons fall back to a colored monogram
+/// chip built from the icon name — matching the web's FolderCode fallback in
+/// spirit. Returns None for missing/unknown icons (header renders no chip).
+fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
+    match icon.get("kind").and_then(Value::as_str)? {
+        "emoji" => {
+            let emoji = icon.get("emoji").and_then(Value::as_str)?;
+            Some(
+                div()
+                    .flex_none()
+                    .w(px(14.))
+                    .text_xs()
+                    .child(emoji.to_string())
+                    .into_any_element(),
+            )
+        }
+        kind @ ("monogram" | "lucide") => {
+            let (text, color) = if kind == "monogram" {
+                (
+                    icon.get("text").and_then(Value::as_str),
+                    icon.get("color").and_then(Value::as_str),
+                )
+            } else {
+                (
+                    icon.get("name").and_then(Value::as_str),
+                    icon.get("color").and_then(Value::as_str),
+                )
+            };
+            let label: String = text
+                .unwrap_or(project_name)
+                .chars()
+                .take(2)
+                .collect::<String>()
+                .to_uppercase();
+            Some(
+                div()
+                    .flex_none()
+                    .w(px(14.))
+                    .h(px(14.))
+                    .rounded_sm()
+                    .bg(project_icon_color(color.unwrap_or("gray")))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(gpui::white())
+                    .child(div().text_size(px(9.)).child(label))
+                    .into_any_element(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Drag payload for pointer-reordering pinned threads (dropped on another
+/// pinned row of the same project).
+struct SidebarThreadDrag {
+    thread_id: SharedString,
+    project_id: SharedString,
+}
+
+/// Floating ghost rendered under the pointer during a thread drag.
+struct ThreadDragGhost {
+    title: SharedString,
+}
+
+impl Render for ThreadDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::border())
+            .text_sm()
+            .text_color(theme::fg())
+            .child(self.title.clone())
+    }
+}
+
 impl AppView {
     /// Lazily create the sidebar's text fields and subscriptions. Called once
     /// from `render_sidebar` because entities need a `cx` to be built.
@@ -300,16 +489,15 @@ impl AppView {
         }
         self.sidebar_state.wired = true;
 
-        self.sidebar_state.subs.push(cx.observe(
-            &self.search_field,
-            |this, field, cx| {
+        self.sidebar_state
+            .subs
+            .push(cx.observe(&self.search_field, |this, field, cx| {
                 let query = field_text(&field, cx);
                 if this.sidebar_state.query != query {
                     this.sidebar_state.query = query;
                     cx.notify();
                 }
-            },
-        ));
+            }));
 
         let rename_field = cx.new(|cx| TextField::new("Thread title…", cx));
         self.sidebar_state.subs.push(cx.subscribe(
@@ -336,6 +524,16 @@ impl AppView {
         ));
         self.sidebar_state.project_name_field = Some(name_field);
         self.sidebar_state.project_path_field = Some(path_field);
+
+        let snooze_field =
+            cx.new(|cx| TextField::new("30m, 2h, 1d, or YYYY-MM-DD HH:MM (UTC)", cx));
+        self.sidebar_state.subs.push(cx.subscribe(
+            &snooze_field,
+            |this, _field, event: &PromptSubmitted, cx| {
+                this.submit_custom_snooze(&event.0, cx);
+            },
+        ));
+        self.sidebar_state.snooze_field = Some(snooze_field);
         self.sidebar_state.menu_focus = Some(cx.focus_handle());
     }
 
@@ -584,20 +782,24 @@ impl AppView {
     /// lexicographically.
     fn is_unread(&self, thread: &Thread) -> bool {
         thread.marked_unread_at.is_some()
-            || thread.latest_run_started_at.as_ref().is_some_and(|started| {
-                thread
-                    .visited_at
-                    .as_ref()
-                    .is_none_or(|visited| started.as_ref() > visited.as_ref())
-            })
+            || thread
+                .latest_run_started_at
+                .as_ref()
+                .is_some_and(|started| {
+                    thread
+                        .visited_at
+                        .as_ref()
+                        .is_none_or(|visited| started.as_ref() > visited.as_ref())
+                })
     }
 
     /// True while `snoozedUntil` is still ahead of the clock — the web's
     /// `effectiveSnoozed` check (an expired snooze is already awake).
     fn is_snoozed(&self, thread: &Thread) -> bool {
-        thread.snoozed_until.as_ref().is_some_and(|until| {
-            unix_from_iso(until.as_ref()).is_some_and(|t| t > unix_now())
-        })
+        thread
+            .snoozed_until
+            .as_ref()
+            .is_some_and(|until| unix_from_iso(until.as_ref()).is_some_and(|t| t > unix_now()))
     }
 
     /// Dispatch `thread.snooze` and optimistically mark the row.
@@ -606,18 +808,19 @@ impl AppView {
             thread.snoozed_until = Some(until.clone().into());
         }
         self.sidebar_state.snooze_target = None;
+        self.sidebar_state.snooze_error = None;
         self.dispatch(json!({
             "type": "thread.snooze",
             "commandId": Uuid::new_v4().to_string(),
             "threadId": thread_id.to_string(),
             "snoozedUntil": until,
         }));
-        // push_toast has no action/callback support — a plain notice, no Undo.
-        self.push_toast(
+        self.push_toast_with_action(
             ToastKind::Info,
             "Thread snoozed",
             Some(format!("wakes {}", until.get(..16).unwrap_or(&until))),
-            Some(thread_id),
+            Some(thread_id.clone()),
+            Some(ToastAction::UnsnoozeThread { thread_id }),
             cx,
         );
     }
@@ -628,6 +831,7 @@ impl AppView {
             thread.snoozed_until = None;
         }
         self.sidebar_state.snooze_target = None;
+        self.sidebar_state.snooze_error = None;
         self.dispatch(json!({
             "type": "thread.unsnooze",
             "commandId": Uuid::new_v4().to_string(),
@@ -635,6 +839,209 @@ impl AppView {
             "reason": "user",
         }));
         cx.notify();
+    }
+
+    /// Open the snooze overlay for `thread_id`: reset the custom-until field
+    /// and focus it so typing a duration works immediately. Focus is deferred
+    /// one frame — the field's input handler only registers once the overlay
+    /// has painted, so an immediate `focus` lands nowhere.
+    fn open_snooze_overlay(
+        &mut self,
+        thread_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_state.snooze_target = Some(thread_id);
+        self.sidebar_state.snooze_error = None;
+        if let Some(field) = self.sidebar_state.snooze_field.clone() {
+            reset_field(&field, cx);
+            let focus = field.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Enter in the snooze overlay's custom-until field. Parses durations
+    /// ("30m") and UTC datetimes ("YYYY-MM-DD HH:MM"); on a bad or past time
+    /// the field text is restored (PromptSubmitted clears it) and an error
+    /// line shows instead of closing the overlay.
+    fn submit_custom_snooze(&mut self, input: &SharedString, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.sidebar_state.snooze_target.clone() else {
+            return;
+        };
+        let now = unix_now();
+        match parse_custom_snooze(input.as_ref(), now) {
+            Some(until) if until > now => {
+                if let Some(field) = self.sidebar_state.snooze_field.clone() {
+                    reset_field(&field, cx);
+                }
+                self.snooze_thread(thread_id, iso_from_unix(until), cx);
+            }
+            _ => {
+                self.sidebar_state.snooze_error =
+                    Some("Use 30m/2h/1d or YYYY-MM-DD HH:MM (UTC), in the future".into());
+                if let Some(field) = self.sidebar_state.snooze_field.clone() {
+                    set_field_text(&field, input.as_ref(), cx);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Park the current composer draft + file attachments as a sidebar draft
+    /// thread and clear the composer. Only meaningful in new-thread mode —
+    /// a draft is the prompt a not-yet-created thread would carry.
+    fn save_current_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.selected.is_some() {
+            self.push_toast(
+                ToastKind::Info,
+                "No draft to save",
+                Some("Drafts live on the new-thread composer (⌘N)".to_string()),
+                None,
+                cx,
+            );
+            return;
+        }
+        let prompt = self.composer_state.draft.trim().to_string();
+        let files: Vec<config::StashedFile> = self
+            .composer_state
+            .attachments
+            .iter()
+            .filter_map(|attachment| match &attachment.kind {
+                AttachmentKind::File { path } => Some(config::StashedFile {
+                    name: attachment.name.clone(),
+                    path: path.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if prompt.is_empty() && files.is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Nothing to save",
+                Some("Type a prompt or attach files first".to_string()),
+                None,
+                cx,
+            );
+            return;
+        }
+        self.client_config.push_draft_thread(config::DraftThread {
+            thread_id: format!("draft:{}", Uuid::new_v4()),
+            project_id: self.composer_project_key(),
+            prompt,
+            files,
+            created_at: iso_now(),
+        });
+        self.composer
+            .update(cx, |field, cx| field.reset(window, cx));
+        self.composer_state.draft.clear();
+        self.composer_state.attachments.clear();
+        self.composer_state.history_index = None;
+        self.push_toast(ToastKind::Info, "Draft saved", None, None, cx);
+        cx.notify();
+    }
+
+    /// Open a saved draft: park any composer content first (opening a draft
+    /// replaces the composer, so the current text is kept as a draft of its
+    /// own instead of being lost), then load the draft into the composer and
+    /// consume the stored entry.
+    fn open_draft_thread(&mut self, draft_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer_state.draft.trim().to_string();
+        let files: Vec<config::StashedFile> = self
+            .composer_state
+            .attachments
+            .iter()
+            .filter_map(|attachment| match &attachment.kind {
+                AttachmentKind::File { path } => Some(config::StashedFile {
+                    name: attachment.name.clone(),
+                    path: path.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if !prompt.is_empty() || !files.is_empty() {
+            self.client_config.push_draft_thread(config::DraftThread {
+                thread_id: format!("draft:{}", Uuid::new_v4()),
+                project_id: self.composer_project_key(),
+                prompt,
+                files,
+                created_at: iso_now(),
+            });
+        }
+        let Some(draft) = self.client_config.take_draft_thread(&draft_id) else {
+            cx.notify();
+            return;
+        };
+        self.state.selected = None;
+        self.thread_items.clear();
+        self.composer.update(cx, |field, cx| {
+            field.reset(window, cx);
+            field.replace_text_in_range(None, &draft.prompt, window, cx);
+        });
+        self.composer_state.draft = draft.prompt;
+        self.composer_state.attachments = draft
+            .files
+            .into_iter()
+            .map(|file| Attachment {
+                name: file.name,
+                kind: AttachmentKind::File { path: file.path },
+                thumbnail: None,
+            })
+            .collect();
+        self.composer_state.history_index = None;
+        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Delete a saved draft (its row's ✕).
+    fn delete_draft_thread(&mut self, draft_id: String, cx: &mut Context<Self>) {
+        self.client_config.remove_draft_thread(&draft_id);
+        cx.notify();
+    }
+
+    /// Fetch `icon` for all live projects once per shell event that can
+    /// change it (`icons_queried` resets in `observe_shell_event`). Project
+    /// shells in this RPC response carry the same `icon` the subscribeShell
+    /// snapshot emits — `net::parse_project` just doesn't surface it.
+    fn load_project_icons(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_state.icons_queried {
+            return;
+        }
+        self.sidebar_state.icons_queried = true;
+        let Some(rx) = self.send_query("orchestration.getArchivedShellSnapshot", json!({})) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(exit) = rx.recv().await else {
+                // Failed query (dropped connection, wedged server): leave
+                // `icons_queried` false so the next render retries.
+                let _ = this.update(cx, |this, _cx| {
+                    this.sidebar_state.icons_queried = false;
+                });
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if exit["_tag"].as_str() != Some("Success") {
+                    this.sidebar_state.icons_queried = false;
+                    cx.notify();
+                    return;
+                }
+                let value = &exit["value"];
+                let mut icons = HashMap::new();
+                if let Some(projects) = value.get("projects").and_then(Value::as_array) {
+                    for project in projects {
+                        let id = project.get("id").and_then(Value::as_str);
+                        let icon = project.get("icon").filter(|v| !v.is_null());
+                        if let (Some(id), Some(icon)) = (id, icon) {
+                            icons.insert(id.to_string(), icon.clone());
+                        }
+                    }
+                }
+                this.sidebar_state.project_icons = icons;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Pinned threads of `project_id` in display order, mirroring the web's
@@ -676,9 +1083,49 @@ impl AppView {
         }));
     }
 
-    /// "Move up/down" on a pinned row. With usable neighbor keys the moved
-    /// row takes the midpoint key; with missing/corrupt keys the whole block
-    /// is respread — the same fallback as the web's `planPinnedReorder`.
+    /// Persist a pinned block's final order: `ordered` is the display order
+    /// after the move and `moved_index` the slot of the row whose position
+    /// changed. With usable neighbor keys the moved row takes the midpoint
+    /// key; with missing/corrupt keys the whole block is respread — the same
+    /// fallback as the web's `planPinnedReorder`. Shared by `move_pinned`
+    /// (context menu) and `drop_pinned` (pointer drag).
+    fn commit_pinned_order(&mut self, ordered: Vec<Thread>, moved_index: usize) {
+        let n = ordered.len();
+        // Neighbors of the moved row in the *final* order; an existing
+        // neighbor is only usable when it carries a valid fraction key,
+        // missing bounds are open ends.
+        let before_index = moved_index.checked_sub(1);
+        let after_index = (moved_index + 1 < n).then_some(moved_index + 1);
+        let usable = |index: Option<usize>| {
+            index.is_none_or(|i| {
+                ordered[i]
+                    .pin_order_key
+                    .as_deref()
+                    .is_some_and(is_valid_order_key)
+            })
+        };
+        if usable(before_index) && usable(after_index) {
+            let before =
+                before_index.and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
+            let after =
+                after_index.and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
+            let order_key = order_key_between(before.as_deref(), after.as_deref());
+            let moved_id = ordered[moved_index].id.clone();
+            self.set_pin_key(moved_id.as_ref(), order_key);
+        } else {
+            // Respread: fresh slot keys across the whole pinned block in its
+            // new order — also heals non-fraction (e.g. ISO) legacy keys.
+            for (i, row) in ordered.iter().enumerate() {
+                let order_key = spread_slot_key(i, n);
+                if row.pin_order_key.as_deref() != Some(order_key.as_str()) {
+                    self.set_pin_key(row.id.as_ref(), order_key);
+                }
+            }
+        }
+    }
+
+    /// "Move up/down" on a pinned row (context-menu fallback for pointer
+    /// drag).
     fn move_pinned(&mut self, thread_id: SharedString, dir: i32, cx: &mut Context<Self>) {
         let Some(project_id) = self
             .state
@@ -697,43 +1144,43 @@ impl AppView {
         if target < 0 || target as usize >= ordered.len() {
             return;
         }
-        let target = target as usize;
-        let n = ordered.len();
-        // Neighbors of the moved row in the *final* order, expressed as
-        // indexes into the pre-swap list (the displaced row is one of them).
-        let (before_index, after_index) = if dir > 0 {
-            (Some(target), (target + 1 < n).then_some(target + 1))
-        } else {
-            ((target > 0).then_some(target - 1), Some(target))
-        };
-        // An existing neighbor is only usable when it carries a valid
-        // fraction key; missing bounds are open ends.
-        let usable = |index: Option<usize>| {
-            index.is_none_or(|i| {
-                ordered[i]
-                    .pin_order_key
-                    .as_deref()
-                    .is_some_and(is_valid_order_key)
-            })
-        };
-        if usable(before_index) && usable(after_index) {
-            let before = before_index
-                .and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
-            let after = after_index
-                .and_then(|i| ordered[i].pin_order_key.as_deref().map(str::to_owned));
-            let order_key = order_key_between(before.as_deref(), after.as_deref());
-            self.set_pin_key(thread_id.as_ref(), order_key);
-        } else {
-            // Respread: fresh slot keys across the whole pinned block in its
-            // new order — also heals non-fraction (e.g. ISO) legacy keys.
-            ordered.swap(ix, target);
-            for (i, row) in ordered.iter().enumerate() {
-                let order_key = spread_slot_key(i, n);
-                if row.pin_order_key.as_deref() != Some(order_key.as_str()) {
-                    self.set_pin_key(row.id.as_ref(), order_key);
-                }
-            }
+        ordered.swap(ix, target as usize);
+        self.commit_pinned_order(ordered, target as usize);
+        cx.notify();
+    }
+
+    /// Drop handler for pointer-dragged pinned rows: dropping a row onto
+    /// another pinned row of the same project inserts it at that row's slot —
+    /// after the target when dragging down, before when dragging up (a
+    /// post-removal `insert` at the target index lands both ways).
+    fn drop_pinned(
+        &mut self,
+        drag_id: SharedString,
+        target_id: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        if drag_id == target_id {
+            return;
         }
+        let Some(project_id) = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id == drag_id)
+            .map(|t| t.project_id.clone())
+        else {
+            return;
+        };
+        let mut ordered = self.pinned_order(project_id.as_ref());
+        let (Some(drag_ix), Some(target_ix)) = (
+            ordered.iter().position(|t| t.id == drag_id),
+            ordered.iter().position(|t| t.id == target_id),
+        ) else {
+            return;
+        };
+        let row = ordered.remove(drag_ix);
+        ordered.insert(target_ix, row);
+        self.commit_pinned_order(ordered, target_ix);
         cx.notify();
     }
 
@@ -780,6 +1227,40 @@ impl AppView {
         let mut row = div()
             .id(("thread", row_id))
             .mx_1()
+            .when(thread.pinned, |row| {
+                // Pinned rows are pointer-draggable and accept drops from
+                // other pinned rows of the same project.
+                let drag = SidebarThreadDrag {
+                    thread_id: thread.id.clone(),
+                    project_id: thread.project_id.clone(),
+                };
+                let title = thread.title.clone();
+                let drop_project = thread.project_id.clone();
+                let drop_target = thread.id.clone();
+                row.on_drag(drag, move |_drag, _offset, _window, cx| {
+                    cx.new(|_cx| ThreadDragGhost {
+                        title: title.clone(),
+                    })
+                })
+                .can_drop(move |value, _window, _cx| {
+                    value
+                        .downcast_ref::<SidebarThreadDrag>()
+                        .is_some_and(|d| d.project_id == drop_project)
+                })
+                .drag_over::<SidebarThreadDrag>(|style, _drag, _window, _cx| {
+                    style.bg(theme::selected())
+                })
+                .on_drop::<SidebarThreadDrag>(move |drag, window, cx| {
+                    let Some(view) = window.root::<AppView>().flatten() else {
+                        return;
+                    };
+                    let target_id = drop_target.clone();
+                    let drag_id = drag.thread_id.clone();
+                    view.update(cx, |this, cx| {
+                        this.drop_pinned(drag_id, target_id, cx);
+                    });
+                })
+            })
             .flex()
             .items_center()
             .gap_2()
@@ -827,7 +1308,13 @@ impl AppView {
 
         if renaming {
             if let Some(field) = self.sidebar_state.rename_field.clone() {
-                row = row.child(div().flex_1().min_w_0().text_color(theme::fg()).child(field));
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::fg())
+                        .child(field),
+                );
             }
         } else {
             row = row.child(
@@ -983,9 +1470,7 @@ impl AppView {
         ));
 
         // Pinned rows can be nudged within the pinned block.
-        if pinned
-            && let Some(project_id) = thread.as_ref().map(|t| t.project_id.clone())
-        {
+        if pinned && let Some(project_id) = thread.as_ref().map(|t| t.project_id.clone()) {
             let ordered = self.pinned_order(project_id.as_ref());
             if let Some(index) = ordered.iter().position(|t| t.id == menu.thread_id) {
                 if index > 0 {
@@ -1019,7 +1504,11 @@ impl AppView {
 
         let read_id = menu.thread_id.clone();
         menu_el = menu_el.child(self.menu_item(
-            if unread { "mi-mark-read" } else { "mi-mark-unread" },
+            if unread {
+                "mi-mark-read"
+            } else {
+                "mi-mark-unread"
+            },
             if unread { "Mark read" } else { "Mark unread" },
             false,
             cx,
@@ -1039,10 +1528,9 @@ impl AppView {
             "Snooze…",
             false,
             cx,
-            move |this, _window, cx| {
+            move |this, window, cx| {
                 this.sidebar_state.context_menu = None;
-                this.sidebar_state.snooze_target = Some(snooze_id.clone());
-                cx.notify();
+                this.open_snooze_overlay(snooze_id.clone(), window, cx);
             },
         ));
         if snoozed {
@@ -1063,19 +1551,32 @@ impl AppView {
         let archive_title = thread.as_ref().map(|t| t.title.to_string());
         menu_el = menu_el
             .child(separator())
-            .child(self.menu_item("mi-archive", "Archive", false, cx, move |this, _window, cx| {
-                this.sidebar_state.context_menu = None;
-                this.state.threads.retain(|t| t.id != archive_id);
-                this.dispatch(json!({
-                    "type": "thread.archive",
-                    "commandId": Uuid::new_v4().to_string(),
-                    "threadId": archive_id.to_string(),
-                }));
-                // push_toast has no action/callback support — a plain notice,
-                // no Undo button.
-                this.push_toast(ToastKind::Info, "Thread archived", archive_title.clone(), None, cx);
-                cx.notify();
-            }))
+            .child(self.menu_item(
+                "mi-archive",
+                "Archive",
+                false,
+                cx,
+                move |this, _window, cx| {
+                    this.sidebar_state.context_menu = None;
+                    this.state.threads.retain(|t| t.id != archive_id);
+                    this.dispatch(json!({
+                        "type": "thread.archive",
+                        "commandId": Uuid::new_v4().to_string(),
+                        "threadId": archive_id.to_string(),
+                    }));
+                    this.push_toast_with_action(
+                        ToastKind::Info,
+                        "Thread archived",
+                        archive_title.clone(),
+                        None,
+                        Some(ToastAction::UnarchiveThread {
+                            thread_id: archive_id.clone(),
+                        }),
+                        cx,
+                    );
+                    cx.notify();
+                },
+            ))
             .child(separator());
 
         let delete_id = menu.thread_id.clone();
@@ -1103,7 +1604,15 @@ impl AppView {
                         "commandId": Uuid::new_v4().to_string(),
                         "threadId": delete_id.to_string(),
                     }));
-                    this.push_toast(ToastKind::Info, "Thread deleted", delete_title.clone(), None, cx);
+                    // No un-delete exists on the wire (the command set has
+                    // only thread.unarchive) — a plain notice, no Undo.
+                    this.push_toast(
+                        ToastKind::Info,
+                        "Thread deleted",
+                        delete_title.clone(),
+                        None,
+                        cx,
+                    );
                 } else {
                     this.sidebar_state.delete_confirm = Some(delete_id.clone());
                 }
@@ -1216,8 +1725,218 @@ impl AppView {
             )
     }
 
+    /// One saved-draft row in the Drafts block: prompt preview + project
+    /// name, ✕ to discard, body click opens it in the composer.
+    fn render_draft_row(
+        &self,
+        draft: &config::DraftThread,
+        row_id: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let preview = draft
+            .prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let n = draft.files.len();
+                format!("{n} attachment{}", if n == 1 { "" } else { "s" })
+            });
+        let project_name = self
+            .state
+            .projects
+            .iter()
+            .find(|p| p.id.as_ref() == draft.project_id)
+            .map(|p| p.name.clone());
+        let open_id = draft.thread_id.clone();
+        let delete_id = draft.thread_id.clone();
+        div()
+            .id(("draft", row_id))
+            .mx_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .text_color(theme::fg_muted())
+            .hover(|s| s.bg(theme::hover()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, window, cx| {
+                    this.open_draft_thread(open_id.clone(), window, cx);
+                }),
+            )
+            .child(div().flex_none().text_xs().child("✎"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .child(preview),
+            )
+            .when_some(project_name, |row, name| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(name),
+                )
+            })
+            .child(
+                div()
+                    .id(("draft-delete", row_id))
+                    .flex_none()
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            this.delete_draft_thread(delete_id.clone(), cx);
+                        }),
+                    )
+                    .child("×"),
+            )
+    }
+
+    /// The "Drafts" block at the top of the list — the web client's
+    /// `SidebarDraftBlock`: client-side draft threads (persisted in
+    /// `client_config`), plus the live new-thread draft while the composer
+    /// has content. None when there is nothing to show.
+    fn render_drafts_block(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let live = self.state.selected.is_none()
+            && (!self.composer_state.draft.trim().is_empty()
+                || !self.composer_state.attachments.is_empty());
+        let mut drafts = self.client_config.draft_threads.clone();
+        if drafts.is_empty() && !live {
+            return None;
+        }
+        drafts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let collapsed = self.sidebar_state.drafts_collapsed;
+        let chevron = if collapsed { "▸" } else { "▾" };
+        let count = drafts.len() + usize::from(live);
+
+        let mut block = div().flex().flex_col().child(
+            div()
+                .id("drafts-header")
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.sidebar_state.drafts_collapsed = !this.sidebar_state.drafts_collapsed;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(chevron),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg_muted())
+                        .child(format!("Drafts · {count}")),
+                ),
+        );
+
+        if !collapsed {
+            if live {
+                let preview = self
+                    .composer_state
+                    .draft
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        let n = self.composer_state.attachments.len();
+                        format!("{n} attachment{}", if n == 1 { "" } else { "s" })
+                    });
+                block = block.child(
+                    div()
+                        .id("draft-live")
+                        .mx_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .cursor_pointer()
+                        .bg(theme::selected())
+                        .text_color(theme::fg())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, window, cx| {
+                                this.composer.read(cx).focus_handle(cx).focus(window, cx);
+                            }),
+                        )
+                        .child(div().flex_none().text_xs().child("✎"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(preview),
+                        )
+                        .child(
+                            div()
+                                .id("draft-save")
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(theme::primary())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, window, cx| {
+                                        cx.stop_propagation();
+                                        this.save_current_draft(window, cx);
+                                    }),
+                                )
+                                .child("Save"),
+                        ),
+                );
+            }
+            for (row_id, draft) in drafts.iter().enumerate() {
+                block = block.child(self.render_draft_row(draft, row_id, cx));
+            }
+        }
+        Some(block.into_any_element())
+    }
+
     pub fn render_sidebar(&mut self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         self.wire_sidebar(cx);
+        self.load_project_icons(cx);
 
         let query = self.sidebar_state.query.trim().to_lowercase();
         let filtering = !query.is_empty();
@@ -1253,9 +1972,7 @@ impl AppView {
                 .filter(|t| t.title.to_lowercase().contains(&query))
                 .cloned()
                 .collect();
-            hits.sort_by_key(|t| {
-                (self.is_snoozed(t), Reverse(t.updated_at.clone()))
-            });
+            hits.sort_by_key(|t| (self.is_snoozed(t), Reverse(t.updated_at.clone())));
             if hits.is_empty() {
                 list = list.child(
                     div()
@@ -1273,14 +1990,12 @@ impl AppView {
                     .iter()
                     .find(|p| p.id == thread.project_id)
                     .map(|p| p.name.clone());
-                list = list.child(self.render_thread_row(
-                    thread,
-                    row_id,
-                    project_name,
-                    cx,
-                ));
+                list = list.child(self.render_thread_row(thread, row_id, project_name, cx));
             }
         } else {
+            if let Some(block) = self.render_drafts_block(cx) {
+                list = list.child(block);
+            }
             let projects = self.state.projects.clone();
             let mut row_id = 0usize;
             for (pi, project) in projects.iter().enumerate() {
@@ -1300,11 +2015,8 @@ impl AppView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
-                            if let Some(project) = this
-                                .state
-                                .projects
-                                .iter_mut()
-                                .find(|p| p.id == toggle_id)
+                            if let Some(project) =
+                                this.state.projects.iter_mut().find(|p| p.id == toggle_id)
                             {
                                 project.expanded = !project.expanded;
                             }
@@ -1318,6 +2030,13 @@ impl AppView {
                             .text_xs()
                             .text_color(theme::fg_muted())
                             .child(chevron),
+                    )
+                    .when_some(
+                        self.sidebar_state
+                            .project_icons
+                            .get(project.id.as_ref())
+                            .and_then(|icon| project_icon_chip(icon, project.name.as_ref())),
+                        |row, chip| row.child(chip),
                     )
                     .child(
                         div()
@@ -1394,9 +2113,7 @@ impl AppView {
                         );
                     }
                     for thread in threads.iter() {
-                        section = section.child(self.render_thread_row(
-                            thread, row_id, None, cx,
-                        ));
+                        section = section.child(self.render_thread_row(thread, row_id, None, cx));
                         row_id += 1;
                     }
                 }
@@ -1413,10 +2130,9 @@ impl AppView {
             .bg(theme::sidebar())
             .border_r_1()
             .border_color(theme::border())
-            .when_some(
-                self.sidebar_state.menu_focus.clone(),
-                |el, focus| el.track_focus(&focus),
-            )
+            .when_some(self.sidebar_state.menu_focus.clone(), |el, focus| {
+                el.track_focus(&focus)
+            })
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
                 if ev.keystroke.key == "escape" {
                     this.sidebar_state.context_menu = None;
@@ -1424,6 +2140,7 @@ impl AppView {
                     this.sidebar_state.renaming = None;
                     this.sidebar_state.new_project_open = false;
                     this.sidebar_state.snooze_target = None;
+                    this.sidebar_state.snooze_error = None;
                     cx.notify();
                 }
             }))
@@ -1455,7 +2172,13 @@ impl AppView {
                         .px_2()
                         .py_1()
                         .text_sm()
-                        .child(div().flex_1().min_w_0().text_color(theme::fg()).child(self.search_field.clone())),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(theme::fg())
+                                .child(self.search_field.clone()),
+                        ),
                 ),
             )
             .child(
@@ -1622,6 +2345,20 @@ impl AppView {
                 MouseButton::Left,
                 cx.listener(|_this, _ev, _window, cx| cx.stop_propagation()),
             )
+            // Escape inside the card (e.g. with the custom-until field
+            // focused) closes the overlay before the App-level CloseOverlay
+            // sees it.
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.sidebar_state.snooze_target = None;
+                    this.sidebar_state.snooze_error = None;
+                    if let Some(field) = this.sidebar_state.snooze_field.clone() {
+                        reset_field(&field, cx);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .px_3()
@@ -1659,7 +2396,10 @@ impl AppView {
                         .py_1()
                         .text_xs()
                         .text_color(theme::fg_muted())
-                        .child(format!("Snoozed until {}", until.get(..16).unwrap_or(&until))),
+                        .child(format!(
+                            "Snoozed until {}",
+                            until.get(..16).unwrap_or(&until)
+                        )),
                 )
                 .child(
                     div()
@@ -1714,6 +2454,42 @@ impl AppView {
             );
         }
 
+        // Custom "snooze until…" entry — the web's datetime picker, reduced
+        // to a text input since GPUI has no calendar widget.
+        card = card
+            .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()))
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .rounded_sm()
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .px_2()
+                            .py_1()
+                            .text_sm()
+                            .text_color(theme::fg())
+                            .when_some(self.sidebar_state.snooze_field.clone(), |el, field| {
+                                el.child(field)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("Enter to snooze until then"),
+                    )
+                    .when_some(self.sidebar_state.snooze_error.clone(), |el, error| {
+                        el.child(div().text_xs().text_color(rgb(0xf87171)).child(error))
+                    }),
+            );
+
         card = card
             .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()))
             .child(
@@ -1729,6 +2505,10 @@ impl AppView {
                         cx.listener(|this, _ev, _window, cx| {
                             cx.stop_propagation();
                             this.sidebar_state.snooze_target = None;
+                            this.sidebar_state.snooze_error = None;
+                            if let Some(field) = this.sidebar_state.snooze_field.clone() {
+                                reset_field(&field, cx);
+                            }
                             cx.notify();
                         }),
                     )
@@ -1747,6 +2527,10 @@ impl AppView {
                 MouseButton::Left,
                 cx.listener(|this, _ev, _window, cx| {
                     this.sidebar_state.snooze_target = None;
+                    this.sidebar_state.snooze_error = None;
+                    if let Some(field) = this.sidebar_state.snooze_field.clone() {
+                        reset_field(&field, cx);
+                    }
                     cx.notify();
                 }),
             )

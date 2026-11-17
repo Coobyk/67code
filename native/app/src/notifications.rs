@@ -6,9 +6,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, deferred, div,
-    prelude::*, px, rgb,
+    AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, deferred, div, prelude::*,
+    px, rgb,
 };
+use serde_json::json;
+use uuid::Uuid;
 
 use crate::model::ConnectionStatus;
 use crate::net::ShellEvent;
@@ -41,6 +43,25 @@ impl ToastKind {
     }
 }
 
+/// Action button on a toast. An enum (not a closure) so the click handler can
+/// match and call back into `AppView` methods — the same pattern as
+/// `ToastKind`.
+#[derive(Clone, Debug)]
+pub enum ToastAction {
+    /// "Undo" an archive — `thread.unarchive` exists on the wire (delete has
+    /// no un-delete command, so delete toasts stay plain notices).
+    UnarchiveThread { thread_id: SharedString },
+    /// "Undo" a snooze — `thread.unsnooze`.
+    UnsnoozeThread { thread_id: SharedString },
+}
+
+impl ToastAction {
+    /// Button label. Both current actions undo something.
+    fn label(&self) -> &'static str {
+        "Undo"
+    }
+}
+
 pub struct Toast {
     pub id: u64,
     pub kind: ToastKind,
@@ -49,6 +70,8 @@ pub struct Toast {
     /// Thread focused when the toast body is clicked, when the toast is
     /// about one.
     pub thread_id: Option<SharedString>,
+    /// Optional action button (e.g. Undo archive).
+    pub action: Option<ToastAction>,
     /// Push time; kept for relative-age display or TTL policies.
     #[allow(dead_code)]
     pub created: Instant,
@@ -74,6 +97,7 @@ impl State {
         title: impl Into<SharedString>,
         detail: Option<String>,
         thread_id: Option<SharedString>,
+        action: Option<ToastAction>,
     ) -> u64 {
         let title: SharedString = title.into();
         let detail: Option<SharedString> = detail.map(Into::into);
@@ -97,6 +121,7 @@ impl State {
             title,
             detail,
             thread_id,
+            action,
             created: Instant::now(),
         });
         id
@@ -106,7 +131,10 @@ impl State {
 /// `OrchestrationV2ShellThreadStatus` values that mean a run is in flight
 /// (`LIVE_SHELL_STATUSES` in packages/contracts/src/orchestrationV2.ts).
 fn is_live_status(status: &str) -> bool {
-    matches!(status, "preparing" | "queued" | "starting" | "running" | "waiting")
+    matches!(
+        status,
+        "preparing" | "queued" | "starting" | "running" | "waiting"
+    )
 }
 
 /// Single-line, `max`-char summary of a wire string for the toast detail.
@@ -128,9 +156,22 @@ impl AppView {
         thread_id: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.push_toast_with_action(kind, title, detail, thread_id, None, cx);
+    }
+
+    /// `push_toast` plus an action button (e.g. "Undo" for archive/snooze).
+    pub(crate) fn push_toast_with_action(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<SharedString>,
+        detail: Option<String>,
+        thread_id: Option<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self
             .notifications_state
-            .push(kind, title, detail, thread_id);
+            .push(kind, title, detail, thread_id, action);
         cx.notify();
         // Auto-dismiss: remove this id after the timeout (a no-op if the
         // toast was already dismissed or evicted).
@@ -146,6 +187,39 @@ impl AppView {
 
     fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         self.notifications_state.toasts.retain(|t| t.id != id);
+        cx.notify();
+    }
+
+    /// Run a toast's action button. Each arm dispatches the matching
+    /// orchestration command and applies the same optimistic update as the
+    /// sidebar paths (the server's `thread.updated` is the source of truth).
+    fn run_toast_action(&mut self, action: &ToastAction, cx: &mut Context<Self>) {
+        match action {
+            ToastAction::UnarchiveThread { thread_id } => {
+                self.dispatch(json!({
+                    "type": "thread.unarchive",
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": thread_id.to_string(),
+                }));
+            }
+            ToastAction::UnsnoozeThread { thread_id } => {
+                if let Some(thread) = self
+                    .state
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.id.as_ref() == thread_id.as_ref())
+                {
+                    thread.snoozed_until = None;
+                }
+                self.sidebar_state.snooze_target = None;
+                self.dispatch(json!({
+                    "type": "thread.unsnooze",
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": thread_id.to_string(),
+                    "reason": "user",
+                }));
+            }
+        }
         cx.notify();
     }
 
@@ -169,22 +243,22 @@ impl AppView {
                 );
             }
             ShellEvent::Error(e) => {
-                self.push_toast(
-                    ToastKind::Error,
-                    "Error",
-                    Some(truncate(e, 80)),
-                    None,
-                    cx,
-                );
+                self.push_toast(ToastKind::Error, "Error", Some(truncate(e, 80)), None, cx);
             }
             // Seed the transition tracker without toasting; snapshots and
             // backfills describe history, not something that just happened.
             ShellEvent::Snapshot(snapshot) => {
+                self.sidebar_state.icons_queried = false;
                 for thread in &snapshot.threads {
                     self.notifications_state
                         .thread_status
                         .insert(thread.id.clone(), thread.status.clone());
                 }
+            }
+            // Project shells carry `icon` (net::parse_project drops it); the
+            // sidebar re-harvests icons after any event that can change one.
+            ShellEvent::ProjectUpserted(_) | ShellEvent::ProjectsRefreshed { .. } => {
+                self.sidebar_state.icons_queried = false;
             }
             ShellEvent::OlderSettledThreads { threads } => {
                 for thread in threads {
@@ -323,12 +397,7 @@ impl AppView {
             .border_color(theme::border())
             .overflow_hidden()
             .occlude()
-            .child(
-                div()
-                    .w(px(3.))
-                    .flex_shrink_0()
-                    .bg(toast.kind.accent()),
-            )
+            .child(div().w(px(3.)).flex_shrink_0().bg(toast.kind.accent()))
             .child(
                 div()
                     .flex_1()
@@ -353,6 +422,32 @@ impl AppView {
                                 .text_color(theme::fg_muted())
                                 .truncate()
                                 .child(detail),
+                        )
+                    })
+                    .when_some(toast.action.clone(), |d, action| {
+                        let action_label = action.label().to_string();
+                        d.child(
+                            div()
+                                .id(("toast-action", toast.id as usize))
+                                .px_2()
+                                .py_0p5()
+                                .mt_0p5()
+                                .self_start()
+                                .rounded_sm()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme::primary())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.run_toast_action(&action, cx);
+                                        this.dismiss_toast(dismiss_id, cx);
+                                    }),
+                                )
+                                .child(action_label),
                         )
                     }),
             )
