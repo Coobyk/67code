@@ -45,18 +45,18 @@ requires a new `native/server` handler matching the TS wire shape.
 
 ## Sidebar
 
-| Feature                                          | Status | Notes                                                                                                 |
-| ------------------------------------------------ | ------ | ----------------------------------------------------------------------------------------------------- |
-| Projects + threads list                          | ✅     |                                                                                                       |
-| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                                                                       |
-| Status indicators (running dot, PR link, unread) | ✅     | running dot, ⧉ PR glyph, 😴 snoozed, unread markers                                                   |
-| Drag-reorder threads                             | ✅     | pointer drag on pinned rows with spread order keys → `thread.pin.reorder`                             |
-| Snooze + custom snooze                           | ✅     | presets + custom "snooze until" field (relative durations / ISO parse) → `thread.snooze.until`        |
-| Undo-notice toasts on archive/delete             | ✅     | toast action buttons — Undo archive (`thread.unarchive`) / unsnooze                                   |
-| Draft threads block                              | ✅     | client-side drafts persisted on `ClientConfig.draft_threads`; sidebar block with open/delete/collapse |
-| Project icons/favicons                           | 🟡     | `projectIcon` chips in sidebar + icon picker in Projects settings; no favicon-image rendering         |
-| Settings gear                                    | ✅     | footer gear + ctrl-,                                                                                  |
-| Update pills / server version                    | 🚫     | Electron/desktop-update surface                                                                       |
+| Feature                                          | Status | Notes                                                                                                        |
+| ------------------------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------ |
+| Projects + threads list                          | ✅     |                                                                                                              |
+| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                                                                              |
+| Status indicators (running dot, PR link, unread) | ✅     | running dot, ⧉ PR glyph, 😴 snoozed, unread markers                                                          |
+| Drag-reorder threads                             | ✅     | pointer drag on pinned rows with spread order keys → `thread.pin.reorder`                                    |
+| Snooze + custom snooze                           | ✅     | presets + custom "snooze until" field (relative durations / ISO parse) → `thread.snooze.until`               |
+| Undo-notice toasts on archive/delete             | ✅     | toast action — Undo archive (`thread.unarchive`) / unsnooze; delete = plain notice (no un-delete RPC exists) |
+| Draft threads block                              | ✅     | client-side drafts persisted on `ClientConfig.draft_threads`; sidebar block with open/delete/collapse        |
+| Project icons/favicons                           | 🟡     | `projectIcon` chips in sidebar + icon picker in Projects settings; no favicon-image rendering                |
+| Settings gear                                    | ✅     | footer gear + ctrl-,                                                                                         |
+| Update pills / server version                    | 🚫     | Electron/desktop-update surface                                                                              |
 
 ## Terminal drawer
 

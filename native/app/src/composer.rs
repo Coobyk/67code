@@ -2088,11 +2088,7 @@ impl AppView {
         if text.is_empty() || self.composer_state.terminal_contexts.is_empty() {
             return;
         }
-        let Some(thread_id) = self
-            .state
-            .selected_thread()
-            .map(|t| t.id.to_string())
-        else {
+        let Some(thread_id) = self.state.selected_thread().map(|t| t.id.to_string()) else {
             self.push_toast(
                 ToastKind::Error,
                 "No thread selected",
@@ -2371,9 +2367,7 @@ impl AppView {
                             .text_xs()
                             .text_color(theme::fg_muted())
                             .child("Name:")
-                            .child(
-                                div().flex_1().text_color(theme::fg()).child(field.clone()),
-                            )
+                            .child(div().flex_1().text_color(theme::fg()).child(field.clone()))
                             .child("↵ to create"),
                     );
                 }
