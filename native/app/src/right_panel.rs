@@ -1,7 +1,8 @@
-//! Right-side inspector panel hosting tabbed panes (files, terminals, PRs).
+//! Right-side inspector panel hosting tabbed panes (files, terminals, PRs,
+//! local-diff review).
 //! Owns `impl AppView` panel render + `right_panel::State`.
 
-use gpui::{div, prelude::*, px, Context, Div};
+use gpui::{Context, Div, div, prelude::*, px};
 
 use crate::AppView;
 
@@ -11,6 +12,8 @@ pub enum Tab {
     Files,
     Terminals,
     PullRequests,
+    /// `review.getDiffPreview` viewer (vcs.rs / pr_review.rs).
+    Diff,
 }
 
 #[derive(Default)]
@@ -28,6 +31,7 @@ impl AppView {
             Tab::Files => self.render_explorer_pane(cx).into_any_element(),
             Tab::Terminals => self.render_terminal_pane(cx).into_any_element(),
             Tab::PullRequests => self.render_prs_pane(cx).into_any_element(),
+            Tab::Diff => self.render_diff_pane(cx).into_any_element(),
         };
         div()
             .w(px(380.))
@@ -83,5 +87,6 @@ impl AppView {
             .child(tab("Files", Tab::Files, cx))
             .child(tab("Terminals", Tab::Terminals, cx))
             .child(tab("Pull requests", Tab::PullRequests, cx))
+            .child(tab("Diff", Tab::Diff, cx))
     }
 }

@@ -20,15 +20,20 @@ use std::cell::{Cell, RefCell};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    div, prelude::*, px, rgb, Context, Div, Entity, Focusable, FontWeight, MouseButton, Rgba,
-    Stateful, Subscription, Window,
+    Context, Div, Entity, Focusable, FontWeight, MouseButton, Rgba, Stateful, Subscription, Window,
+    div, prelude::*, px, rgb,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::net::ClientCommand;
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
-use crate::{theme, AppView};
+use crate::{AppView, theme};
+
+/// Diff viewer module — lives beside this file but must stay out of lib.rs's
+/// module list, so it is hung off `vcs` via an explicit path.
+#[path = "pr_review.rs"]
+pub(crate) mod pr_review;
 
 /// GitHub-flavored state/verdict colors (mirrors the web PR row tones).
 fn pr_open_color() -> Rgba {
@@ -92,6 +97,27 @@ pub struct State {
     detail: Option<Value>,
     detail_error: Option<String>,
     linked_threads: Option<Vec<Value>>,
+
+    /// Local-diff review pane (pr_review.rs, `Tab::Diff`).
+    pub diff: pr_review::DiffState,
+
+    /// `vcs.pull`/`vcs.init` in flight.
+    pull_pending: bool,
+    init_pending: bool,
+
+    /// Worktree section inside the branch picker.
+    new_worktree_open: bool,
+    new_worktree_field: Option<Entity<TextField>>,
+    worktree_field_sub: Option<Subscription>,
+    /// Worktree create/remove in flight (branch name or path).
+    worktree_pending: Option<String>,
+    worktree_error: Option<String>,
+    /// Worktree path armed by the first remove click ("confirm" second click).
+    worktree_remove_armed: Option<String>,
+
+    /// `sourceControl.signInStart` probe row under the PR auth error.
+    signin_busy: bool,
+    signin_detail: Option<String>,
 }
 
 /// Stable row/expansion key for a list entry.
@@ -340,6 +366,15 @@ impl AppView {
             s.detail_error = None;
             s.detail_loading = false;
             s.linked_threads = None;
+            s.diff = pr_review::DiffState::default();
+            s.pull_pending = false;
+            s.init_pending = false;
+            s.new_worktree_open = false;
+            s.worktree_pending = None;
+            s.worktree_error = None;
+            s.worktree_remove_armed = None;
+            s.signin_busy = false;
+            s.signin_detail = None;
         }
 
         let Some((_project_id, cwd)) = scope else {
@@ -449,26 +484,503 @@ impl AppView {
                 .await
                 .unwrap_or_else(|_| json!({"_tag": "Failure"}));
             let _ = this.update(cx, |this, cx| {
+                if this.vcs_state.generation != generation {
+                    return;
+                }
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.vcs_fold_refresh(&exit["value"]);
+                } else {
+                    this.vcs_state.status_error = Some(failure_message(&exit));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fold a `vcs.refreshStatus` success value into the header state: local
+    /// fields land whole, remote-shaped keys split back out for rendering.
+    fn vcs_fold_refresh(&mut self, merged: &Value) {
+        let s = &mut self.vcs_state;
+        s.status_remote = Some(json!({
+            "hasUpstream": merged["hasUpstream"].clone(),
+            "aheadCount": merged["aheadCount"].clone(),
+            "behindCount": merged["behindCount"].clone(),
+            "aheadOfDefaultCount": merged["aheadOfDefaultCount"].clone(),
+            "pr": merged["pr"].clone(),
+        }));
+        s.remote_seen = true;
+        s.status_local = Some(merged.clone());
+        s.status_error = None;
+    }
+
+    /// ↻ on the status card — a manual `vcs.refreshStatus` re-poll.
+    fn vcs_refresh_status(&mut self, cx: &mut Context<Self>) {
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let generation = self.vcs_state.generation;
+        let Some(rx) = self.send_query("vcs.refreshStatus", json!({ "cwd": cwd })) else {
+            self.vcs_state.status_error = Some("Not connected to a server.".to_string());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                if this.vcs_state.generation != generation {
+                    return;
+                }
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.vcs_fold_refresh(&exit["value"]);
+                } else {
+                    this.vcs_state.status_error = Some(failure_message(&exit));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `vcs.pull` — ff-only pull of the checked-out branch's upstream.
+    fn vcs_pull(&mut self, cx: &mut Context<Self>) {
+        if self.vcs_state.pull_pending {
+            return;
+        }
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let generation = self.vcs_state.generation;
+        let Some(rx) = self.send_query("vcs.pull", json!({ "cwd": cwd })) else {
+            cx.notify();
+            return;
+        };
+        self.vcs_state.pull_pending = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
                 let s = &mut this.vcs_state;
                 if s.generation != generation {
                     return;
                 }
+                s.pull_pending = false;
                 if exit["_tag"].as_str() == Some("Success") {
-                    let merged = &exit["value"];
-                    // refreshStatus returns local+remote fields merged flat;
-                    // split the remote-shaped keys back out for rendering.
-                    s.status_remote = Some(json!({
-                        "hasUpstream": merged["hasUpstream"].clone(),
-                        "aheadCount": merged["aheadCount"].clone(),
-                        "behindCount": merged["behindCount"].clone(),
-                        "aheadOfDefaultCount": merged["aheadOfDefaultCount"].clone(),
-                        "pr": merged["pr"].clone(),
-                    }));
-                    s.remote_seen = true;
-                    s.status_local = Some(merged.clone());
-                    s.status_error = None;
+                    let v = &exit["value"];
+                    let ref_name = v["refName"].as_str().unwrap_or("").to_string();
+                    let msg = if v["status"].as_str() == Some("skipped_up_to_date") {
+                        format!("{ref_name} is up to date")
+                    } else {
+                        format!("Pulled {ref_name}")
+                    };
+                    this.push_toast(ToastKind::Success, msg, None, None, cx);
+                    this.vcs_refresh_status(cx);
                 } else {
-                    s.status_error = Some(failure_message(&exit));
+                    let msg = failure_message(&exit);
+                    this.push_toast(ToastKind::Error, "Pull failed", Some(msg), None, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `vcs.init` — `git init` in the project root ("Not a git repository").
+    fn vcs_init(&mut self, cx: &mut Context<Self>) {
+        if self.vcs_state.init_pending {
+            return;
+        }
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let generation = self.vcs_state.generation;
+        let Some(rx) = self.send_query("vcs.init", json!({ "cwd": cwd, "kind": "git" })) else {
+            cx.notify();
+            return;
+        };
+        self.vcs_state.init_pending = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.vcs_state;
+                if s.generation != generation {
+                    return;
+                }
+                s.init_pending = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.push_toast(
+                        ToastKind::Success,
+                        "Initialized git repository",
+                        None,
+                        None,
+                        cx,
+                    );
+                    this.vcs_refresh_status(cx);
+                } else {
+                    let msg = failure_message(&exit);
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Repository init failed",
+                        Some(msg),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lazily build the new-worktree `TextField` and focus it. Submitting
+    /// runs `vcs.createWorktree` (new branch at the current ref).
+    fn vcs_open_new_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vcs_state.new_worktree_open = true;
+        if self.vcs_state.new_worktree_field.is_none() {
+            let field = cx.new(|cx| TextField::new("new-worktree-branch", cx));
+            self.vcs_state.worktree_field_sub = Some(cx.subscribe_in(
+                &field,
+                window,
+                |this, _field, event: &PromptSubmitted, _window, cx| {
+                    let name = event.0.trim().to_string();
+                    if !name.is_empty() {
+                        this.vcs_create_worktree(name, cx);
+                    }
+                },
+            ));
+            self.vcs_state.new_worktree_field = Some(field);
+        }
+        if let Some(field) = self.vcs_state.new_worktree_field.clone() {
+            field.update(cx, |f, cx| f.reset(window, cx));
+            field.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// `vcs.createWorktree` `{refName: <current>, newRefName: <name>}` —
+    /// creates the branch at the current ref and checks it out in a managed
+    /// worktree directory under the server's T3 home.
+    fn vcs_create_worktree(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.vcs_state.worktree_pending.is_some() {
+            return;
+        }
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let base = self
+            .vcs_state
+            .status_local
+            .as_ref()
+            .and_then(|l| l["refName"].as_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("HEAD")
+            .to_string();
+        let generation = self.vcs_state.generation;
+        let Some(rx) = self.send_query(
+            "vcs.createWorktree",
+            json!({ "cwd": cwd, "refName": base, "newRefName": name }),
+        ) else {
+            self.vcs_state.worktree_error = Some("Not connected to a server.".to_string());
+            cx.notify();
+            return;
+        };
+        self.vcs_state.worktree_pending = Some(name.clone());
+        self.vcs_state.worktree_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.vcs_state;
+                if s.generation != generation {
+                    return;
+                }
+                s.worktree_pending = None;
+                if exit["_tag"].as_str() == Some("Success") {
+                    let path = exit["value"]["worktree"]["path"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    s.new_worktree_open = false;
+                    this.push_toast(
+                        ToastKind::Success,
+                        format!("Worktree created for {name}"),
+                        (!path.is_empty()).then_some(path),
+                        None,
+                        cx,
+                    );
+                    this.vcs_load_refs(cx);
+                } else {
+                    let msg = failure_message(&exit);
+                    s.worktree_error = Some(msg.clone());
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Worktree create failed",
+                        Some(msg),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `vcs.removeWorktree` — two clicks: the first arms "Confirm remove",
+    /// the second sends the request.
+    fn vcs_remove_worktree(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.vcs_state.worktree_pending.is_some() {
+            return;
+        }
+        if self.vcs_state.worktree_remove_armed.as_deref() != Some(path.as_str()) {
+            self.vcs_state.worktree_remove_armed = Some(path);
+            cx.notify();
+            return;
+        }
+        self.vcs_state.worktree_remove_armed = None;
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let generation = self.vcs_state.generation;
+        let Some(rx) = self.send_query("vcs.removeWorktree", json!({ "cwd": cwd, "path": path }))
+        else {
+            self.vcs_state.worktree_error = Some("Not connected to a server.".to_string());
+            cx.notify();
+            return;
+        };
+        self.vcs_state.worktree_pending = Some(path.clone());
+        self.vcs_state.worktree_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.vcs_state;
+                if s.generation != generation {
+                    return;
+                }
+                s.worktree_pending = None;
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.push_toast(ToastKind::Success, "Worktree removed", None, None, cx);
+                    this.vcs_load_refs(cx);
+                } else {
+                    let msg = failure_message(&exit);
+                    s.worktree_error = Some(msg.clone());
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Worktree remove failed",
+                        Some(msg),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `thread.pull-request.link` — pin the PR on the selected thread. The
+    /// store stamps the link object (minus type/commandId/threadId) onto
+    /// `linkedPullRequest`; the shell `thread.updated` confirms it.
+    fn vcs_link_pr(&mut self, entry: &Value, cx: &mut Context<Self>) {
+        let Some(thread) = self.state.selected_thread() else {
+            return;
+        };
+        let thread_id = thread.id.to_string();
+        let repository = entry["repository"].as_str().unwrap_or("").to_string();
+        let number = entry["number"].as_i64().unwrap_or(0);
+        let url = entry["url"].as_str().unwrap_or("").to_string();
+        if repository.is_empty() || number <= 0 || url.is_empty() {
+            return;
+        }
+        let host = entry["host"].as_str().unwrap_or("github.com").to_string();
+        let mut link = json!({
+            "host": host,
+            "repository": repository,
+            "number": number,
+            "url": url,
+            "projectId": entry["projectId"].as_str().unwrap_or(""),
+            "source": "manual",
+        });
+        let mut command = json!({
+            "type": "thread.pull-request.link",
+            "commandId": uuid::Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+        });
+        if let (Some(map), Some(l)) = (command.as_object_mut(), link.as_object()) {
+            map.extend(l.clone());
+        }
+        // Optimistic: the badge shows before the store's event lands.
+        link.as_object_mut().map(|o| {
+            o.remove("source");
+        });
+        if let Some(t) = self
+            .state
+            .threads
+            .iter_mut()
+            .find(|t| t.id.as_ref() == thread_id)
+        {
+            t.linked_pull_request = Some(link);
+        }
+        self.dispatch(command);
+        self.push_toast(
+            ToastKind::Success,
+            format!("Linked PR #{number}"),
+            None,
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// `thread.pull-request.unlink` — clear the pinned linked-PR badge.
+    fn vcs_unlink_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.state.selected_thread() else {
+            return;
+        };
+        let thread_id = thread.id.to_string();
+        let link = thread.linked_pull_request.clone().unwrap_or(Value::Null);
+        let mut command = json!({
+            "type": "thread.pull-request.unlink",
+            "commandId": uuid::Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+            "repository": link["repository"].as_str().unwrap_or(""),
+            "number": link["number"].as_i64().unwrap_or(0),
+        });
+        if let Some(host) = link["host"].as_str() {
+            command["host"] = json!(host);
+        }
+        if let Some(t) = self
+            .state
+            .threads
+            .iter_mut()
+            .find(|t| t.id.as_ref() == thread_id)
+        {
+            t.linked_pull_request = None;
+        }
+        self.dispatch(command);
+        self.push_toast(ToastKind::Info, "Unlinked pull request", None, None, cx);
+        cx.notify();
+    }
+
+    /// "Files changed" on a PR row — `review.getDiffPreview` against the
+    /// PR's base branch (local git; no forge credential). The wire carries
+    /// no remote file list, so this is the local branch-range comparison.
+    fn vcs_pr_diff(&mut self, entry: &Value, cx: &mut Context<Self>) {
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let number = entry["number"].as_i64().unwrap_or(0);
+        let repo = entry["repository"].as_str().unwrap_or("").to_string();
+        let base = self
+            .vcs_state
+            .detail
+            .as_ref()
+            .and_then(|d| d["baseBranch"].as_str())
+            .or_else(|| entry["baseBranch"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let head = self
+            .vcs_state
+            .detail
+            .as_ref()
+            .and_then(|d| d["headBranch"].as_str())
+            .or_else(|| entry["headBranch"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let local_ref = self
+            .vcs_state
+            .status_local
+            .as_ref()
+            .and_then(|l| l["refName"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let note = (!head.is_empty() && head != local_ref).then(|| {
+            format!(
+                "Local checkout is '{local_ref}', not this PR's head '{head}' — showing the local comparison.",
+            )
+        });
+        let mut request = json!({ "cwd": cwd });
+        if !base.is_empty() {
+            request["baseRef"] = json!(base);
+        }
+        self.open_review_diff(
+            format!("PR #{number} · {repo}"),
+            request,
+            Some("branch-range"),
+            note,
+            cx,
+        );
+    }
+
+    /// "Review changes" on the status card — `review.getDiffPreview` for all
+    /// local sources (uncommitted + changes vs merge base).
+    fn vcs_review_changes(&mut self, cx: &mut Context<Self>) {
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        self.open_review_diff(
+            "Local changes".to_string(),
+            json!({ "cwd": cwd }),
+            None,
+            None,
+            cx,
+        );
+    }
+
+    /// `sourceControl.signInStart` probe — this server cannot drive a device
+    /// flow, so the reply is a `SourceControlSignInError` whose detail tells
+    /// the user to run `gh auth login` themselves. Surfaced inline.
+    fn vcs_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.vcs_state.signin_busy {
+            return;
+        }
+        self.vcs_state.signin_busy = true;
+        self.vcs_state.signin_detail = None;
+        cx.notify();
+        let Some(rx) =
+            self.send_query("sourceControl.signInStart", json!({ "host": "github.com" }))
+        else {
+            self.vcs_state.signin_busy = false;
+            self.vcs_state.signin_detail = Some("Not connected to a server.".to_string());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let s = &mut this.vcs_state;
+                s.signin_busy = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    s.signin_detail = Some("Signed in.".to_string());
+                    let generation = s.generation;
+                    this.vcs_load_prs(generation, cx);
+                } else {
+                    let error = &exit["cause"]["error"];
+                    s.signin_detail = error["detail"]
+                        .as_str()
+                        .or_else(|| error["message"].as_str())
+                        .map(str::to_owned)
+                        .or_else(|| Some(failure_message(&exit)));
                 }
                 cx.notify();
             });
@@ -903,7 +1415,32 @@ impl AppView {
             return card.child(muted_status_row("Loading repository status…"));
         };
         if local["isRepo"].as_bool() != Some(true) {
-            return card.child(muted_status_row("Not a git repository"));
+            return card.child(muted_status_row("Not a git repository")).child(
+                div()
+                    .id("vcs-init")
+                    .mx_2()
+                    .mb_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border())
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme::primary())
+                    .hover(|h| h.bg(theme::hover()))
+                    .child(if s.init_pending {
+                        "Initializing…"
+                    } else {
+                        "Initialize git repository"
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.vcs_init(cx);
+                        }),
+                    ),
+            );
         }
 
         let ref_name = local["refName"]
@@ -1025,7 +1562,48 @@ impl AppView {
         } else {
             meta = meta.child("· clean");
         }
-        card.child(meta)
+        card = card.child(meta);
+
+        // Actions: manual refresh, ff-only pull, local-diff review sheet.
+        let has_upstream = remote.and_then(|r| r["hasUpstream"].as_bool()) == Some(true);
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pb_1p5()
+            .flex_wrap();
+        actions = actions.child(action_button(
+            "vcs-action-refresh",
+            "↻ Refresh",
+            s.pull_pending,
+            cx.listener(|this, _ev, _window, cx| {
+                this.vcs_refresh_status(cx);
+            }),
+        ));
+        if has_upstream {
+            actions = actions.child(action_button(
+                "vcs-action-pull",
+                if s.pull_pending {
+                    "Pulling…"
+                } else {
+                    "↓ Pull"
+                },
+                s.pull_pending,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.vcs_pull(cx);
+                }),
+            ));
+        }
+        actions = actions.child(action_button(
+            "vcs-action-review",
+            "Review changes",
+            false,
+            cx.listener(|this, _ev, _window, cx| {
+                this.vcs_review_changes(cx);
+            }),
+        ));
+        card.child(actions)
     }
 
     /// Inline branch picker under the status card.
@@ -1173,7 +1751,171 @@ impl AppView {
             }
             list = list.child(row);
         }
-        picker.child(list)
+        picker = picker.child(list);
+        picker.child(self.render_worktree_section(cx))
+    }
+
+    /// Worktree list + create/remove inside the branch picker. Refs carry a
+    /// `worktreePath` when their branch is checked out in a worktree.
+    fn render_worktree_section(&self, cx: &mut Context<Self>) -> Div {
+        let s = &self.vcs_state;
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme::border());
+
+        let mut header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::fg_muted())
+                    .child("Worktrees"),
+            );
+        header = header.child(
+            div()
+                .id("vcs-new-worktree")
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme::primary())
+                .hover(|h| h.bg(theme::hover()))
+                .child("+ New")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, window, cx| {
+                        this.vcs_open_new_worktree(window, cx);
+                    }),
+                ),
+        );
+        section = section.child(header);
+
+        if s.new_worktree_open {
+            let mut row = div().flex().flex_col().px_2().pb_1().gap_0p5();
+            if let Some(field) = s.new_worktree_field.clone() {
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(24.))
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::canvas())
+                        .text_sm()
+                        .child(field),
+                );
+            }
+            row = row.child(
+                div()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("Enter to create a branch + worktree at the current ref"),
+            );
+            section = section.child(row);
+        }
+        if let Some(err) = &s.worktree_error {
+            section = section.child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(pr_closed_color())
+                    .child(err.clone()),
+            );
+        }
+
+        let worktrees: Vec<(String, String, bool)> = s
+            .refs
+            .iter()
+            .filter_map(|r| {
+                let path = r["worktreePath"].as_str()?.to_string();
+                Some((
+                    r["name"].as_str().unwrap_or("").to_string(),
+                    path,
+                    r["current"].as_bool() == Some(true),
+                ))
+            })
+            .collect();
+        if !s.refs_loaded {
+            return section;
+        }
+        if worktrees.is_empty() {
+            return section.child(
+                div()
+                    .px_2()
+                    .pb_1p5()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("No worktrees."),
+            );
+        }
+        for (ix, (name, path, current)) in worktrees.into_iter().enumerate() {
+            let armed = s.worktree_remove_armed.as_deref() == Some(path.as_str());
+            let pending = s.worktree_pending.as_deref() == Some(path.as_str());
+            let mut row = div()
+                .id(("vcs-worktree", ix))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .text_xs();
+            row = row
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme::fg())
+                        .child(name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::fg_muted())
+                        .font_family("monospace")
+                        .child(path.clone()),
+                );
+            if current {
+                row = row.child(chip("current"));
+            } else if pending {
+                row = row.child(div().text_color(theme::fg_muted()).child("…"));
+            } else {
+                let path = path.clone();
+                row = row.child(
+                    div()
+                        .id(("vcs-worktree-remove", ix))
+                        .px_1p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(if armed {
+                            pr_closed_color()
+                        } else {
+                            theme::fg_muted()
+                        })
+                        .hover(|h| h.bg(theme::hover()))
+                        .child(if armed { "Confirm remove" } else { "Remove" })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.vcs_remove_worktree(path.clone(), cx);
+                            }),
+                        ),
+                );
+            }
+            section = section.child(row);
+        }
+        section
     }
 
     /// "Pull requests · N" section header + refresh button.
@@ -1255,17 +1997,24 @@ impl AppView {
             let repo = link["repository"].as_str().unwrap_or("").to_string();
             let url = link["url"].as_str().unwrap_or("").to_string();
             if number > 0 {
-                list = list.child(
+                let mut badge = div()
+                    .id("vcs-linked-pr")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border());
+                badge = badge.child(
                     div()
-                        .id("vcs-linked-pr")
                         .flex()
                         .items_center()
                         .gap_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(theme::border())
+                        .flex_1()
+                        .min_w_0()
+                        .id("vcs-linked-pr-open")
                         .cursor_pointer()
                         .hover(|h| h.bg(theme::hover()))
                         .child(
@@ -1293,6 +2042,25 @@ impl AppView {
                             }),
                         ),
                 );
+                badge = badge.child(
+                    div()
+                        .id("vcs-linked-pr-unlink")
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .hover(|h| h.bg(theme::hover()))
+                        .child("Unlink")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.vcs_unlink_pr(cx);
+                            }),
+                        ),
+                );
+                list = list.child(badge);
             }
         }
 
@@ -1309,23 +2077,93 @@ impl AppView {
 
         if let Some(err) = &s.pr_error {
             if s.prs.is_empty() {
-                return list.child(
+                let mut err_block = div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .px_4()
+                    .py_6()
+                    .child(div().text_sm().child("Pull requests unavailable"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .text_center()
+                            .child(err.clone()),
+                    );
+                // Sign-in helper: probe sourceControl.signInStart (the
+                // server cannot drive a device flow, so its detail row says
+                // `gh auth login`) and offer the command for copying.
+                let mut signin_row = div().flex().items_center().gap_2().pt_2();
+                signin_row = signin_row.child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_1()
-                        .px_4()
-                        .py_6()
-                        .child(div().text_sm().child("Pull requests unavailable"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .text_center()
-                                .child(err.clone()),
+                        .id("vcs-signin")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::border())
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme::primary())
+                        .hover(|h| h.bg(theme::hover()))
+                        .child(if s.signin_busy {
+                            "Checking…"
+                        } else {
+                            "Sign in with GitHub"
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.vcs_sign_in(cx);
+                            }),
                         ),
                 );
+                signin_row = signin_row.child(
+                    div()
+                        .id("vcs-copy-gh-login")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::border())
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .hover(|h| h.bg(theme::hover()))
+                        .child("Copy `gh auth login`")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    "gh auth login".to_string(),
+                                ));
+                                this.push_toast(
+                                    ToastKind::Info,
+                                    "Copied `gh auth login`",
+                                    Some(
+                                        "Run it in a terminal on the server host, then refresh."
+                                            .to_string(),
+                                    ),
+                                    None,
+                                    cx,
+                                );
+                            }),
+                        ),
+                );
+                err_block = err_block.child(signin_row);
+                if let Some(detail) = &s.signin_detail {
+                    err_block = err_block.child(
+                        div()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .text_center()
+                            .child(detail.clone()),
+                    );
+                }
+                return list.child(err_block);
             }
             list = list.child(
                 div()
@@ -1377,6 +2215,14 @@ impl AppView {
             let deletions = entry["deletions"].as_i64().unwrap_or(0);
             let review = entry["reviewDecision"].as_str().map(str::to_owned);
             let review_requested = entry["viewerReviewRequested"].as_bool() == Some(true);
+            let linked = self
+                .state
+                .selected_thread()
+                .and_then(|t| t.linked_pull_request.as_ref())
+                .is_some_and(|l| {
+                    l["number"].as_i64() == Some(number)
+                        && l["repository"].as_str() == Some(repo.as_str())
+                });
 
             let mut top = div()
                 .flex()
@@ -1463,16 +2309,19 @@ impl AppView {
                         .min_w_0()
                         .child(top)
                         .child(sub),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _window, cx| {
-                        this.vcs_toggle_pr(key_click.clone(), cx);
-                    }),
                 );
+            if linked {
+                row = row.child(div().text_xs().text_color(theme::primary()).child("⧉"));
+            }
             if expanded {
                 row = row.child(div().text_xs().text_color(theme::fg_muted()).child("▾"));
             }
+            row = row.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.vcs_toggle_pr(key_click.clone(), cx);
+                }),
+            );
             let mut group = div().flex().flex_col().child(row);
             if expanded {
                 group = group.child(self.render_pr_detail(entry, cx));
@@ -1497,6 +2346,88 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1();
+
+        // Action rows are useful even while the detail fetch is in flight.
+        let mut actions = div().flex().items_center().gap_2().flex_wrap();
+        {
+            let entry_owned = entry.clone();
+            actions = actions.child(
+                div()
+                    .id("vcs-pr-files")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme::primary())
+                    .hover(|h| h.bg(theme::hover()))
+                    .child("Files changed")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.vcs_pr_diff(&entry_owned, cx);
+                        }),
+                    ),
+            );
+        }
+        let linked = self
+            .state
+            .selected_thread()
+            .and_then(|t| t.linked_pull_request.as_ref())
+            .is_some_and(|l| {
+                l["number"].as_i64() == entry["number"].as_i64()
+                    && l["repository"].as_str() == entry["repository"].as_str()
+            });
+        if linked {
+            actions = actions.child(
+                div()
+                    .id("vcs-pr-unlink")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .hover(|h| h.bg(theme::hover()))
+                    .child("Unlink from thread")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.vcs_unlink_pr(cx);
+                        }),
+                    ),
+            );
+        } else {
+            let entry_owned = entry.clone();
+            actions = actions.child(
+                div()
+                    .id("vcs-pr-link")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme::primary())
+                    .hover(|h| h.bg(theme::hover()))
+                    .child("Link to this thread")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.vcs_link_pr(&entry_owned, cx);
+                        }),
+                    ),
+            );
+        }
+        block = block.child(actions);
 
         if s.detail_key.as_deref() != Some(key.as_str()) {
             return block;
@@ -1719,6 +2650,26 @@ impl AppView {
         }
         block
     }
+}
+
+/// Small clickable ghost button for the status-card action row.
+fn action_button(
+    id: &'static str,
+    label: &'static str,
+    busy: bool,
+    listener: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    let mut b = div()
+        .id(id)
+        .px_1p5()
+        .py_0p5()
+        .rounded_sm()
+        .text_xs()
+        .text_color(theme::fg_muted());
+    if !busy {
+        b = b.cursor_pointer().hover(|h| h.bg(theme::hover()));
+    }
+    b.child(label).on_mouse_down(MouseButton::Left, listener)
 }
 
 /// Small muted badge used for "default"/"remote"/"worktree"/"review"/labels.
