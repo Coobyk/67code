@@ -70,28 +70,41 @@ const RUNTIME_MODES: &[(&str, &str, &str)] = &[
 
 /// `defaultThreadEnvMode` options — labels from
 /// `resolveEnvModeLabel` in apps/web/src/components/BranchToolbar.logic.ts.
-const ENV_MODES: &[(&str, &str)] = &[
-    ("local", "Current checkout"),
-    ("worktree", "New worktree"),
+const ENV_MODES: &[(&str, &str)] = &[("local", "Current checkout"), ("worktree", "New worktree")];
+
+/// Project-icon emoji choices — `PROJECT_EMOJIS` in
+/// apps/web/src/projectIconOptions.ts (same order).
+const PROJECT_EMOJIS: &[&str] = &[
+    "💻", "🛠️", "🚀", "🤖", "✨", "⚡", "🌐", "📱", "🖥️", "⌨️", "⚙️", "🗄️", "☁️", "📦", "📚", "🧪",
+    "🔒", "🎮", "🎵", "🎬", "🖼️", "🛍️", "🔥", "💡", "🧩", "📊", "🧠", "🦄", "🐙", "🌱",
 ];
 
 /// Packed-value sentinel for "no explicit selection" rows.
-const AUTO_VALUE: &str = "\u{1f}auto";
+pub(crate) const AUTO_VALUE: &str = "\u{1f}auto";
 /// Model option values pack `instanceId` + `model` with a unit separator.
-const PACK_SEP: char = '\u{1f}';
+pub(crate) const PACK_SEP: char = '\u{1f}';
 
-fn pack_model(instance: &str, model: &str) -> String {
+pub(crate) fn pack_model(instance: &str, model: &str) -> String {
     format!("{instance}{PACK_SEP}{model}")
 }
 
 /// Which inline option list is expanded (at most one at a time).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum OpenList {
+pub(crate) enum OpenList {
     NotificationMode,
     DefaultModel,
     FallbackModel,
     RuntimeMode,
     EnvMode,
+    // settings_extra.rs sections (Threads / Source Control):
+    DiffLayout,
+    DiffFiles,
+    WorktreeSubmodules,
+    AutoSettleDays,
+    TextGenModel,
+    ResponseStreaming,
+    ScWritingMode,
+    ScWriterModel,
 }
 
 impl State {
@@ -105,13 +118,21 @@ impl State {
 
 impl OpenList {
     /// Element-id prefix + trigger id for this list.
-    fn prefix(self) -> &'static str {
+    pub(crate) fn prefix(self) -> &'static str {
         match self {
             OpenList::NotificationMode => "misc-notif-mode",
             OpenList::DefaultModel => "misc-default-model",
             OpenList::FallbackModel => "misc-fallback-model",
             OpenList::RuntimeMode => "misc-runtime-mode",
             OpenList::EnvMode => "misc-env-mode",
+            OpenList::DiffLayout => "extra-diff-layout",
+            OpenList::DiffFiles => "extra-diff-files",
+            OpenList::WorktreeSubmodules => "extra-wt-submodules",
+            OpenList::AutoSettleDays => "extra-autosettle-days",
+            OpenList::TextGenModel => "extra-textgen-model",
+            OpenList::ResponseStreaming => "extra-resp-streaming",
+            OpenList::ScWritingMode => "extra-sc-writing-mode",
+            OpenList::ScWriterModel => "extra-sc-writer-model",
         }
     }
 }
@@ -119,15 +140,20 @@ impl OpenList {
 #[derive(Default)]
 pub struct State {
     /// ServerSettings mirror (`server.getConfig → settings`; replaced with
-    /// the merged object `server.updateSettings` returns).
-    settings: Value,
+    /// the merged object `server.updateSettings` returns). `pub(crate)` so
+    /// the settings_extra sections can read the same mirror.
+    pub(crate) settings: Value,
     /// `Cell` flags because the lazy-load kick runs from `&self` render.
-    settings_loaded: Cell<bool>,
-    settings_loading: Cell<bool>,
+    pub(crate) settings_loaded: Cell<bool>,
+    pub(crate) settings_loading: Cell<bool>,
     /// Last settings load/write failure, shown as a status line.
-    settings_error: Option<String>,
+    pub(crate) settings_error: Option<String>,
     /// Expanded option list, if any.
     open_list: Option<OpenList>,
+    /// Wave-3 sections (Keybindings / Source Control / Threads) — the
+    /// AppView field list lives in lib.rs, so extra-section state hangs off
+    /// this struct instead.
+    pub(crate) extra: crate::settings_extra::ExtraState,
 
     // ── Notification prefs (client/device-local in the web) ─────────
     // Persisted via `ClientConfig.notification_mode` / `.in_app_notifications`
@@ -161,12 +187,32 @@ pub struct State {
     path_field: Option<Entity<TextField>>,
     rename_field: Option<Entity<TextField>>,
     subs: Vec<Subscription>,
+
+    // ── Folder browser (filesystem.browse) ──────────────────────────────
+    /// The browse panel inside the add-project form is open.
+    browse_open: bool,
+    /// Directory whose children `browse_entries` lists (absolute, no
+    /// trailing slash except the filesystem root).
+    browse_dir: String,
+    /// `(name, fullPath)` directory entries from `filesystem.browse`.
+    browse_entries: Vec<(String, String)>,
+    /// `Cell` flags because the fetch kick runs from `&self` render.
+    browse_loading: Cell<bool>,
+    /// `browse_dir` changed since the last fetch — re-browse on next render.
+    browse_dirty: Cell<bool>,
+    browse_error: Option<String>,
+
+    // ── Project icon picker ─────────────────────────────────────────────
+    /// Project id whose emoji-picker row is open (`project.update`
+    /// `{projectIcon:{kind:"emoji",…}}` — the wire accepts it; ShellProject
+    /// doesn't carry the icon back, so there is no current-icon display).
+    icon_picker: Option<String>,
 }
 
 // ─── small render helpers (mirroring settings.rs section style) ───────────
 
 /// Small caption above a group of rows.
-fn group_label(text: &'static str) -> gpui::Div {
+pub(crate) fn group_label(text: &'static str) -> gpui::Div {
     div()
         .pb_1()
         .pt_3()
@@ -176,13 +222,13 @@ fn group_label(text: &'static str) -> gpui::Div {
 }
 
 /// Destructive accent used across the app (palette/sidebar danger).
-fn danger() -> gpui::Rgba {
+pub(crate) fn danger() -> gpui::Rgba {
     rgb(0xf87171)
 }
 
 /// A settings row: title + muted description on the left, control on the
 /// right — the compact shape `SettingsRow` gives the web.
-fn setting_row(
+pub(crate) fn setting_row(
     title: &'static str,
     description: &'static str,
     control: impl IntoElement,
@@ -199,12 +245,7 @@ fn setting_row(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme::fg())
-                        .child(title),
-                )
+                .child(div().text_sm().text_color(theme::fg()).child(title))
                 .child(
                     div()
                         .text_xs()
@@ -216,33 +257,33 @@ fn setting_row(
 }
 
 /// A simple switch (web `Switch`): pill with a knob on the on/off side.
-fn switch_control(on: bool) -> gpui::Div {
+pub(crate) fn switch_control(on: bool) -> gpui::Div {
     div()
         .w(px(32.))
         .h(px(18.))
         .flex_none()
         .rounded_full()
         .px(px(2.))
-        .bg(if on { theme::primary() } else { theme::border() })
+        .bg(if on {
+            theme::primary()
+        } else {
+            theme::border()
+        })
         .flex()
         .items_center()
         .when(on, |d| d.justify_end())
-        .child(
-            div()
-                .w(px(14.))
-                .h(px(14.))
-                .rounded_full()
-                .bg(gpui::white()),
-        )
+        .child(div().w(px(14.)).h(px(14.)).rounded_full().bg(gpui::white()))
 }
 
 /// A readable message out of a Failure `Exit` frame's cause (same shape
 /// `exit_failure_message` in archived.rs digs through).
-fn exit_failure_message(exit: &Value) -> String {
+pub(crate) fn exit_failure_message(exit: &Value) -> String {
     let cause = &exit["cause"];
     for candidate in [
         &cause["message"],
         &cause["error"]["message"],
+        &cause["error"]["detail"],
+        &cause["detail"],
         &cause["defect"],
         &cause["reason"],
         cause,
@@ -258,7 +299,7 @@ fn exit_failure_message(exit: &Value) -> String {
 //     there). Listeners with a `window` prefer `field.update` directly. ────
 
 /// Read a text field's contents when no `&mut Window` is on the update stack.
-fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
+pub(crate) fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
     if let Some(text) = cx
         .with_window(field.entity_id(), |window, app| {
             field.update(app, |field, cx| {
@@ -282,7 +323,7 @@ fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
 }
 
 /// Read a text field's contents inside an event listener that has a `window`.
-fn field_text_in(
+pub(crate) fn field_text_in(
     field: &Entity<TextField>,
     window: &mut Window,
     cx: &mut Context<AppView>,
@@ -296,7 +337,7 @@ fn field_text_in(
 
 /// Run `f` on `field` with a `&mut Window` from a context that doesn't carry
 /// one (entity subscriptions/observers).
-fn edit_field<R>(
+pub(crate) fn edit_field<R>(
     field: &Entity<TextField>,
     cx: &mut Context<AppView>,
     f: impl Fn(&mut TextField, &mut Window, &mut Context<TextField>) -> R,
@@ -328,7 +369,7 @@ impl AppView {
     /// Kick off `server.getConfig` on first render of a settings-backed
     /// section. With no command channel there is nothing to fetch — mark it
     /// loaded so defaults show instead of retrying every frame.
-    fn maybe_load_misc_settings(&self, cx: &mut Context<Self>) {
+    pub(crate) fn maybe_load_misc_settings(&self, cx: &mut Context<Self>) {
         let state = &self.misc_settings_state;
         if state.settings_loaded.get() || state.settings_loading.get() {
             return;
@@ -347,10 +388,13 @@ impl AppView {
                                 state.settings = exit["value"]["settings"].clone();
                                 state.settings_error = None;
                                 this.apply_server_defaults();
+                                this.seed_extra_fields(cx);
                             }
                             Ok(exit) => {
-                                state.settings_error =
-                                    Some(format!("Settings failed to load: {}", exit_failure_message(&exit)));
+                                state.settings_error = Some(format!(
+                                    "Settings failed to load: {}",
+                                    exit_failure_message(&exit)
+                                ));
                             }
                             Err(_) => {
                                 state.settings_error =
@@ -398,10 +442,9 @@ impl AppView {
     /// `server.updateSettings {patch}` — optimistic top-level merge into the
     /// mirror; the reply carries the full merged object and replaces it. A
     /// failure marks the mirror stale so the next render refetches.
-    fn update_server_settings(&mut self, patch: Value, cx: &mut Context<Self>) {
+    pub(crate) fn update_server_settings(&mut self, patch: Value, cx: &mut Context<Self>) {
         let Some(rx) = self.send_query("server.updateSettings", json!({ "patch": patch })) else {
-            self.misc_settings_state.settings_error =
-                Some("Not connected to a server.".into());
+            self.misc_settings_state.settings_error = Some("Not connected to a server.".into());
             cx.notify();
             return;
         };
@@ -443,7 +486,7 @@ impl AppView {
     }
 
     /// Fold an expanded select list's pick into state / server settings.
-    fn misc_pick(&mut self, list: OpenList, value: String, cx: &mut Context<Self>) {
+    pub(crate) fn misc_pick(&mut self, list: OpenList, value: String, cx: &mut Context<Self>) {
         self.misc_settings_state.open_list = None;
         match list {
             OpenList::NotificationMode => {
@@ -480,13 +523,73 @@ impl AppView {
                 };
                 self.update_server_settings(json!({ "defaultThreadEnvMode": mode }), cx);
             }
+            // ── settings_extra lists (Threads / Source Control) ────────────
+            OpenList::DiffLayout => {
+                self.client_config.diff_layout = value;
+                self.client_config.save();
+            }
+            OpenList::DiffFiles => {
+                self.client_config.diff_files_collapsed = value == "collapsed";
+                self.client_config.save();
+            }
+            OpenList::WorktreeSubmodules => {
+                let submodules = if value == "inherit" {
+                    Value::Null
+                } else {
+                    Value::String(value)
+                };
+                self.update_server_settings(json!({ "worktreeSubmodules": submodules }), cx);
+            }
+            OpenList::AutoSettleDays => {
+                let days = if value == "off" {
+                    Value::Null
+                } else {
+                    value.parse::<i64>().map(Value::from).unwrap_or(Value::Null)
+                };
+                self.update_server_settings(json!({ "sidebarAutoSettleAfterDays": days }), cx);
+            }
+            OpenList::TextGenModel => {
+                let patch = if value == AUTO_VALUE {
+                    json!({ "textGenerationModelSelection": null })
+                } else {
+                    let (instance, model) = value.split_once(PACK_SEP).unwrap_or(("", ""));
+                    json!({ "textGenerationModelSelection": { "instanceId": instance, "model": model } })
+                };
+                self.update_server_settings(patch, cx);
+            }
+            OpenList::ResponseStreaming => {
+                self.update_server_settings(json!({ "responseStreamingMode": value }), cx);
+            }
+            OpenList::ScWritingMode => {
+                // `sourceControlWritingStyle` is one object server-side; send
+                // the merged value so sibling fields (customInstructions,
+                // followChangeRequestTemplates) are not lost.
+                let mut style = self.misc_settings_state.settings["sourceControlWritingStyle"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                style.insert("mode".into(), json!(value));
+                self.update_server_settings(
+                    json!({ "sourceControlWritingStyle": Value::Object(style) }),
+                    cx,
+                );
+            }
+            OpenList::ScWriterModel => {
+                let patch = if value == AUTO_VALUE {
+                    json!({ "sourceControlWriterModelSelection": null })
+                } else {
+                    let (instance, model) = value.split_once(PACK_SEP).unwrap_or(("", ""));
+                    json!({ "sourceControlWriterModelSelection": { "instanceId": instance, "model": model } })
+                };
+                self.update_server_settings(patch, cx);
+            }
         }
         cx.notify();
     }
 
     /// Value-label pair for a stored `ModelSelection` (`{instanceId, model}`,
     /// tolerating the legacy `provider` key).
-    fn selection_label(selection: &Value) -> String {
+    pub(crate) fn selection_label(selection: &Value) -> String {
         let instance = selection["instanceId"]
             .as_str()
             .or_else(|| selection["provider"].as_str())
@@ -504,7 +607,7 @@ impl AppView {
 
     /// The trigger control of a select row — current value + ▾; click
     /// toggles the option list open/closed.
-    fn select_trigger(
+    pub(crate) fn select_trigger(
         &self,
         list: OpenList,
         current: SharedString,
@@ -536,7 +639,7 @@ impl AppView {
     }
 
     /// One select setting: row + (when open) the option list underneath.
-    fn select_setting(
+    pub(crate) fn select_setting(
         &self,
         title: &'static str,
         description: &'static str,
@@ -782,24 +885,26 @@ impl AppView {
             .find(|(value, _, _)| *value == runtime_mode)
             .map(|(_, label, _)| *label)
             .unwrap_or(runtime_mode);
-        section = section.child(self.select_setting(
-            "Default permissions",
-            "Default permissions for new threads. Projects can override them.",
-            OpenList::RuntimeMode,
-            runtime_label.into(),
-            runtime_mode,
-            RUNTIME_MODES
-                .iter()
-                .map(|(value, label, detail)| {
-                    (
-                        value.to_string(),
-                        label.to_string(),
-                        Some(detail.to_string()),
-                    )
-                })
-                .collect(),
-            cx,
-        ));
+        section = section.child(
+            self.select_setting(
+                "Default permissions",
+                "Default permissions for new threads. Projects can override them.",
+                OpenList::RuntimeMode,
+                runtime_label.into(),
+                runtime_mode,
+                RUNTIME_MODES
+                    .iter()
+                    .map(|(value, label, detail)| {
+                        (
+                            value.to_string(),
+                            label.to_string(),
+                            Some(detail.to_string()),
+                        )
+                    })
+                    .collect(),
+                cx,
+            ),
+        );
 
         // ── Workspace (defaultThreadEnvMode; null inherits) ──────────────
         let env_mode = settings["defaultThreadEnvMode"].as_str();
@@ -864,27 +969,24 @@ impl AppView {
         let path_field = cx.new(|cx| TextField::new("/path/to/project", cx));
         let rename_field = cx.new(|cx| TextField::new("Project name", cx));
 
-        self.misc_settings_state.subs.push(cx.observe(
-            &name_field,
-            |this, field, cx| {
+        self.misc_settings_state
+            .subs
+            .push(cx.observe(&name_field, |this, field, cx| {
                 this.misc_settings_state.draft_name = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
-        self.misc_settings_state.subs.push(cx.observe(
-            &path_field,
-            |this, field, cx| {
+            }));
+        self.misc_settings_state
+            .subs
+            .push(cx.observe(&path_field, |this, field, cx| {
                 this.misc_settings_state.draft_path = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
-        self.misc_settings_state.subs.push(cx.observe(
-            &rename_field,
-            |this, field, cx| {
+            }));
+        self.misc_settings_state
+            .subs
+            .push(cx.observe(&rename_field, |this, field, cx| {
                 this.misc_settings_state.draft_rename = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
+            }));
 
         self.misc_settings_state.subs.push(cx.subscribe(
             &name_field,
@@ -925,6 +1027,9 @@ impl AppView {
         state.renaming = None;
         state.draft_name.clear();
         state.draft_path.clear();
+        state.browse_open = false;
+        state.browse_entries.clear();
+        state.browse_error = None;
         for field in [state.name_field.clone(), state.path_field.clone()]
             .into_iter()
             .flatten()
@@ -962,6 +1067,7 @@ impl AppView {
                     Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
                         state.projects_error = None;
                         state.add_open = false;
+                        state.browse_open = false;
                         state.renaming = None;
                         state.confirm_delete = None;
                     }
@@ -1007,9 +1113,7 @@ impl AppView {
                         state.add_open = false;
                         state.draft_name.clear();
                         if let Some(field) = state.name_field.clone() {
-                            edit_field(&field, cx, |field, window, cx| {
-                                field.reset(window, cx)
-                            });
+                            edit_field(&field, cx, |field, window, cx| field.reset(window, cx));
                         }
                         let commit_error = exit["value"]["commitError"].as_str();
                         this.push_toast(
@@ -1052,20 +1156,14 @@ impl AppView {
         }
         // Reject duplicates — a second project on the same root is a UI bug
         // the server won't catch.
-        if self
-            .state
-            .projects
-            .iter()
-            .any(|p| p.path.as_ref() == path)
-        {
+        if self.state.projects.iter().any(|p| p.path.as_ref() == path) {
             self.misc_settings_state.projects_error =
                 Some("That folder is already a project.".to_string());
             cx.notify();
             return;
         }
         if let Err(e) = std::fs::create_dir_all(&path) {
-            self.misc_settings_state.projects_error =
-                Some(format!("Could not create folder: {e}"));
+            self.misc_settings_state.projects_error = Some(format!("Could not create folder: {e}"));
             cx.notify();
             return;
         }
@@ -1176,7 +1274,178 @@ impl AppView {
         );
     }
 
+    // ─── Folder browser (`filesystem.browse`) ────────────────────────────
+
+    /// Open the directory browser inside the add-project form, rooted at
+    /// the typed path's directory (else the server setting
+    /// `addProjectBaseDirectory`, else `~`). Drives `filesystem.browse`
+    /// `{partialPath: "<dir>/"}` which lists subdirectories of `<dir>`.
+    fn open_browse(&mut self, cx: &mut Context<Self>) {
+        let state = &mut self.misc_settings_state;
+        state.browse_open = true;
+        state.browse_error = None;
+        let seed = if state.draft_path.trim().is_empty() {
+            let base = state.settings["addProjectBaseDirectory"]
+                .as_str()
+                .unwrap_or("");
+            if base.trim().is_empty() {
+                "~".to_string()
+            } else {
+                base.to_string()
+            }
+        } else {
+            state.draft_path.clone()
+        };
+        // The seed may be a not-yet-existing leaf — start at its parent so
+        // the browser lands somewhere real and the leaf stays one click away.
+        let expanded = expand_home(&seed);
+        let path = std::path::Path::new(&expanded);
+        state.browse_dir = if path.is_dir() {
+            expanded.trim_end_matches('/').to_string()
+        } else {
+            path.parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty())
+                .unwrap_or(expanded)
+        };
+        if state.browse_dir.is_empty() {
+            state.browse_dir = "/".to_string();
+        }
+        state.browse_dirty.set(true);
+        cx.notify();
+    }
+
+    /// Kick the `filesystem.browse` fetch when the browser is open and the
+    /// current directory changed since the last fetch (render is `&self`,
+    /// hence the Cell flags — the maybe_load_misc_settings pattern).
+    fn browse_kick(&self, cx: &mut Context<Self>) {
+        let state = &self.misc_settings_state;
+        if !state.browse_open || !state.browse_dirty.get() || state.browse_loading.get() {
+            return;
+        }
+        let dir = state.browse_dir.clone();
+        let partial = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{dir}/")
+        };
+        let Some(rx) = self.send_query("filesystem.browse", json!({ "partialPath": partial }))
+        else {
+            return;
+        };
+        state.browse_loading.set(true);
+        let requested_dir = dir.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                let state = &mut this.misc_settings_state;
+                state.browse_loading.set(false);
+                // A navigation during the flight re-armed `dirty` — leave it
+                // set so the next render fetches the new directory.
+                if state.browse_dir == requested_dir {
+                    state.browse_dirty.set(false);
+                } else {
+                    cx.notify();
+                    return;
+                }
+                match reply {
+                    Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
+                        let value = &exit["value"];
+                        state.browse_error = None;
+                        if let Some(parent) = value["parentPath"].as_str() {
+                            state.browse_dir = parent.to_string();
+                        }
+                        state.browse_entries = value["entries"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|e| {
+                                        let name = e["name"].as_str()?.to_string();
+                                        let full = e["fullPath"].as_str()?.to_string();
+                                        Some((name, full))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    Ok(exit) => {
+                        state.browse_entries.clear();
+                        state.browse_error = Some(exit_failure_message(&exit));
+                    }
+                    Err(_) => {
+                        state.browse_entries.clear();
+                        state.browse_error =
+                            Some("Lost connection before the reply arrived.".into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Navigate into a subdirectory (or up via `..`-style parent handling).
+    fn browse_nav(&mut self, dir: String, cx: &mut Context<Self>) {
+        let state = &mut self.misc_settings_state;
+        let dir = dir.trim_end_matches('/').to_string();
+        state.browse_dir = if dir.is_empty() { "/".into() } else { dir };
+        state.browse_dirty.set(true);
+        cx.notify();
+    }
+
+    /// One level up from the current browse directory.
+    fn browse_up(&mut self, cx: &mut Context<Self>) {
+        let dir = self.misc_settings_state.browse_dir.clone();
+        let parent = std::path::Path::new(&dir)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string());
+        self.browse_nav(parent, cx);
+    }
+
+    /// "Use this folder": copy the browsed directory into the path field
+    /// (+ its draft mirror) and close the browser.
+    fn browse_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.misc_settings_state.browse_dir.clone();
+        let state = &mut self.misc_settings_state;
+        state.browse_open = false;
+        state.draft_path = dir.clone();
+        if let Some(field) = state.path_field.clone() {
+            field.update(cx, |field, cx| {
+                field.reset(window, cx);
+                field.replace_text_in_range(Some(0..0), &dir, window, cx);
+            });
+            field.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// `project.update {projectIcon:{kind:"emoji",emoji}}` — the wire accepts
+    /// the StoredProjectIcon shape; ShellProject doesn't carry it back, so
+    /// the pick only shows as a toast here (the web renders it).
+    fn set_project_icon(&mut self, project_id: String, emoji: &str, cx: &mut Context<Self>) {
+        let state = &mut self.misc_settings_state;
+        if state.pending.contains(&project_id) {
+            return;
+        }
+        state.icon_picker = None;
+        let pending_id = project_id.clone();
+        self.project_mutate(
+            json!({
+                "type": "project.update",
+                "commandId": format!("c67-app:{}", Uuid::new_v4()),
+                "projectId": project_id,
+                "projectIcon": { "kind": "emoji", "emoji": emoji },
+            }),
+            Some(pending_id),
+            cx,
+        );
+    }
+
     pub(crate) fn render_projects_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // `addProjectBaseDirectory` seeds the browser's starting folder.
+        self.maybe_load_misc_settings(cx);
+        self.browse_kick(cx);
         let state = &self.misc_settings_state;
         let connected = self.commands.is_some();
         let active_project = self
@@ -1344,11 +1613,52 @@ impl AppView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, window, cx| {
-                            this.start_project_rename(rename_id.clone(), &rename_current, window, cx);
+                            this.start_project_rename(
+                                rename_id.clone(),
+                                &rename_current,
+                                window,
+                                cx,
+                            );
                         }),
                     );
             }
             row = row.child(rename_btn);
+
+            // Icon — opens the emoji picker row below (`project.update`
+            // `{projectIcon}` round-trips to other clients; ShellProject
+            // doesn't carry it, so the native sidebar stays text-only).
+            let icon_id = project_id.clone();
+            let picker_open = state.icon_picker.as_deref() == Some(project_id.as_str());
+            let mut icon_btn = div()
+                .id(("project-icon", index))
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .text_xs()
+                .text_color(theme::fg_muted());
+            if pending {
+                icon_btn = icon_btn.opacity(0.4).child("Icon");
+            } else {
+                icon_btn = icon_btn
+                    .cursor_pointer()
+                    .bg(theme::hover())
+                    .hover(|s| s.bg(theme::selected()))
+                    .child(if picker_open { "Close" } else { "Icon" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            let state = &mut this.misc_settings_state;
+                            state.icon_picker =
+                                if state.icon_picker.as_deref() == Some(icon_id.as_str()) {
+                                    None
+                                } else {
+                                    Some(icon_id.clone())
+                                };
+                            cx.notify();
+                        }),
+                    );
+            }
+            row = row.child(icon_btn);
 
             // Delete — two-stage arm/confirm (palette/envs pattern).
             let delete_id = project_id.clone();
@@ -1392,6 +1702,43 @@ impl AppView {
             }
             row = row.child(delete_btn);
             section = section.child(row);
+
+            // Emoji picker — same PROJECT_EMOJIS set as the web's
+            // ProjectIconPickerDialog (lucide/monogram kinds are not
+            // offered here; the wire would accept them).
+            if picker_open {
+                let mut picker = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(theme::selected());
+                for (emoji_index, emoji) in PROJECT_EMOJIS.iter().enumerate() {
+                    let pick_id = project_id.clone();
+                    let emoji = *emoji;
+                    picker = picker.child(
+                        div()
+                            .id(("project-emoji", index * 100 + emoji_index))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .child(emoji)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.set_project_icon(pick_id.clone(), emoji, cx);
+                                }),
+                            ),
+                    );
+                }
+                section = section.child(picker);
+            }
         }
 
         if let Some(error) = &state.projects_error {
@@ -1463,7 +1810,8 @@ impl AppView {
             form = form.child(div().flex().child(create_btn));
 
             // Existing folder — `project.create` pointing at a workspace
-            // root the user types in (no browse RPC yet).
+            // root the user types in or picks in the `filesystem.browse`
+            // browser below.
             if let Some(field) = state.path_field.clone() {
                 form = form.child(
                     div()
@@ -1488,8 +1836,160 @@ impl AppView {
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
+                        )
+                        .child(
+                            div()
+                                .id("project-browse-toggle")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::hover())
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::selected()))
+                                .child(if state.browse_open {
+                                    "Close browser"
+                                } else {
+                                    "Browse…"
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        if this.misc_settings_state.browse_open {
+                                            this.misc_settings_state.browse_open = false;
+                                            cx.notify();
+                                        } else {
+                                            this.open_browse(cx);
+                                        }
+                                    }),
+                                ),
                         ),
                 );
+            }
+
+            // Directory browser — `filesystem.browse` lists subdirectories
+            // of `browse_dir`; rows navigate in, "↑" goes up, "Use this
+            // folder" feeds the path field above.
+            if state.browse_open {
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::canvas());
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("project-browse-up")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::hover())
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::selected()))
+                                .child("↑ Up")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.browse_up(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(state.browse_dir.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("project-browse-select")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::primary())
+                                .text_color(gpui::white())
+                                .child("Use this folder")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, window, cx| {
+                                        this.browse_select(window, cx);
+                                    }),
+                                ),
+                        ),
+                );
+                if state.browse_loading.get() {
+                    panel = panel.child(
+                        div()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("Loading…"),
+                    );
+                } else if let Some(error) = &state.browse_error {
+                    panel = panel.child(
+                        div()
+                            .py_1()
+                            .text_xs()
+                            .text_color(danger())
+                            .child(error.clone()),
+                    );
+                } else if state.browse_entries.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("No subfolders here."),
+                    );
+                } else {
+                    let mut list = div().flex().flex_col();
+                    for (entry_index, (name, full)) in state.browse_entries.iter().enumerate() {
+                        let full = full.clone();
+                        list = list.child(
+                            div()
+                                .id(("project-browse-entry", entry_index))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_sm()
+                                .cursor_pointer()
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::hover()))
+                                .child(format!("📁 {name}"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.browse_nav(full.clone(), cx);
+                                    }),
+                                ),
+                        );
+                    }
+                    panel = panel.child(
+                        div()
+                            .id("project-browse-list")
+                            .h(px(140.))
+                            .overflow_y_scroll()
+                            .child(list),
+                    );
+                }
+                form = form.child(panel);
             }
             let path_ok = !state.draft_path.trim().is_empty();
             let mut add_btn = div()
@@ -1516,33 +2016,29 @@ impl AppView {
                 }),
             );
             form = form.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(add_btn)
-                    .child(
-                        div()
-                            .id("project-add-cancel")
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .cursor_pointer()
-                            .bg(theme::hover())
-                            .text_color(theme::fg())
-                            .hover(|s| s.bg(theme::selected()))
-                            .child("Cancel")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    let state = &mut this.misc_settings_state;
-                                    state.add_open = false;
-                                    state.projects_error = None;
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
+                div().flex().items_center().gap_2().child(add_btn).child(
+                    div()
+                        .id("project-add-cancel")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(theme::hover())
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::selected()))
+                        .child("Cancel")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                let state = &mut this.misc_settings_state;
+                                state.add_open = false;
+                                state.browse_open = false;
+                                state.projects_error = None;
+                                cx.notify();
+                            }),
+                        ),
+                ),
             );
             section = section.child(group_label("Add project")).child(form);
         } else {
@@ -1574,7 +2070,7 @@ impl AppView {
 }
 
 /// Expand a leading `~` or `~/…` against `$HOME` for the add-folder field.
-fn expand_home(path: &str) -> String {
+pub(crate) fn expand_home(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| trimmed.to_string());
