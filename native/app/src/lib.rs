@@ -13,8 +13,10 @@ mod notifications;
 mod palette;
 mod right_panel;
 mod search_dialog;
+mod integrations;
 mod settings;
 mod settings_backend;
+mod settings_extra;
 mod settings_misc;
 mod sidebar;
 mod terminal_drawer;
@@ -440,11 +442,21 @@ impl AppView {
                 self.composer_state.drain_attachments(),
             );
             // A busy thread queues the message behind the active run instead
-            // of interrupting it (web parity).
-            let dispatch_mode = if self.selected_thread_busy() {
-                serde_json::json!({ "type": "queue_after_active" })
-            } else {
-                serde_json::json!({ "type": "start_immediately" })
+            // of interrupting it (web parity); `dispatch_override` is the
+            // composer's run-options pick (steer/restart/queue).
+            let dispatch_mode = match self.composer_state.dispatch_override.take() {
+                Some(mode @ ("steer_active" | "restart_active")) => serde_json::json!({
+                    "type": mode,
+                    "targetRunId": self
+                        .state
+                        .selected_thread()
+                        .and_then(|t| t.latest_run_id.clone()),
+                }),
+                Some(mode) => serde_json::json!({ "type": mode }),
+                None if self.selected_thread_busy() => {
+                    serde_json::json!({ "type": "queue_after_active" })
+                }
+                None => serde_json::json!({ "type": "start_immediately" }),
             };
             self.dispatch(
                 serde_json::json!({

@@ -4,6 +4,7 @@ pub mod handlers;
 pub mod provider;
 pub mod rpc_assets;
 pub mod rpc_fs;
+pub mod rpc_mcp;
 pub mod rpc_misc;
 pub mod rpc_prs;
 pub mod rpc_tasks;

@@ -35,6 +35,10 @@ pub enum Section {
     Diagnostics,
     Usage,
     Shortcuts,
+    Keybindings,
+    SourceControl,
+    Integrations,
+    Threads,
     About,
 }
 
@@ -54,6 +58,10 @@ const SECTIONS: &[(Section, &str)] = &[
     (Section::Diagnostics, "Diagnostics"),
     (Section::Usage, "Usage Limits"),
     (Section::Shortcuts, "Keyboard Shortcuts"),
+    (Section::Keybindings, "Keybindings"),
+    (Section::SourceControl, "Source Control"),
+    (Section::Integrations, "Integrations"),
+    (Section::Threads, "Threads"),
     (Section::About, "About"),
 ];
 
@@ -471,6 +479,22 @@ impl AppView {
             Section::Shortcuts => (
                 "Keyboard Shortcuts",
                 self.render_shortcuts_section().into_any_element(),
+            ),
+            Section::Keybindings => (
+                "Keybindings",
+                self.render_keybindings_section(cx).into_any_element(),
+            ),
+            Section::SourceControl => (
+                "Source Control",
+                self.render_source_control_section(cx).into_any_element(),
+            ),
+            Section::Integrations => (
+                "Integrations",
+                self.render_integrations_section(cx).into_any_element(),
+            ),
+            Section::Threads => (
+                "Threads",
+                self.render_threads_section(cx).into_any_element(),
             ),
             Section::About => ("About", self.render_about_section().into_any_element()),
         };

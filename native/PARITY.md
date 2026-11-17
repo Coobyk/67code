@@ -17,46 +17,46 @@ requires a new `native/server` handler matching the TS wire shape.
 
 ## Chat surface
 
-| Feature                                           | Status | Notes                                                                                                                                 |
-| ------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Thread timeline + markdown                        | ✅     | markdown.rs incl. tables, code blocks                                                                                                 |
-| Streaming turn items (thinking, tool calls, text) | ✅     |                                                                                                                                       |
-| Working/elapsed indicator                         | ✅     | pulsing ● + ticking "Working for Ns"                                                                                                  |
-| Interactive approvals                             | ✅     | runtime-request.respond; auto-approve under full-access                                                                               |
-| Stop turn (composer Stop)                         | ✅     |                                                                                                                                       |
-| Queued dispatch / steer active run                | ❌     | dispatchMode union: steer_active/restart_active/queue_after_active — needs timeline UI + server (server already accepts dispatchMode) |
-| Command output panel (terminal tool calls)        | 🟡     | tool calls render, no expandable output panel                                                                                         |
-| Compaction display                                | ❌     | `idleCompaction`, compaction items not rendered                                                                                       |
-| Background work / delegated tasks                 | ❌     | child-thread approvals, subagent items                                                                                                |
-| Pending user-input panel (questions)              | 🟡     | approvals only; `answers` questions not rendered                                                                                      |
-| Attachments: file path + clipboard image          | ✅     | Attach field, paste-to-stage                                                                                                          |
-| Image thumbnails in composer strip                | ❌     | strip lists names only                                                                                                                |
-| Drag & drop files onto composer                   | ❌     | needs GPUI drop handler                                                                                                               |
-| @mentions (files/threads/context chips)           | ❌     | needs `projects.searchContents`/listEntries RPC                                                                                       |
-| Prompt history (up-arrow recall)                  | ❌     | client-side, easy                                                                                                                     |
-| Message stash                                     | ❌     | client-side draft stash                                                                                                               |
-| Model effort picker                               | ❌     | composer has model picker only; effort is a modelSelection field                                                                      |
-| Usage-limit banner in composer                    | ❌     | needs `server.getUsageSummary`                                                                                                        |
-| Dictation/speech button                           | 🚫     | needs a transcription service (web uses cloud voice); no local engine                                                                 |
-| Citations on assistant messages                   | ❌     | citation chips/sources                                                                                                                |
-| Message feedback / copy                           | ❌     | no per-message actions                                                                                                                |
-| Expanded image viewer dialog                      | ❌     | inline images not decoded yet                                                                                                         |
-| Canvas/right-panel layout                         | 🟡     | right panel renders Files/Terminals/PR panes; Terminals tab lists metadata + close/new; PR pane functional                            |
+| Feature                                           | Status | Notes                                                                                                      |
+| ------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------- |
+| Thread timeline + markdown                        | ✅     | markdown.rs incl. tables, code blocks                                                                      |
+| Streaming turn items (thinking, tool calls, text) | ✅     |                                                                                                            |
+| Working/elapsed indicator                         | ✅     | pulsing ● + ticking "Working for Ns"                                                                       |
+| Interactive approvals                             | ✅     | runtime-request.respond; auto-approve under full-access                                                    |
+| Stop turn (composer Stop)                         | ✅     |                                                                                                            |
+| Queued dispatch / steer active run                | 🟡     | `queue_after_active`/`start_immediately` sent on busy threads; `steer_active`/`restart_active` not offered |
+| Command output panel (terminal tool calls)        | ✅     | expandable detail rows + capped output                                                                     |
+| Compaction display                                | ✅     | compaction_row divider with token counts                                                                   |
+| Background work / delegated tasks                 | 🟡     | `subagent` rows render; child-thread approval routing unknown                                              |
+| Pending user-input panel (questions)              | ✅     | question option click-select + answers                                                                     |
+| Attachments: file path + clipboard image          | ✅     | Attach field, paste-to-stage                                                                               |
+| Image thumbnails in composer strip                | ✅     | decoded RenderImage thumbnails + remove                                                                    |
+| Drag & drop files onto composer                   | ✅     | ExternalPaths drop → staged attachments                                                                    |
+| @mentions (files/threads/context chips)           | ❌     | popup needed; `projects.searchEntries`/`searchContents` + thread list available                            |
+| Prompt history (up-arrow recall)                  | ✅     | per-project ClientConfig history                                                                           |
+| Message stash                                     | ✅     | ctrl-shift-s stash/restore, per-project ClientConfig                                                       |
+| Model effort picker                               | ✅     | effort chip → modelSelection.options                                                                       |
+| Usage-limit banner in composer                    | ❌     | `server.getUsageSummary` implemented; banner UI needed                                                     |
+| Dictation/speech button                           | 🚫     | needs a transcription service (web uses cloud voice); no local engine                                      |
+| Citations on assistant messages                   | ❌     | check wire items; no provider currently emits citation items                                               |
+| Message feedback / copy                           | 🟡     | copy chips on messages/tool outputs; no thumbs/feedback actions                                            |
+| Expanded image viewer dialog                      | ✅     | click thumbnail → full overlay                                                                             |
+| Canvas/right-panel layout                         | 🟡     | right panel renders Files/Terminals/PR panes; Terminals tab lists metadata + close/new; PR pane functional |
 
 ## Sidebar
 
-| Feature                                          | Status | Notes                                                    |
-| ------------------------------------------------ | ------ | -------------------------------------------------------- |
-| Projects + threads list                          | ✅     |                                                          |
-| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                          |
-| Status indicators (running dot, PR link, unread) | 🟡     | run-status dot only; no PR badges, unread markers        |
-| Drag-reorder threads                             | ❌     | `thread.pin.reorder`/`thread.active.reorder` commands    |
-| Snooze + custom snooze                           | ❌     | `thread.snooze`/`unsnooze` commands + CustomSnoozeDialog |
-| Undo-notice toasts on archive/delete             | ❌     | SidebarThreadUndoNotice — timed undo toast               |
-| Draft threads block                              | ❌     | drafts are client-side in web                            |
-| Project icons/favicons                           | ❌     | ProjectFaviconPickerDialog; monogram exists?             |
-| Settings gear                                    | ✅     | footer gear + ctrl-,                                     |
-| Update pills / server version                    | 🚫     | Electron/desktop-update surface                          |
+| Feature                                          | Status | Notes                                                                       |
+| ------------------------------------------------ | ------ | --------------------------------------------------------------------------- |
+| Projects + threads list                          | ✅     |                                                                             |
+| Search, rename, archive/unarchive, delete, pin   | ✅     |                                                                             |
+| Status indicators (running dot, PR link, unread) | ✅     | running dot, ⧉ PR glyph, 😴 snoozed, unread markers                         |
+| Drag-reorder threads                             | 🟡     | `thread.pin.reorder`/`thread.active.reorder` dispatched; no pointer-drag UX |
+| Snooze + custom snooze                           | 🟡     | presets + overlay; no custom datetime picker                                |
+| Undo-notice toasts on archive/delete             | ❌     | needs toast action buttons (push_toast callback support)                    |
+| Draft threads block                              | ❌     | drafts are client-side in web                                               |
+| Project icons/favicons                           | ❌     | ProjectFaviconPickerDialog; monogram exists?                                |
+| Settings gear                                    | ✅     | footer gear + ctrl-,                                                        |
+| Update pills / server version                    | 🚫     | Electron/desktop-update surface                                             |
 
 ## Terminal drawer
 

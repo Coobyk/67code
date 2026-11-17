@@ -121,6 +121,8 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
                 crate::rpc_tasks::handle(state, other, payload).await
             } else if other.starts_with("assets.") || other.starts_with("attachments.") {
                 crate::rpc_assets::handle(state, other, payload).await
+            } else if other.starts_with("mcpApps.") {
+                crate::rpc_mcp::handle(state, other, payload).await
             } else if other.starts_with("pullRequests.") || other.starts_with("review.")
                 || other.starts_with("sourceControl.")
             {

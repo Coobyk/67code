@@ -524,6 +524,7 @@ impl AppView {
             active_order_key: None,
             runtime_mode: None,
             interaction_mode: None,
+            latest_run_id: None,
         });
         self.select_and_visit(thread_id.into(), cx);
     }

@@ -36,6 +36,20 @@ pub struct StashedDraft {
     pub files: Vec<StashedFile>,
 }
 
+/// A client-side draft thread — the web client's "Draft threads" sidebar
+/// block. Keyed by `thread_id` (a `draft:<uuid>` id); promoted to a real
+/// thread on first dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DraftThread {
+    pub thread_id: String,
+    pub project_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub files: Vec<StashedFile>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
 /// Appearance mode: `"dark"`, `"light"`, or `"system"`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +86,10 @@ pub struct ClientConfig {
     /// Show in-app toasts when a background thread settles (default true).
     #[serde(default = "default_in_app_notifications")]
     pub in_app_notifications: bool,
+    /// Client-side draft threads (sidebar block) — persisted so drafts
+    /// survive restart, same as the web's localStorage drafts.
+    #[serde(default)]
+    pub draft_threads: Vec<DraftThread>,
 }
 
 fn default_in_app_notifications() -> bool {

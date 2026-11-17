@@ -49,6 +49,8 @@ pub struct Thread {
     pub active_order_key: Option<SharedString>,
     pub runtime_mode: Option<SharedString>,
     pub interaction_mode: Option<SharedString>,
+    /// Latest run id — `targetRunId` for steer/restart dispatch modes.
+    pub latest_run_id: Option<SharedString>,
 }
 
 impl Thread {
@@ -79,6 +81,7 @@ impl Thread {
             active_order_key: t.active_order_key.clone().map(Into::into),
             runtime_mode: t.runtime_mode.clone().map(Into::into),
             interaction_mode: t.interaction_mode.clone().map(Into::into),
+            latest_run_id: t.latest_run_id.clone().map(Into::into),
         }
     }
 
@@ -104,6 +107,7 @@ impl Thread {
             active_order_key: None,
             runtime_mode: None,
             interaction_mode: None,
+            latest_run_id: None,
         }
     }
 

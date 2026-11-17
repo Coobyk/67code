@@ -52,6 +52,10 @@ pub struct State {
     /// User explicitly picked a permission mode; blocks
     /// `defaultRuntimeMode` from reseeding `runtime_mode`.
     pub runtime_mode_picked: bool,
+    /// Run-options pick for the next dispatch on a busy thread —
+    /// `steer_active`/`restart_active`/`queue_after_active`. Consumed by
+    /// `on_prompt_submitted` in lib.rs; None = default queue behavior.
+    pub dispatch_override: Option<&'static str>,
     /// Index into the project's persisted prompt history while browsing with
     /// up/down; `None` = live draft, not browsing.
     pub history_index: Option<usize>,
@@ -81,6 +85,7 @@ impl Default for State {
             effort: String::new(),
             model_picked: false,
             runtime_mode_picked: false,
+            dispatch_override: None,
             history_index: None,
             history_draft: String::new(),
             history_recalled: String::new(),
