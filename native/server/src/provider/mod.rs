@@ -49,7 +49,11 @@ pub fn spawn_turn(state: Arc<AppState>, ctx: RunContext) {
 }
 
 /// Emit an `error` turn item and mark the run failed.
-pub async fn fail_run(state: &Arc<AppState>, ctx: &RunContext, message: &str) -> anyhow::Result<()> {
+pub async fn fail_run(
+    state: &Arc<AppState>,
+    ctx: &RunContext,
+    message: &str,
+) -> anyhow::Result<()> {
     let now = crate::domain::now_iso();
     let item = serde_json::json!({
         "id": crate::domain::new_id(),
@@ -93,14 +97,24 @@ pub async fn fail_run(state: &Arc<AppState>, ctx: &RunContext, message: &str) ->
         });
     let events = vec![
         crate::domain::thread_event(
-            &ctx.thread_id, "turn-item.updated", item,
-            Some(&ctx.run_id), Some(&ctx.root_node_id), Some("acpRegistry"),
-            Some(&ctx.provider_instance_id), None,
+            &ctx.thread_id,
+            "turn-item.updated",
+            item,
+            Some(&ctx.run_id),
+            Some(&ctx.root_node_id),
+            Some("acpRegistry"),
+            Some(&ctx.provider_instance_id),
+            None,
         ),
         crate::domain::thread_event(
-            &ctx.thread_id, "run.updated", run,
-            Some(&ctx.run_id), Some(&ctx.root_node_id), Some("acpRegistry"),
-            Some(&ctx.provider_instance_id), None,
+            &ctx.thread_id,
+            "run.updated",
+            run,
+            Some(&ctx.run_id),
+            Some(&ctx.root_node_id),
+            Some("acpRegistry"),
+            Some(&ctx.provider_instance_id),
+            None,
         ),
     ];
     let committed = state

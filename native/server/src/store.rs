@@ -135,8 +135,8 @@ pub struct StoreHandle {
 
 impl StoreHandle {
     pub fn spawn(db_path: &Path) -> anyhow::Result<Self> {
-        let mut conn = Connection::open(db_path)
-            .with_context(|| format!("open {}", db_path.display()))?;
+        let mut conn =
+            Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
         migrate(&mut conn)?;
         let (tx, rx) = std_mpsc::channel::<StoreCmd>();
         std::thread::Builder::new()
@@ -231,10 +231,7 @@ impl StoreHandle {
 
     pub async fn apply_command(&self, command: Value) -> Result<ApplyResult, String> {
         let (tx, rx) = oneshot::channel();
-        self.send(StoreCmd::ApplyCommand {
-            command,
-            reply: tx,
-        });
+        self.send(StoreCmd::ApplyCommand { command, reply: tx });
         rx.await.unwrap_or_else(|_| Err("store actor died".into()))
     }
 
@@ -701,7 +698,11 @@ fn actor_loop(conn: Connection, rx: std_mpsc::Receiver<StoreCmd>) {
                 omit_older_settled,
                 reply,
             } => {
-                let _ = reply.send(shell_snapshot(&conn, omit_idle_subagents, omit_older_settled));
+                let _ = reply.send(shell_snapshot(
+                    &conn,
+                    omit_idle_subagents,
+                    omit_older_settled,
+                ));
             }
             StoreCmd::ThreadShell { thread_id, reply } => {
                 let _ = reply.send(thread_shell_for(&conn, &thread_id));
@@ -811,7 +812,13 @@ fn actor_loop(conn: Connection, rx: std_mpsc::Receiver<StoreCmd>) {
                     "INSERT OR REPLACE INTO acp_imported_sessions (
                        instance_id, project_id, session_id, thread_id, created_at
                      ) VALUES (?1,?2,?3,?4,?5)",
-                    params![instance_id, project_id, session_id, thread_id, domain::now_iso()],
+                    params![
+                        instance_id,
+                        project_id,
+                        session_id,
+                        thread_id,
+                        domain::now_iso()
+                    ],
                 );
                 let _ = reply.send(());
             }
@@ -841,7 +848,11 @@ fn project_shell_for(conn: &Connection, project_id: &str) -> Option<Value> {
          FROM projection_projects WHERE project_id = ?1 AND deleted_at IS NULL",
         params![project_id],
         |r| {
-            let s = |i| r.get::<_, Option<String>>(i).unwrap_or_default().unwrap_or_default();
+            let s = |i| {
+                r.get::<_, Option<String>>(i)
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+            };
             Ok(domain::project_shell(
                 &s(0),
                 &s(1),
@@ -870,7 +881,11 @@ fn list_projects(conn: &Connection) -> Vec<Value> {
     };
     let rows = stmt
         .query_map([], |r| {
-            let s = |i| r.get::<_, Option<String>>(i).unwrap_or_default().unwrap_or_default();
+            let s = |i| {
+                r.get::<_, Option<String>>(i)
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+            };
             Ok(domain::project_shell(
                 &s(0),
                 &s(1),
@@ -1171,7 +1186,10 @@ fn shell_snapshot(conn: &Connection, omit_idle_subagents: bool, omit_older_settl
         let is_archived = !app.get("archivedAt").unwrap_or(&Value::Null).is_null();
         if is_archived {
             archived.push(shell);
-        } else if listed || (omit_idle_subagents && is_live_subagent_shell(&shell)) || !listed && !omit_idle_subagents {
+        } else if listed
+            || (omit_idle_subagents && is_live_subagent_shell(&shell))
+            || !listed && !omit_idle_subagents
+        {
             threads.push(shell);
         }
     }
@@ -1201,7 +1219,10 @@ fn shell_snapshot(conn: &Connection, omit_idle_subagents: bool, omit_older_settl
     }
 
     let mut snap = Map::new();
-    snap.insert("schemaVersion".into(), json!(domain::PROJECTION_SCHEMA_VERSION));
+    snap.insert(
+        "schemaVersion".into(),
+        json!(domain::PROJECTION_SCHEMA_VERSION),
+    );
     snap.insert("snapshotSequence".into(), json!(snapshot_sequence));
     snap.insert("projects".into(), Value::Array(projects));
     if omit_older_settled {
@@ -1271,21 +1292,23 @@ fn acp_imported_thread_id(
     if let Some(tid) = mapped {
         return live_thread_exists(conn, &tid).then_some(tid);
     }
-    let derived = domain::imported_acp_thread_id(
-        provider_driver(instance_id),
-        instance_id,
-        session_id,
-    );
+    let derived =
+        domain::imported_acp_thread_id(provider_driver(instance_id), instance_id, session_id);
     live_thread_exists(conn, &derived).then_some(derived)
 }
 
 fn is_live_subagent_shell(shell: &Value) -> bool {
     let live = |s: Option<&str>| {
-        matches!(s, Some("queued" | "preparing" | "starting" | "running" | "waiting"))
+        matches!(
+            s,
+            Some("queued" | "preparing" | "starting" | "running" | "waiting")
+        )
     };
     !shell.get("activityRunStatus").is_none_or(Value::is_null)
         || live(shell.get("status").and_then(Value::as_str))
-        || !shell.get("pendingRuntimeRequest").is_none_or(Value::is_null)
+        || !shell
+            .get("pendingRuntimeRequest")
+            .is_none_or(Value::is_null)
         || shell
             .get("pendingBackgroundTasks")
             .and_then(Value::as_array)
@@ -1322,7 +1345,9 @@ fn older_settled(
             sql.push_str(&format!(" AND project_id IN ({list})"));
         }
     }
-    sql.push_str(" ORDER BY json_extract(payload_json, '$.settledAt') DESC, thread_id DESC LIMIT ?2");
+    sql.push_str(
+        " ORDER BY json_extract(payload_json, '$.settledAt') DESC, thread_id DESC LIMIT ?2",
+    );
     params_vec.push(Box::new(limit));
 
     let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
@@ -1362,14 +1387,23 @@ fn events_for_thread(conn: &Connection, thread_id: &str, after: i64) -> Vec<Comm
     })
     .map(|rows| {
         rows.filter_map(|r| r.ok())
-            .map(|(sequence, event_id, stream_id, ty, occurred_at, payload, metadata)| {
-                CommittedEvent {
-                    sequence,
-                    aggregate_kind: "thread".into(),
-                    stream_id,
-                    event: rebuild_event(&event_id, thread_id, &ty, &occurred_at, &payload, &metadata),
-                }
-            })
+            .map(
+                |(sequence, event_id, stream_id, ty, occurred_at, payload, metadata)| {
+                    CommittedEvent {
+                        sequence,
+                        aggregate_kind: "thread".into(),
+                        stream_id,
+                        event: rebuild_event(
+                            &event_id,
+                            thread_id,
+                            &ty,
+                            &occurred_at,
+                            &payload,
+                            &metadata,
+                        ),
+                    }
+                },
+            )
             .collect()
     })
     .unwrap_or_default()
@@ -1392,7 +1426,13 @@ fn rebuild_event(
     ev.insert("type".into(), json!(ty));
     ev.insert("occurredAt".into(), json!(occurred_at));
     ev.insert("payload".into(), payload);
-    for k in ["runId", "nodeId", "driver", "providerInstanceId", "rawEventId"] {
+    for k in [
+        "runId",
+        "nodeId",
+        "driver",
+        "providerInstanceId",
+        "rawEventId",
+    ] {
         if let Some(v) = metadata.get(k) {
             ev.insert(k.into(), v.clone());
         }
@@ -1403,20 +1443,16 @@ fn rebuild_event(
 fn thread_projection(conn: &Connection, thread_id: &str) -> Option<Value> {
     let thread = get_thread_row(conn, thread_id)?;
     let col = |sql: &str| column_json(conn, sql, &[&thread_id]);
-    let runs = col(
-        "SELECT payload_json FROM orchestration_v2_projection_runs \
-         WHERE thread_id = ?1 ORDER BY ordinal ASC, run_id ASC",
-    );
+    let runs = col("SELECT payload_json FROM orchestration_v2_projection_runs \
+         WHERE thread_id = ?1 ORDER BY ordinal ASC, run_id ASC");
     let attempts = col(
         "SELECT payload_json FROM orchestration_v2_projection_run_attempts \
          WHERE thread_id = ?1 ORDER BY attempt_ordinal ASC, attempt_id ASC",
     );
-    let nodes = col(
-        "SELECT payload_json FROM orchestration_v2_projection_nodes WHERE thread_id = ?1",
-    );
-    let subagents = col(
-        "SELECT payload_json FROM orchestration_v2_projection_subagents WHERE thread_id = ?1",
-    );
+    let nodes =
+        col("SELECT payload_json FROM orchestration_v2_projection_nodes WHERE thread_id = ?1");
+    let subagents =
+        col("SELECT payload_json FROM orchestration_v2_projection_subagents WHERE thread_id = ?1");
     let provider_sessions = col(
         "SELECT payload_json FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ?1",
     );
@@ -1433,9 +1469,8 @@ fn thread_projection(conn: &Connection, thread_id: &str) -> Option<Value> {
         "SELECT payload_json FROM orchestration_v2_projection_messages \
          WHERE thread_id = ?1 ORDER BY created_at ASC, message_id ASC",
     );
-    let plans = col(
-        "SELECT payload_json FROM orchestration_v2_projection_plans WHERE thread_id = ?1",
-    );
+    let plans =
+        col("SELECT payload_json FROM orchestration_v2_projection_plans WHERE thread_id = ?1");
     let turn_items = col(
         "SELECT t.payload_json FROM orchestration_v2_projection_turn_items t \
          LEFT JOIN orchestration_v2_turn_item_positions p \
@@ -1489,7 +1524,13 @@ fn thread_projection(conn: &Connection, thread_id: &str) -> Option<Value> {
 
 fn metadata_for_event(event: &Value) -> Value {
     let mut m = Map::new();
-    for k in ["runId", "nodeId", "driver", "providerInstanceId", "rawEventId"] {
+    for k in [
+        "runId",
+        "nodeId",
+        "driver",
+        "providerInstanceId",
+        "rawEventId",
+    ] {
         if let Some(v) = event.get(k) {
             if !v.is_null() {
                 m.insert(k.into(), v.clone());
@@ -1507,7 +1548,10 @@ fn append_event(
     event: &Value,
     command_id: Option<&str>,
 ) -> Result<CommittedEvent, String> {
-    let ty = event.get("type").and_then(Value::as_str).unwrap_or("unknown");
+    let ty = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let occurred_at = event
         .get("occurredAt")
         .and_then(Value::as_str)
@@ -1515,7 +1559,8 @@ fn append_event(
         .unwrap_or_else(domain::now_iso);
     let payload_json = serde_json::to_string(event.get("payload").unwrap_or(&Value::Null))
         .map_err(|e| e.to_string())?;
-    let metadata_json = serde_json::to_string(&metadata_for_event(event)).map_err(|e| e.to_string())?;
+    let metadata_json =
+        serde_json::to_string(&metadata_for_event(event)).map_err(|e| e.to_string())?;
     let actor = if event.get("rawEventId").is_some() {
         "provider"
     } else {
@@ -1558,7 +1603,14 @@ fn append_event(
         sequence,
         aggregate_kind: aggregate_kind.into(),
         stream_id: stream_id.into(),
-        event: rebuild_event(&event_id, stream_id, ty, &occurred_at, &payload_json, &metadata_json),
+        event: rebuild_event(
+            &event_id,
+            stream_id,
+            ty,
+            &occurred_at,
+            &payload_json,
+            &metadata_json,
+        ),
     })
 }
 
@@ -1584,11 +1636,11 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
     let ty = event.get("type").and_then(Value::as_str).unwrap_or("");
     let p = event.get("payload").cloned().unwrap_or(Value::Null);
     let pj = serde_json::to_string(&p).map_err(|e| e.to_string())?;
-    let s = |k: &str| -> Option<String> {
-        p.get(k).and_then(Value::as_str).map(str::to_owned)
-    };
+    let s = |k: &str| -> Option<String> { p.get(k).and_then(Value::as_str).map(str::to_owned) };
     let run = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<(), String> {
-        conn.execute(sql, params).map(|_| ()).map_err(|e| e.to_string())
+        conn.execute(sql, params)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     };
 
     match ty {
@@ -1615,9 +1667,8 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
         | "thread.interaction-mode-updated"
         | "thread.model-selection-updated"
         | "thread.provider-switched"
-        | "thread.guest-share-updated" => {
-            run(
-                "INSERT INTO orchestration_v2_projection_threads (
+        | "thread.guest-share-updated" => run(
+            "INSERT INTO orchestration_v2_projection_threads (
                    thread_id, project_id, title, default_provider, runtime_mode,
                    interaction_mode, active_provider_thread_id, created_at, updated_at,
                    archived_at, deleted_at, payload_json, provider_instance_id
@@ -1631,23 +1682,22 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
                    updated_at=excluded.updated_at, archived_at=excluded.archived_at,
                    deleted_at=excluded.deleted_at, payload_json=excluded.payload_json,
                    provider_instance_id=excluded.provider_instance_id",
-                &[
-                    &s("id"),
-                    &s("projectId"),
-                    &s("title"),
-                    &s("providerInstanceId"),
-                    &s("runtimeMode"),
-                    &s("interactionMode"),
-                    &s("activeProviderThreadId"),
-                    &s("createdAt"),
-                    &s("updatedAt"),
-                    &s("archivedAt"),
-                    &s("deletedAt"),
-                    &pj,
-                    &s("providerInstanceId"),
-                ],
-            )
-        }
+            &[
+                &s("id"),
+                &s("projectId"),
+                &s("title"),
+                &s("providerInstanceId"),
+                &s("runtimeMode"),
+                &s("interactionMode"),
+                &s("activeProviderThreadId"),
+                &s("createdAt"),
+                &s("updatedAt"),
+                &s("archivedAt"),
+                &s("deletedAt"),
+                &pj,
+                &s("providerInstanceId"),
+            ],
+        ),
         "run.created" | "run.updated" => run(
             "INSERT INTO orchestration_v2_projection_runs (
                run_id, thread_id, ordinal, provider, provider_thread_id, status,
@@ -1735,7 +1785,11 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
                             while !v.is_char_boundary(end) {
                                 end -= 1;
                             }
-                            stored[k] = json!(format!("{}{}", &v[..end], "\n… output truncated for transport"));
+                            stored[k] = json!(format!(
+                                "{}{}",
+                                &v[..end],
+                                "\n… output truncated for transport"
+                            ));
                         }
                     }
                 }
@@ -1794,7 +1848,9 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
                 &s("runId"),
                 &s("nodeId"),
                 &s("role"),
-                &p.get("streaming").and_then(Value::as_bool).map(|b| b as i64),
+                &p.get("streaming")
+                    .and_then(Value::as_bool)
+                    .map(|b| b as i64),
                 &s("createdAt"),
                 &s("updatedAt"),
                 &pj,
@@ -1806,7 +1862,15 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
              ) VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(plan_id) DO UPDATE SET
                status=excluded.status, payload_json=excluded.payload_json",
-            &[&s("id"), &thread_id, &s("runId"), &s("nodeId"), &s("kind"), &s("status"), &pj],
+            &[
+                &s("id"),
+                &thread_id,
+                &s("runId"),
+                &s("nodeId"),
+                &s("kind"),
+                &s("status"),
+                &pj,
+            ],
         ),
         "provider-session.attached" | "provider-session.updated" => {
             let thread_id_val = s("threadId").or_else(|| Some(thread_id.to_string()));
@@ -1939,7 +2003,9 @@ fn apply_projection(conn: &Connection, thread_id: &str, event: &Value) -> Result
                 &s("providerThreadId"),
                 &s("kind"),
                 &p.get("ordinalWithinParent").and_then(Value::as_i64),
-                &p.get("advancesAppRunCount").and_then(Value::as_bool).map(|b| b as i64),
+                &p.get("advancesAppRunCount")
+                    .and_then(Value::as_bool)
+                    .map(|b| b as i64),
                 &s("createdAt"),
                 &pj,
             ],
@@ -2046,15 +2112,27 @@ fn apply_command(conn: &Connection, command: &Value) -> Result<ApplyResult, Stri
         "thread.create" => apply_thread_create(conn, command, &command_id),
         "message.dispatch" => apply_message_dispatch(conn, command, &command_id),
         "thread.stop" => apply_thread_stop(conn, command, &command_id),
-        "thread.archive" | "thread.unarchive" | "thread.delete" | "thread.pin"
-        | "thread.unpin" | "thread.metadata.update" | "thread.runtime-mode.set"
-        | "thread.interaction-mode.set" | "thread.snooze" | "thread.unsnooze"
-        | "thread.settle" | "thread.unsettle" | "thread.mark-unread" | "thread.visit"
-        | "thread.auto-settle.set" | "thread.tag.set" | "thread.pin.reorder"
-        | "thread.active.reorder" | "thread.model-selection.set"
-        | "thread.pull-request.link" | "thread.pull-request.unlink" => {
-            apply_thread_mutation(conn, command, &command_id)
-        }
+        "thread.archive"
+        | "thread.unarchive"
+        | "thread.delete"
+        | "thread.pin"
+        | "thread.unpin"
+        | "thread.metadata.update"
+        | "thread.runtime-mode.set"
+        | "thread.interaction-mode.set"
+        | "thread.snooze"
+        | "thread.unsnooze"
+        | "thread.settle"
+        | "thread.unsettle"
+        | "thread.mark-unread"
+        | "thread.visit"
+        | "thread.auto-settle.set"
+        | "thread.tag.set"
+        | "thread.pin.reorder"
+        | "thread.active.reorder"
+        | "thread.model-selection.set"
+        | "thread.pull-request.link"
+        | "thread.pull-request.unlink" => apply_thread_mutation(conn, command, &command_id),
         "runtime-request.respond" => apply_runtime_respond(conn, command, &command_id),
         "project.create" => apply_project_create(conn, command, &command_id),
         other => Err(format!("unsupported command type: {other}")),
@@ -2134,10 +2212,7 @@ fn apply_thread_mutation(
             "thread.unsnoozed"
         }
         "thread.settle" => {
-            payload["settledAt"] = command
-                .get("settledAt")
-                .cloned()
-                .unwrap_or(json!(now));
+            payload["settledAt"] = command.get("settledAt").cloned().unwrap_or(json!(now));
             "thread.settled"
         }
         "thread.unsettle" => {
@@ -2149,23 +2224,20 @@ fn apply_thread_mutation(
             "thread.marked-unread"
         }
         "thread.visit" => {
-            payload["visitedAt"] = command
-                .get("visitedAt")
-                .cloned()
-                .unwrap_or(json!(now));
+            payload["visitedAt"] = command.get("visitedAt").cloned().unwrap_or(json!(now));
             payload["markedUnreadAt"] = Value::Null;
             "thread.visited"
         }
         "thread.auto-settle.set" => {
-            payload["autoSettleEnabled"] = command
-                .get("enabled")
-                .cloned()
-                .unwrap_or(json!(true));
+            payload["autoSettleEnabled"] = command.get("enabled").cloned().unwrap_or(json!(true));
             "thread.auto-settle-set"
         }
         "thread.tag.set" => {
             let tag = command.get("tag").cloned().unwrap_or(Value::Null);
-            let tagged = command.get("tagged").and_then(Value::as_bool).unwrap_or(true);
+            let tagged = command
+                .get("tagged")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let mut tags: Vec<Value> = payload
                 .get("tags")
                 .and_then(Value::as_array)
@@ -2265,7 +2337,13 @@ fn apply_runtime_respond(
              FROM orchestration_v2_projection_runtime_requests \
              WHERE runtime_request_id = ?1",
             params![request_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .ok()
         .and_then(|(t, s, n)| serde_json::from_str::<Value>(&s).ok().map(|v| (t, v, n)))
@@ -2311,8 +2389,8 @@ fn apply_runtime_respond(
         &[&thread_id],
     );
     for mut item in item_rows {
-        let matches = node_id.is_none()
-            || item.get("nodeId").and_then(Value::as_str) == node_id.as_deref();
+        let matches =
+            node_id.is_none() || item.get("nodeId").and_then(Value::as_str) == node_id.as_deref();
         if matches {
             item["status"] = json!("completed");
             item["completedAt"] = json!(now);
@@ -2420,14 +2498,18 @@ fn apply_project_create(
             title,
             workspace_root,
             now,
-            command
-                .get("defaultModelSelection")
-                .map(|v| v.to_string()),
+            command.get("defaultModelSelection").map(|v| v.to_string()),
         ],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    record_receipt(conn, command_id, &project_id, "project.create", stored.sequence);
+    record_receipt(
+        conn,
+        command_id,
+        &project_id,
+        "project.create",
+        stored.sequence,
+    );
     Ok(ApplyResult {
         sequence: stored.sequence,
         events: vec![stored],
@@ -2435,13 +2517,7 @@ fn apply_project_create(
     })
 }
 
-fn record_receipt(
-    conn: &Connection,
-    command_id: &str,
-    thread_id: &str,
-    ty: &str,
-    sequence: i64,
-) {
+fn record_receipt(conn: &Connection, command_id: &str, thread_id: &str, ty: &str, sequence: i64) {
     if command_id.is_empty() {
         return;
     }
@@ -2514,7 +2590,11 @@ fn apply_message_dispatch(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(domain::new_id);
-    let text = command.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = command
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let dispatch_queued = command.get("dispatchMode").and_then(Value::as_str) == Some("queue");
     let model_selection = command
         .get("modelSelection")
@@ -2576,7 +2656,10 @@ fn apply_message_dispatch(
         "updatedAt": now,
     });
     if let Some(ctx) = command.get("context") {
-        message.as_object_mut().unwrap().insert("context".into(), ctx.clone());
+        message
+            .as_object_mut()
+            .unwrap()
+            .insert("context".into(), ctx.clone());
     }
 
     let user_item_id = domain::new_id();
@@ -2622,7 +2705,9 @@ fn apply_message_dispatch(
         "contextHandoffId": null,
     });
     if command.get("freshContext") == Some(&json!(true)) {
-        run.as_object_mut().unwrap().insert("freshContext".into(), json!(true));
+        run.as_object_mut()
+            .unwrap()
+            .insert("freshContext".into(), json!(true));
     }
 
     let attempt = json!({
@@ -2725,13 +2810,76 @@ fn apply_message_dispatch(
     );
 
     let events: Vec<Value> = vec![
-        domain::thread_event(&thread_id, "message.updated", message, Some(&run_id), Some(&root_node_id), None, None, None),
-        domain::thread_event(&thread_id, "turn-item.updated", user_item, Some(&run_id), Some(&root_node_id), Some(driver), Some(&provider_instance_id), None),
-        domain::thread_event(&thread_id, "run.created", run, Some(&run_id), None, Some(driver), Some(&provider_instance_id), None),
-        domain::thread_event(&thread_id, "run-attempt.created", attempt, Some(&run_id), Some(&root_node_id), Some(driver), Some(&provider_instance_id), None),
-        domain::thread_event(&thread_id, "node.updated", root_node, Some(&run_id), Some(&root_node_id), Some(driver), Some(&provider_instance_id), None),
-        domain::thread_event(&thread_id, "provider-thread.updated", provider_thread, Some(&run_id), None, Some(driver), Some(&provider_instance_id), None),
-        domain::thread_event(&thread_id, "provider-turn.updated", provider_turn, Some(&run_id), Some(&root_node_id), Some(driver), Some(&provider_instance_id), None),
+        domain::thread_event(
+            &thread_id,
+            "message.updated",
+            message,
+            Some(&run_id),
+            Some(&root_node_id),
+            None,
+            None,
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "turn-item.updated",
+            user_item,
+            Some(&run_id),
+            Some(&root_node_id),
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "run.created",
+            run,
+            Some(&run_id),
+            None,
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "run-attempt.created",
+            attempt,
+            Some(&run_id),
+            Some(&root_node_id),
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "node.updated",
+            root_node,
+            Some(&run_id),
+            Some(&root_node_id),
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "provider-thread.updated",
+            provider_thread,
+            Some(&run_id),
+            None,
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
+        domain::thread_event(
+            &thread_id,
+            "provider-turn.updated",
+            provider_turn,
+            Some(&run_id),
+            Some(&root_node_id),
+            Some(driver),
+            Some(&provider_instance_id),
+            None,
+        ),
         app_event,
     ];
 
@@ -2813,7 +2961,11 @@ fn apply_thread_stop(
             run_ctx: None,
         });
     };
-    let run_id = run.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let run_id = run
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let root_node_id = run
         .get("rootNodeId")
         .and_then(Value::as_str)

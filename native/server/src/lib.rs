@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod domain;
 pub mod handlers;
+pub mod mcp_manager;
 pub mod provider;
 pub mod rpc_assets;
 pub mod rpc_fs;
@@ -55,8 +56,7 @@ pub struct AppState {
 /// The sender delivers the orchestration decision string ("accept",
 /// "acceptForSession", "acceptAlways", "decline", "cancel") to the provider
 /// task, which maps it onto the ACP option list it already holds.
-pub type PendingRequestRegistry =
-    StdMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>;
+pub type PendingRequestRegistry = StdMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>;
 
 /// Everything the server needs; no env lookup inside `run`.
 pub struct ServerConfig {
@@ -79,7 +79,9 @@ impl ServerConfig {
     /// Classic env-driven configuration (standalone `c67-server` binary).
     pub fn from_env() -> Self {
         let env = |names: &[&str]| {
-            names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
+            names
+                .iter()
+                .find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
         };
         let port: u16 = env(&["C67_PORT", "CODE67_PORT", "T3CODE_PORT"])
             .and_then(|v| v.parse().ok())

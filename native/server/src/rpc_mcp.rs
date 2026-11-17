@@ -12,12 +12,14 @@
 //!   `t3McpApp` reference with the same `toolName` impersonation guard
 //!   (`server.tool` or Claude's `mcp__<server>__<tool>` naming), plus the
 //!   envelope unwrapping `readResult` performs.
-//! - `toolInfo`/`callTool`/`readResource` proxy through the *live provider
-//!   session runtime* (`ProviderSessionManagerV2` → adapter `mcpApps` facet).
-//!   Rust providers are one-shot turn subprocesses — `providerSessionId` is
-//!   always null — so the session lookup runs and faithfully reports
-//!   `session-stopped` today; a future `providerSessionId` reports
-//!   `provider-unsupported` until a Rust provider grows an MCP bridge.
+//! - `toolInfo`/`callTool`/`readResource` run against the server's own MCP
+//!   client (`crate::mcp_manager`): the resolved `t3McpApp.server` name is
+//!   looked up in the discovered stdio server configs (claude.json,
+//!   `.mcp.json`, codex `config.toml`, t3 `settings.json`) and served by a
+//!   persistent child process. Names with no spawnable config — including
+//!   provider-builtin HTTP servers like T3's `t3-code` — keep the
+//!   `session-stopped` answer, and a present `providerSessionId` keeps
+//!   `provider-unsupported` (no Rust adapter MCP bridge exists).
 //! - `updateModelContext` is implemented end-to-end: app resolution, the
 //!   fork-lineage `descendsFrom` guard, content validation, the 16 KiB cap,
 //!   and the same `mcp_app_model_context` upsert the TS migration creates.
@@ -32,6 +34,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use crate::handlers::RpcResult;
+use crate::mcp_manager::McpServerConfig;
 use crate::AppState;
 
 /// `MCP_APP_MODEL_CONTEXT_MAX_BYTES` (McpAppModelContext.ts).
@@ -272,17 +275,16 @@ async fn resolve_app(
     }
 }
 
-/// Full session resolve: `providerThreads` from the projection carry
-/// `providerSessionId`; Rust providers never set one, so this reports
-/// `session-stopped`. If a session id ever appears, the Rust runtime still has
-/// no adapter MCP bridge, hence `provider-unsupported`.
-async fn resolve_session(
+/// `providerThreads` from the projection carry `providerSessionId`; Rust
+/// providers never set one. When a session id ever appears the request must
+/// go through that provider's own MCP session — the Rust runtime has no
+/// adapter MCP bridge, hence `provider-unsupported` at the call site.
+async fn provider_session_id(
     state: &Arc<AppState>,
     thread_id: &str,
-    item_id: &str,
-) -> Result<AppRef, &'static str> {
-    let (_app, provider_thread_id) = resolve_app(state, thread_id, item_id).await?;
-    let provider_thread = state
+    provider_thread_id: &str,
+) -> Option<String> {
+    state
         .store
         .thread_projection(thread_id)
         .await
@@ -290,17 +292,15 @@ async fn resolve_session(
             p.get("providerThreads")?
                 .as_array()?
                 .iter()
-                .find(|t| t.get("id").and_then(Value::as_str) == Some(provider_thread_id.as_str()))
+                .find(|t| t.get("id").and_then(Value::as_str) == Some(provider_thread_id))
                 .cloned()
-        });
-    match provider_thread
-        .as_ref()
-        .and_then(|t| t.get("providerSessionId"))
-        .and_then(Value::as_str)
-    {
-        Some(_) => Err("provider-unsupported"),
-        None => Err("session-stopped"),
-    }
+        })
+        .and_then(|t| {
+            t.get("providerSessionId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// `descendsFrom`: context may only land on the app's thread or a fork below
@@ -448,23 +448,217 @@ async fn update_model_context(state: Arc<AppState>, payload: Value) -> RpcResult
     }
 }
 
-/// `toolInfo` / `callTool` / `readResource` proxy into the live provider
-/// session. Resolution runs in full; the session hop always lands on
-/// `session-stopped` (or `provider-unsupported` if a session id ever exists)
-/// because Rust providers are one-shot turn subprocesses with no MCP bridge.
-async fn live_request(state: Arc<AppState>, payload: Value) -> RpcResult {
+// ---------------------------------------------------------------------------
+// Live MCP requests (server-owned sessions via mcp_manager)
+// ---------------------------------------------------------------------------
+
+/// `mcpAppToolCallableByApp`: `_meta.ui.visibility` array must list "app";
+/// absent/non-array visibility leaves the tool callable.
+fn tool_callable_by_app(tool: &Value) -> bool {
+    match tool
+        .get("_meta")
+        .and_then(|m| m.get("ui"))
+        .and_then(|u| u.get("visibility"))
+    {
+        Some(Value::Array(visibility)) => visibility.iter().any(|v| v.as_str() == Some("app")),
+        _ => true,
+    }
+}
+
+fn tool_read_only(tool: &Value) -> bool {
+    tool.get("annotations")
+        .and_then(|a| a.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn tool_title(tool: &Value) -> Option<&str> {
+    tool.get("annotations")
+        .and_then(|a| a.get("title"))
+        .and_then(Value::as_str)
+}
+
+fn fail_cause(thread_id: &str, reason: &str, cause: String) -> RpcResult {
+    RpcResult::err(json!({
+        "_tag": "McpAppRequestError",
+        "threadId": thread_id,
+        "reason": reason,
+        "cause": cause,
+    }))
+}
+
+fn mcp_fail(thread_id: &str, err: crate::mcp_manager::McpError) -> RpcResult {
+    use crate::mcp_manager::McpError::*;
+    match err {
+        // No spawnable stdio config: either the name belongs to a provider
+        // builtin (T3's `t3-code` HTTP server needs the live session) or the
+        // server simply isn't configured anywhere we can see — in TS both
+        // cases surface as session-stopped because only the provider session
+        // could reach the server.
+        NotConfigured => fail(thread_id, "session-stopped"),
+        Timeout => fail_cause(
+            thread_id,
+            "request-failed",
+            "MCP server request timed out".to_string(),
+        ),
+        Transport(detail) => fail_cause(thread_id, "request-failed", detail),
+        Remote(error) => fail_cause(thread_id, "request-failed", error.to_string()),
+    }
+}
+
+/// `mcpApps.toolInfo` — `tools/list` on the server-owned session, shaped as
+/// `McpAppToolInfo` (`{callable, readOnly, title?, tool?}`).
+async fn tool_info(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    config: &McpServerConfig,
+    app: &AppRef,
+    name: &str,
+) -> RpcResult {
+    match crate::mcp_manager::McpManager::global()
+        .find_tool(config, &app.server, &state.project_dir, name)
+        .await
+    {
+        Err(e) => mcp_fail(thread_id, e),
+        Ok(found) => {
+            let mut info = json!({
+                "callable": found.as_ref().is_some_and(tool_callable_by_app),
+                "readOnly": found.as_ref().is_some_and(tool_read_only),
+            });
+            if let Some(tool) = &found {
+                if let Some(title) = tool_title(tool) {
+                    info["title"] = json!(title);
+                }
+                info["tool"] = tool.clone();
+            }
+            RpcResult::ok(info)
+        }
+    }
+}
+
+/// `mcpApps.callTool` — enforce `_meta.ui.visibility` server-side like
+/// `McpAppRequests.callTool` does, then `tools/call` on the session.
+async fn call_tool(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    config: &McpServerConfig,
+    app: &AppRef,
+    name: &str,
+    arguments: Value,
+) -> RpcResult {
+    let manager = crate::mcp_manager::McpManager::global();
+    match manager
+        .find_tool(config, &app.server, &state.project_dir, name)
+        .await
+    {
+        Err(e) => mcp_fail(thread_id, e),
+        Ok(None) => fail(thread_id, "tool-not-callable"),
+        Ok(Some(tool)) if !tool_callable_by_app(&tool) => fail(thread_id, "tool-not-callable"),
+        Ok(Some(_)) => match manager
+            .call_tool(config, &app.server, &state.project_dir, name, arguments)
+            .await
+        {
+            Err(e) => mcp_fail(thread_id, e),
+            Ok(result) => RpcResult::ok(normalize_tool_result(result)),
+        },
+    }
+}
+
+/// `McpAppCallToolResult` requires a `content` array; MCP guarantees it but
+/// tolerate a server omitting it on an edge-case result.
+fn normalize_tool_result(result: Value) -> Value {
+    if result.get("content").is_none() {
+        let mut obj = result.as_object().cloned().unwrap_or_default();
+        obj.insert("content".into(), json!([]));
+        Value::Object(obj)
+    } else {
+        result
+    }
+}
+
+/// `mcpApps.readResource` — `resources/read` → `{contents}`.
+async fn read_resource(
+    state: &Arc<AppState>,
+    thread_id: &str,
+    config: &McpServerConfig,
+    app: &AppRef,
+    uri: &str,
+) -> RpcResult {
+    match crate::mcp_manager::McpManager::global()
+        .read_resource(config, &app.server, &state.project_dir, uri)
+        .await
+    {
+        Err(e) => mcp_fail(thread_id, e),
+        Ok(result) => {
+            if result.get("contents").is_none() {
+                let mut obj = result.as_object().cloned().unwrap_or_default();
+                obj.insert("contents".into(), json!([]));
+                RpcResult::ok(Value::Object(obj))
+            } else {
+                RpcResult::ok(result)
+            }
+        }
+    }
+}
+
+/// `toolInfo` / `callTool` / `readResource`. Resolution runs in full; when a
+/// live provider session id exists the request still reports
+/// `provider-unsupported` (no Rust adapter MCP bridge). Otherwise the call
+/// runs against the server's own persistent MCP session for the resolved
+/// `t3McpApp.server` name — spawned from discovered stdio configs — and only
+/// names with no spawnable config report `session-stopped`, matching the TS
+/// outcome for apps whose provider session is gone.
+async fn live_request(state: Arc<AppState>, tag: &str, payload: Value) -> RpcResult {
     let thread_id = required_str(&payload, "threadId").unwrap_or("");
-    let item_id = required_str(&payload, "itemId").unwrap_or("");
-    match resolve_session(&state, thread_id, item_id).await {
-        Ok(_) => fail(thread_id, "request-failed"),
-        Err(reason) => fail(thread_id, reason),
+    let Some(item_id) = required_str(&payload, "itemId") else {
+        return fail(thread_id, "request-failed");
+    };
+    let (app, provider_thread_id) = match resolve_app(&state, thread_id, item_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => return fail(thread_id, reason),
+    };
+    if provider_session_id(&state, thread_id, &provider_thread_id)
+        .await
+        .is_some()
+    {
+        return fail(thread_id, "provider-unsupported");
+    }
+    let configs = crate::mcp_manager::discover_server_configs(&state.home_dir, &state.project_dir);
+    let Some(config) = configs.get(&app.server) else {
+        return mcp_fail(thread_id, crate::mcp_manager::McpError::NotConfigured);
+    };
+    match tag {
+        "mcpApps.toolInfo" => {
+            let Some(name) = required_str(&payload, "name") else {
+                return fail(thread_id, "request-failed");
+            };
+            tool_info(&state, thread_id, config, &app, name).await
+        }
+        "mcpApps.callTool" => {
+            let Some(name) = required_str(&payload, "name") else {
+                return fail(thread_id, "request-failed");
+            };
+            let arguments = payload
+                .get("arguments")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            call_tool(&state, thread_id, config, &app, name, arguments).await
+        }
+        "mcpApps.readResource" => {
+            let Some(uri) = required_str(&payload, "uri") else {
+                return fail(thread_id, "request-failed");
+            };
+            read_resource(&state, thread_id, config, &app, uri).await
+        }
+        other => unsupported(other),
     }
 }
 
 pub async fn handle(state: Arc<AppState>, tag: &str, payload: Value) -> RpcResult {
     match tag {
         "mcpApps.callTool" | "mcpApps.toolInfo" | "mcpApps.readResource" => {
-            live_request(state, payload).await
+            live_request(state, tag, payload).await
         }
         "mcpApps.updateModelContext" => update_model_context(state, payload).await,
         other => unsupported(other),

@@ -185,8 +185,7 @@ async fn connection(state: Arc<AppState>, socket: WebSocket, grant: crate::auth:
     // Client session for the auth-access surface: one per connection, removed
     // on disconnect or revoked via `/api/auth/clients/revoke{,-others}`.
     let close = CancellationToken::new();
-    let session_id: Arc<str> =
-        Arc::from(state.auth_access.register_session(&grant, close.clone()));
+    let session_id: Arc<str> = Arc::from(state.auth_access.register_session(&grant, close.clone()));
 
     let writer = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
