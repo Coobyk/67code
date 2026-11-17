@@ -41,10 +41,17 @@ use crate::{AppView, theme};
 
 /// Fixed drawer height; the web drawer is drag-resizable (~260 default).
 const DRAWER_HEIGHT: f32 = 260.;
-/// PTY grid requested at open/attach. No live resize tracking — the server
-/// accepts `terminal.resize` but we only send it once per attach.
+/// PTY grid requested at open/attach until the first layout reports the
+/// real body size — live resize then keeps it current.
 const TERM_COLS: u16 = 96;
 const TERM_ROWS: u16 = 24;
+/// Approximate monospace cell advance at `text_xs` — the PTY grid only
+/// needs whole cells, so a slightly-off estimate costs one column.
+const TERM_CHAR_WIDTH: f32 = 7.2;
+/// Horizontal padding inside the terminal body (`px_2` both sides).
+const TERM_BODY_PAD_X: f32 = 16.;
+/// Layout → `terminal.resize` settle time.
+const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 /// Approximate byte cap for scrollback text kept per terminal.
 const SCROLLBACK_CAP: usize = 200 * 1024;
 /// Uniform row height for the monospaced scrollback list.
@@ -75,6 +82,9 @@ struct Session {
     /// queries scramble keystrokes.
     input_queue: String,
     input_writing: bool,
+    /// Grid size the last layout pass asked for. Debounced: `terminal.resize`
+    /// goes out ~250ms after the value stops changing.
+    desired_size: Option<(u16, u16)>,
 }
 
 #[derive(Clone)]
@@ -698,7 +708,11 @@ impl Screen {
                     _ => i += 1,
                 },
                 PMode::OscEsc => {
-                    self.mode = if b == b'\\' { PMode::Ground } else { PMode::Osc };
+                    self.mode = if b == b'\\' {
+                        PMode::Ground
+                    } else {
+                        PMode::Osc
+                    };
                     i += 1;
                 }
             }
@@ -816,7 +830,11 @@ impl Screen {
             'T' => self.scroll_down(n(1)),
             'Z' => {
                 // CBT — back-tab.
-                self.cc = if self.cc <= 1 { 0 } else { ((self.cc - 1) / 8) * 8 };
+                self.cc = if self.cc <= 1 {
+                    0
+                } else {
+                    ((self.cc - 1) / 8) * 8
+                };
                 self.wrap = false;
             }
             'r' => {
@@ -1114,9 +1132,7 @@ fn label_for(terminal_id: &str) -> String {
             let ok = tail.is_empty()
                 || (tail.len() == 37
                     && tail.starts_with('-')
-                    && tail[1..]
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() || c == '-'));
+                    && tail[1..].chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
             if ok {
                 return format!("Terminal {digits}");
             }
@@ -1150,7 +1166,11 @@ fn status_color(session: &Session) -> gpui::Hsla {
 impl AppView {
     /// Project workspace root for a thread (payload `cwd` for `terminal.open`).
     fn terminal_cwd_for(&self, thread_id: &str) -> Option<String> {
-        let thread = self.state.threads.iter().find(|t| t.id.as_ref() == thread_id)?;
+        let thread = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id.as_ref() == thread_id)?;
         let project = self
             .state
             .projects
@@ -1187,20 +1207,18 @@ impl AppView {
         let key = (thread_id.to_string(), terminal_id.to_string());
         let stale_stream = {
             let st = &mut self.terminal_state;
-            let s = st
-                .sessions
-                .entry(key.clone())
-                .or_insert_with(|| Session {
-                    status: TermStatus::Connecting,
-                    stream_id: None,
-                    want_attach: true,
-                    label: label_for(terminal_id),
-                    pid: None,
-                    screen: Screen::new(TERM_COLS as usize, TERM_ROWS as usize),
-                    no_cwd: false,
-                    input_queue: String::new(),
-                    input_writing: false,
-                });
+            let s = st.sessions.entry(key.clone()).or_insert_with(|| Session {
+                status: TermStatus::Connecting,
+                stream_id: None,
+                want_attach: true,
+                label: label_for(terminal_id),
+                pid: None,
+                screen: Screen::new(TERM_COLS as usize, TERM_ROWS as usize),
+                no_cwd: false,
+                input_queue: String::new(),
+                input_writing: false,
+                desired_size: None,
+            });
             s.want_attach = true;
             if s.stream_id.is_some() && !restart {
                 return;
@@ -1237,11 +1255,19 @@ impl AppView {
                     .map(|k| k.cwd.clone())
             })
         };
+        // The layout canvas may have measured the body before the attach
+        // completed — honor that size from the first request.
+        let (cols, rows) = self
+            .terminal_state
+            .sessions
+            .get(&key)
+            .and_then(|s| s.desired_size)
+            .unwrap_or((TERM_COLS, TERM_ROWS));
         let mut open_payload = json!({
             "threadId": thread_id,
             "terminalId": terminal_id,
-            "cols": TERM_COLS,
-            "rows": TERM_ROWS,
+            "cols": cols,
+            "rows": rows,
         });
         if let Some(cwd) = &cwd {
             open_payload["cwd"] = json!(cwd);
@@ -1279,14 +1305,15 @@ impl AppView {
                 });
             })
             .detach();
-            // One-shot grid resize at open; no live resize tracking.
+            // Seed the PTY grid at open; live resize continues via
+            // terminal_note_size once the layout canvas reports bounds.
             let _ = self.send_query(
                 "terminal.resize",
                 json!({
                     "threadId": thread_id,
                     "terminalId": terminal_id,
-                    "cols": TERM_COLS,
-                    "rows": TERM_ROWS,
+                    "cols": cols,
+                    "rows": rows,
                 }),
             );
         }
@@ -1294,8 +1321,8 @@ impl AppView {
         let mut attach_payload = json!({
             "threadId": thread_id,
             "terminalId": terminal_id,
-            "cols": TERM_COLS,
-            "rows": TERM_ROWS,
+            "cols": cols,
+            "rows": rows,
         });
         if let Some(cwd) = cwd {
             attach_payload["cwd"] = json!(cwd);
@@ -1577,7 +1604,9 @@ impl AppView {
             return;
         }
         // Drawer's terminal for the selected thread.
-        if self.terminal_state.drawer_open && let Some(tid) = self.state.selected.clone() {
+        if self.terminal_state.drawer_open
+            && let Some(tid) = self.state.selected.clone()
+        {
             let term = self
                 .terminal_state
                 .active
@@ -1743,9 +1772,16 @@ impl AppView {
         let key = ks.key.as_str();
         // App-level combos keep working while the terminal is focused.
         if mods.platform
-            || (mods.control && matches!(key, "`" | "b" | ","))
-            || (mods.control && mods.shift && key == "f")
+            || (mods.control && matches!(key, "`" | "b" | "," | "j" | "{" | "}"))
+            || (mods.control && mods.alt && key == "b")
+            || (mods.control && mods.shift && matches!(key, "f" | "m" | "p"))
         {
+            return;
+        }
+        if mods.control && key == "w" {
+            // Web `terminal.close` — mod+w while the terminal is focused.
+            self.terminal_close(&thread_id, &terminal_id, cx);
+            cx.stop_propagation();
             return;
         }
         if mods.control && key == "l" {
@@ -1772,6 +1808,79 @@ impl AppView {
         if let Some(data) = data {
             self.terminal_write(&thread_id, &terminal_id, data, cx);
             cx.stop_propagation();
+        }
+    }
+
+    /// The layout canvas reports the terminal body's pixel bounds each
+    /// frame; if the implied grid changed, remember it and arm the
+    /// `terminal.resize` debounce.
+    fn terminal_note_size(
+        &mut self,
+        thread_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (thread_id.to_string(), terminal_id.to_string());
+        let Some(session) = self.terminal_state.sessions.get_mut(&key) else {
+            return;
+        };
+        if session.desired_size == Some((cols, rows)) {
+            return;
+        }
+        session.desired_size = Some((cols, rows));
+        let thread_id = thread_id.to_string();
+        let terminal_id = terminal_id.to_string();
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(RESIZE_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                this.terminal_apply_size(&thread_id, &terminal_id, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Send `terminal.resize` if the debounced desired size still differs
+    /// from what the session's screen tracks.
+    fn terminal_apply_size(&mut self, thread_id: &str, terminal_id: &str, _cx: &mut Context<Self>) {
+        let key = (thread_id.to_string(), terminal_id.to_string());
+        let Some(session) = self.terminal_state.sessions.get(&key) else {
+            return;
+        };
+        let Some((cols, rows)) = session.desired_size else {
+            return;
+        };
+        if session.screen.cols == cols as usize && session.screen.rows == rows as usize {
+            return;
+        }
+        if let Some(session) = self.terminal_state.sessions.get_mut(&key) {
+            session.screen.cols = cols as usize;
+            session.screen.rows = rows as usize;
+        }
+        let _ = self.send_query(
+            "terminal.resize",
+            json!({
+                "threadId": thread_id,
+                "terminalId": terminal_id,
+                "cols": cols,
+                "rows": rows,
+            }),
+        );
+    }
+
+    /// ctrl-w away from the terminal — web `rightPanel.close`: close the
+    /// right panel if open, else the terminal drawer.
+    pub(crate) fn close_panel_or_drawer(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel_state.tab.is_some() {
+            self.panel_state.tab = None;
+            cx.notify();
+        } else if self.terminal_state.drawer_open {
+            self.terminal_drawer_set_open(false, window, cx);
         }
     }
 }
@@ -1860,17 +1969,15 @@ impl AppView {
         let session_info: Option<(String, String, Option<i64>, gpui::Hsla, bool)> =
             tid.as_ref().and_then(|t| {
                 term.as_ref().and_then(|term| {
-                    st.sessions
-                        .get(&(t.to_string(), term.clone()))
-                        .map(|s| {
-                            (
-                                s.label.clone(),
-                                status_label(s),
-                                s.pid,
-                                status_color(s),
-                                s.status.dead(),
-                            )
-                        })
+                    st.sessions.get(&(t.to_string(), term.clone())).map(|s| {
+                        (
+                            s.label.clone(),
+                            status_label(s),
+                            s.pid,
+                            status_color(s),
+                            s.status.dead(),
+                        )
+                    })
                 })
             });
 
@@ -1899,11 +2006,7 @@ impl AppView {
                         .items_center()
                         .gap_1()
                         .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(*dot))
-                        .child(
-                            div()
-                                .text_color(theme::fg_muted())
-                                .child(status.clone()),
-                        ),
+                        .child(div().text_color(theme::fg_muted()).child(status.clone())),
                 );
                 if let Some(pid) = pid {
                     header = header.child(
@@ -1990,13 +2093,21 @@ impl AppView {
             .text_xs()
             .child(
                 div()
-                    .text_color(if focused { theme::primary() } else { theme::fg_muted() })
+                    .text_color(if focused {
+                        theme::primary()
+                    } else {
+                        theme::fg_muted()
+                    })
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("❯"),
             )
             .child(
                 div()
-                    .text_color(if focused { theme::fg() } else { theme::fg_muted() })
+                    .text_color(if focused {
+                        theme::fg()
+                    } else {
+                        theme::fg_muted()
+                    })
                     .child(if focused {
                         hint.to_string()
                     } else {
@@ -2055,12 +2166,11 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(format!("{} — {}", session.label, status_label(session))),
-                )
+                .child(div().text_xs().text_color(theme::fg_muted()).child(format!(
+                    "{} — {}",
+                    session.label,
+                    status_label(session)
+                )))
                 .child(
                     div()
                         .id("terminal-restart")
@@ -2090,14 +2200,46 @@ impl AppView {
             });
         }
         let scroll = self.terminal_state.scroll.clone();
+        let measure_tid = tid.to_string();
+        let measure_term = term.to_string();
         div()
             .flex_1()
             .min_h_0()
+            .relative()
             .px_2()
             .py_1()
             .font_family("monospace")
             .text_xs()
             .line_height(px(LINE_HEIGHT))
+            .child(
+                // Zero-visual canvas that measures the body's laid-out size
+                // every frame and feeds the debounced PTY resize.
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let size = bounds.size;
+                        let cols = ((f32::from(size.width) - TERM_BODY_PAD_X) / TERM_CHAR_WIDTH)
+                            .floor()
+                            .clamp(20., 500.) as u16;
+                        let rows = (f32::from(size.height) / LINE_HEIGHT)
+                            .floor()
+                            .clamp(4., 200.) as u16;
+                        if let Some(Some(view)) = window.root::<AppView>() {
+                            view.update(cx, |this, cx| {
+                                this.terminal_note_size(
+                                    measure_tid.as_str(),
+                                    measure_term.as_str(),
+                                    cols,
+                                    rows,
+                                    cx,
+                                );
+                            });
+                        }
+                    },
+                    |_bounds, _prepaint, _window, _cx| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(
                 uniform_list("terminal-scrollback", count, move |range, _window, _cx| {
                     range
@@ -2245,17 +2387,13 @@ impl AppView {
             .gap_1();
 
         if mine.is_empty() {
-            list = list.child(
-                div()
-                    .p_2()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(if connected {
-                        "No terminals on this thread — press + to open one.".to_string()
-                    } else {
-                        "Connect to a server to list terminals.".to_string()
-                    }),
-            );
+            list = list.child(div().p_2().text_xs().text_color(theme::fg_muted()).child(
+                if connected {
+                    "No terminals on this thread — press + to open one.".to_string()
+                } else {
+                    "Connect to a server to list terminals.".to_string()
+                },
+            ));
         }
         for (tid, term, label, status, pid, _upd) in mine {
             list = list.child(self.render_terminal_row(tid, term, label, status, pid, cx));

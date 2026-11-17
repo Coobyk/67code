@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    Context, Div, MouseButton, ObjectFit, RenderImage, ScrollHandle, SharedString, div, img,
-    prelude::*, px, relative,
+    Context, Div, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, ScrollHandle, SharedString,
+    Window, div, img, prelude::*, px, relative,
 };
 use serde_json::{Value, json};
 
@@ -86,6 +86,27 @@ struct Preview {
     kind: PreviewKind,
 }
 
+/// Inline editing session for a text preview. `text_field::TextField` is
+/// single-line only, so editing is a minimal buffer editor driven by an
+/// `intercept_keystrokes` hook: printable `key_char`s insert at the caret,
+/// arrows/home/end navigate by line and column, ctrl-s/cmd-s saves through
+/// `projects.writeFile`, and Escape cancels back to the preview.
+struct EditBuffer {
+    /// Workspace-relative path being edited (`selected` while open).
+    path: String,
+    /// Working contents.
+    content: String,
+    /// Contents at last load/save — `content != saved` is the dirty flag.
+    saved: String,
+    /// Caret byte offset (always a char boundary).
+    cursor: usize,
+    /// A `projects.writeFile` request is in flight.
+    saving: bool,
+    /// Last save error, rendered inline.
+    error: Option<String>,
+    scroll: ScrollHandle,
+}
+
 /// `explorer::State` — owned by `AppView.explorer_state`.
 #[derive(Default)]
 pub struct State {
@@ -111,6 +132,12 @@ pub struct State {
     selected: Option<String>,
     /// Bottom-split preview state for `selected`.
     preview: Option<Preview>,
+    /// Active inline editing session for `selected`, if any.
+    editing: Option<EditBuffer>,
+    /// The editor keystroke interceptor was installed once.
+    editor_hook: bool,
+    /// Keeps the interceptor subscription alive (drop = unregister).
+    editor_sub: Option<gpui::Subscription>,
     /// Bumps on project switch; stale async replies are dropped.
     generation: u64,
     tree_scroll: ScrollHandle,
@@ -148,6 +175,108 @@ fn is_markdown_path(path: &str) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "md" | "mdx" | "markdown" | "mdown" | "mkd"
     )
+}
+
+impl EditBuffer {
+    /// Byte range of the line containing `cursor`.
+    fn line_range(&self) -> (usize, usize) {
+        let start = self.content[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = self.content[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.content.len());
+        (start, end)
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.content.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.error = None;
+    }
+
+    fn backspace(&mut self) {
+        let Some(prev) = self.content[..self.cursor].chars().next_back() else {
+            return;
+        };
+        let start = self.cursor - prev.len_utf8();
+        self.content.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    fn delete_forward(&mut self) {
+        let Some(next) = self.content[self.cursor..].chars().next() else {
+            return;
+        };
+        self.content
+            .replace_range(self.cursor..self.cursor + next.len_utf8(), "");
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.content[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.content[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = self.line_range().0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.line_range().1;
+    }
+
+    /// Up/down: keep the caret's character column, clamped to the target
+    /// line's length.
+    fn move_vert(&mut self, dir: i32) {
+        let (line_start, line_end) = self.line_range();
+        let column = self.content[line_start..self.cursor].chars().count();
+        let (target_start, target_end) = if dir < 0 {
+            if line_start == 0 {
+                self.cursor = 0;
+                return;
+            }
+            let end = line_start - 1; // the '\n' before this line
+            let start = self.content[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            (start, end)
+        } else {
+            if line_end == self.content.len() {
+                self.cursor = self.content.len();
+                return;
+            }
+            let start = line_end + 1;
+            let end = self.content[start..]
+                .find('\n')
+                .map(|i| start + i)
+                .unwrap_or(self.content.len());
+            (start, end)
+        };
+        let line: &str = &self.content[target_start..target_end];
+        let mut byte = 0usize;
+        for (ix, ch) in line.chars().enumerate() {
+            if ix == column {
+                break;
+            }
+            byte += ch.len_utf8();
+        }
+        self.cursor = target_start + byte;
+    }
+
+    /// 0-based row of the caret (for `scroll_to_item`).
+    fn cursor_row(&self) -> usize {
+        self.content[..self.cursor]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+    }
 }
 
 fn format_bytes(n: u64) -> String {
@@ -265,6 +394,7 @@ impl AppView {
             s.errors.clear();
             s.selected = None;
             s.preview = None;
+            s.editing = None;
             s.generation = s.generation.wrapping_add(1);
             s.tree_scroll = ScrollHandle::new();
             s.preview_scroll = ScrollHandle::new();
@@ -373,10 +503,15 @@ impl AppView {
         self.explorer_load_dir(dir, false, cx);
     }
 
-    /// Single-click a file row: select it and start the preview.
     /// Reveal `path` in the tree (expanding+loading ancestor dirs so the row
     /// is visible) and preview it. Used by the search dialog's activate.
+    /// If the pane never synced this project (Files tab not opened yet),
+    /// reconcile first so `project_root`/`project_key` back the RPCs.
     pub(crate) fn explorer_reveal(&mut self, path: String, cx: &mut Context<Self>) {
+        let target_key = explorer_target(&self.state).map(|t| t.0);
+        if self.explorer_state.project_key != target_key {
+            self.explorer_sync(cx);
+        }
         let parts: Vec<&str> = path.split('/').collect();
         let mut ancestor = String::new();
         for seg in &parts[..parts.len().saturating_sub(1)] {
@@ -392,6 +527,9 @@ impl AppView {
     }
 
     fn explorer_open_file(&mut self, path: String, cx: &mut Context<Self>) {
+        // Opening (or reloading) a file leaves any editing session — the
+        // buffer is either stale (other path) or about to be re-read.
+        self.explorer_state.editing = None;
         self.explorer_state.selected = Some(path.clone());
         self.explorer_state.preview = Some(Preview {
             path: path.clone(),
@@ -548,6 +686,216 @@ impl AppView {
         .detach();
     }
 
+    // ------------------------------------------------------------------
+    // Inline file editing (projects.writeFile)
+    // ------------------------------------------------------------------
+
+    /// Install the editor keystroke interceptor once. It runs before keymap
+    /// dispatch so printable keys land in the buffer even though focus
+    /// stays on the composer/terminal — the editor is modal while open.
+    fn ensure_editor_hook(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_state.editor_hook {
+            return;
+        }
+        self.explorer_state.editor_hook = true;
+        let subscription = cx.intercept_keystrokes(|event, window, cx| {
+            let Some(view) = window.root::<AppView>().flatten() else {
+                return;
+            };
+            view.update(cx, |this, cx| this.on_explorer_edit_key(event, window, cx));
+        });
+        self.explorer_state.editor_sub = Some(subscription);
+    }
+
+    /// "Edit" on a text preview: swap the read-only preview for the buffer.
+    /// Truncated/display-capped previews never reach this — saving a partial
+    /// read back would silently truncate the file.
+    fn explorer_begin_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((path, contents)) =
+            self.explorer_state
+                .preview
+                .as_ref()
+                .and_then(|preview| match &preview.kind {
+                    PreviewKind::Text {
+                        contents,
+                        truncated: false,
+                        display_capped: false,
+                        ..
+                    } => Some((preview.path.clone(), contents.clone())),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        self.ensure_editor_hook(cx);
+        self.explorer_state.editing = Some(EditBuffer {
+            path,
+            content: contents.clone(),
+            saved: contents,
+            cursor: 0,
+            saving: false,
+            error: None,
+            scroll: ScrollHandle::new(),
+        });
+        cx.notify();
+    }
+
+    /// Escape / Cancel — drop the buffer, back to the read-only preview.
+    fn explorer_end_edit(&mut self, cx: &mut Context<Self>) {
+        self.explorer_state.editing = None;
+        cx.notify();
+    }
+
+    /// ctrl-s/cmd-s — `projects.writeFile`, then re-read so the preview shows
+    /// exactly what landed on disk.
+    fn explorer_save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.explorer_state.editing.as_mut() else {
+            return;
+        };
+        if ed.saving {
+            return;
+        }
+        ed.saving = true;
+        ed.error = None;
+        let path = ed.path.clone();
+        let contents = ed.content.clone();
+        let cwd = self.explorer_state.project_root.clone();
+        let Some(rx) = self.send_query(
+            "projects.writeFile",
+            json!({
+                "cwd": cwd,
+                "relativePath": path,
+                "contents": contents,
+            }),
+        ) else {
+            if let Some(ed) = self.explorer_state.editing.as_mut() {
+                ed.saving = false;
+                ed.error = Some("Not connected to a server.".to_string());
+            }
+            cx.notify();
+            return;
+        };
+        cx.notify();
+        let generation = self.explorer_state.generation;
+        cx.spawn(async move |this, cx| {
+            let exit = rx.recv().await.unwrap_or_else(|_| {
+                json!({"_tag": "Failure", "cause": {"error": {"message": "Connection closed before the reply arrived."}}})
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.explorer_state.generation != generation {
+                    return;
+                }
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.explorer_state.editing = None;
+                    this.explorer_refresh(cx);
+                } else {
+                    let (_, message) = rpc_error(&exit);
+                    if let Some(ed) = this.explorer_state.editing.as_mut() {
+                        ed.saving = false;
+                        ed.error = Some(message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Editor keystrokes, captured app-wide before dispatch. Unhandled keys
+    /// fall through so palette/overlay shortcuts keep working.
+    fn on_explorer_edit_key(
+        &mut self,
+        event: &KeystrokeEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.explorer_state.editing.is_none() {
+            return;
+        }
+        // Another surface owns the keyboard right now.
+        if self.palette_state.open
+            || self.search_state.open
+            || self.settings_state.open
+            || self.welcome_state.open
+        {
+            return;
+        }
+        let ks = &event.keystroke;
+        let mods = ks.modifiers;
+        if (mods.control || mods.platform) && ks.key == "s" {
+            self.explorer_save_edit(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if mods.control || mods.platform || mods.function {
+            return;
+        }
+        let consumed = {
+            let Some(ed) = self.explorer_state.editing.as_mut() else {
+                return;
+            };
+            match ks.key.as_str() {
+                "escape" => true,
+                "enter" => {
+                    ed.insert("\n");
+                    true
+                }
+                "tab" => {
+                    ed.insert("\t");
+                    true
+                }
+                "backspace" => {
+                    ed.backspace();
+                    true
+                }
+                "delete" => {
+                    ed.delete_forward();
+                    true
+                }
+                "left" => {
+                    ed.move_left();
+                    true
+                }
+                "right" => {
+                    ed.move_right();
+                    true
+                }
+                "up" => {
+                    ed.move_vert(-1);
+                    true
+                }
+                "down" => {
+                    ed.move_vert(1);
+                    true
+                }
+                "home" => {
+                    ed.move_home();
+                    true
+                }
+                "end" => {
+                    ed.move_end();
+                    true
+                }
+                _ => {
+                    if let Some(text) = &ks.key_char {
+                        ed.insert(text);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        };
+        if !consumed {
+            return;
+        }
+        cx.stop_propagation();
+        if event.keystroke.key == "escape" {
+            self.explorer_state.editing = None;
+        }
+        cx.notify();
+    }
+
     /// Refresh button: re-fetch every requested directory plus the open file.
     fn explorer_refresh(&mut self, cx: &mut Context<Self>) {
         let dirs: Vec<String> = self.explorer_state.requested.iter().cloned().collect();
@@ -664,23 +1012,25 @@ impl AppView {
         if self.explorer_state.project_key.is_none() {
             pane = pane.child(self.explorer_empty("Select a thread"));
         } else if let Some(err) = self.explorer_state.errors.get("").cloned() {
-            let el = self.explorer_empty(&format!("Couldn't load files — {err}")).child(
-                div()
-                    .id("explorer-retry")
-                    .mt_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(theme::raised())
-                    .text_color(theme::fg())
-                    .hover(|s| s.bg(theme::hover()))
-                    .child("Retry")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev, _w, cx| this.explorer_refresh(cx)),
-                    ),
-            );
+            let el = self
+                .explorer_empty(&format!("Couldn't load files — {err}"))
+                .child(
+                    div()
+                        .id("explorer-retry")
+                        .mt_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(theme::raised())
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::hover()))
+                        .child("Retry")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _w, cx| this.explorer_refresh(cx)),
+                        ),
+                );
             pane = pane.child(el);
         } else if !self.explorer_state.dirs.contains_key("") {
             pane = pane.child(self.explorer_empty("Loading…"));
@@ -779,9 +1129,7 @@ impl AppView {
                     .when(row.ignored || row.is_dir, |s| {
                         s.text_color(theme::fg_muted())
                     })
-                    .when(!row.ignored && !row.is_dir, |s| {
-                        s.text_color(theme::fg())
-                    })
+                    .when(!row.ignored && !row.is_dir, |s| s.text_color(theme::fg()))
                     .when(is_selected, |s| s.text_color(theme::fg()))
                     .child(row.name.clone()),
             );
@@ -822,6 +1170,21 @@ impl AppView {
             PreviewKind::Image { byte_length, .. } => (*byte_length, false),
             _ => (0, false),
         };
+        let editing = self
+            .explorer_state
+            .editing
+            .as_ref()
+            .filter(|ed| ed.path == preview.path);
+        // Only a complete text read is editable — writing a truncated
+        // preview back would destroy the tail of the file.
+        let editable = matches!(
+            &preview.kind,
+            PreviewKind::Text {
+                truncated: false,
+                display_capped: false,
+                ..
+            }
+        ) && editing.is_none();
         let mut pane = div()
             .flex_none()
             .h(relative(0.45))
@@ -857,6 +1220,84 @@ impl AppView {
                                 .child(format_bytes(byte_length)),
                         )
                     })
+                    .when(editable, |el| {
+                        el.child(
+                            div()
+                                .id("explorer-preview-edit")
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(theme::fg_muted())
+                                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                .child("Edit")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _w, cx| {
+                                        this.explorer_begin_edit(cx);
+                                    }),
+                                ),
+                        )
+                    })
+                    .when_some(editing, |el, ed| {
+                        let dirty = ed.content != ed.saved;
+                        el.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_color(if dirty {
+                                    gpui::rgb(0xf5a97f)
+                                } else {
+                                    theme::fg_muted()
+                                })
+                                .child(if dirty { "●" } else { "○" })
+                                .child(if ed.saving {
+                                    "saving…"
+                                } else if dirty {
+                                    "modified · ctrl-s save"
+                                } else {
+                                    "ctrl-s save"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("explorer-edit-save")
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(theme::fg_muted())
+                                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                .child("Save")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _w, cx| {
+                                        this.explorer_save_edit(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("explorer-edit-cancel")
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(theme::fg_muted())
+                                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                .child("esc")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _w, cx| {
+                                        this.explorer_end_edit(cx);
+                                    }),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("explorer-preview-close")
@@ -872,6 +1313,7 @@ impl AppView {
                                 cx.listener(|this, _ev, _w, cx| {
                                     this.explorer_state.selected = None;
                                     this.explorer_state.preview = None;
+                                    this.explorer_state.editing = None;
                                     cx.notify();
                                 }),
                             ),
@@ -897,6 +1339,9 @@ impl AppView {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.explorer_state.preview_scroll);
+        if let Some(ed) = editing {
+            return pane.child(self.render_explorer_editor(ed, cx));
+        }
         pane.child(match &preview.kind {
             PreviewKind::Loading => body
                 .flex()
@@ -913,11 +1358,7 @@ impl AppView {
                 .p_4()
                 .text_color(theme::fg_muted())
                 .child("Binary file — can't display as text.")
-                .child(
-                    div()
-                        .font_family("monospace")
-                        .child(preview.path.clone()),
-                ),
+                .child(div().font_family("monospace").child(preview.path.clone())),
             PreviewKind::Error { message } => body
                 .flex()
                 .flex_col()
@@ -927,21 +1368,16 @@ impl AppView {
                 .p_4()
                 .text_color(theme::fg_muted())
                 .child(message.clone()),
-            PreviewKind::Image { image, .. } => body
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_2()
-                .child(
+            PreviewKind::Image { image, .. } => {
+                body.flex().items_center().justify_center().p_2().child(
                     img(gpui::ImageSource::Render(image.clone()))
                         .object_fit(ObjectFit::Contain)
                         .max_w_full()
                         .max_h_full(),
-                ),
+                )
+            }
             PreviewKind::Text {
-                contents,
-                markdown,
-                ..
+                contents, markdown, ..
             } => {
                 if *markdown {
                     body.p_3()
@@ -956,5 +1392,73 @@ impl AppView {
                 }
             }
         })
+    }
+
+    /// The edit-mode body: one fixed-height row per buffer line, with a
+    /// 1px caret drawn on the cursor line (text before / caret / text after
+    /// — monospace, so the split lands exactly on the column).
+    fn render_explorer_editor(&self, ed: &EditBuffer, _cx: &mut Context<Self>) -> Div {
+        const EDIT_LINE_HEIGHT: f32 = 17.;
+        let cursor_row = ed.cursor_row();
+        let caret_start: usize = ed
+            .content
+            .split_inclusive('\n')
+            .take(cursor_row)
+            .map(|piece| piece.len())
+            .sum();
+        let caret_col = ed.cursor - caret_start;
+
+        let mut list = div()
+            .id("explorer-editor")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&ed.scroll)
+            .px_2()
+            .py_1()
+            .font_family("monospace")
+            .text_xs()
+            .text_color(theme::fg());
+        for (row, line) in ed.content.split('\n').enumerate() {
+            let mut line_row = div()
+                .h(px(EDIT_LINE_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .whitespace_nowrap()
+                .overflow_x_hidden();
+            if row == cursor_row {
+                let (before, after) = line.split_at(caret_col.min(line.len()));
+                line_row = line_row
+                    .child(div().child(SharedString::from(before.to_string())))
+                    .child(div().w(px(1.)).h_full().bg(theme::cursor()))
+                    .child(div().child(SharedString::from(after.to_string())));
+            } else {
+                line_row = line_row.child(div().child(SharedString::from(if line.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.to_string()
+                })));
+            }
+            list = list.child(line_row);
+        }
+        ed.scroll.scroll_to_item(cursor_row);
+
+        let mut pane = div().flex().flex_col().flex_1().min_h_0();
+        if let Some(err) = &ed.error {
+            pane = pane.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(gpui::rgb(0xf87171))
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(format!("Couldn't save: {err}")),
+            );
+        }
+        pane.child(list)
     }
 }

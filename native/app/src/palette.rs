@@ -12,14 +12,18 @@
 //! in lib.rs cover this surface; palette list keys are consumed by the
 //! palette's own keystroke interceptor before they can reach the TextField.
 
+use std::time::Duration;
+
 use gpui::{
     Context, Entity, EntityInputHandler, Focusable, KeystrokeEvent, MouseButton, SharedString,
     Subscription, Window, div, point, prelude::*, px,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::model::ConnectionStatus;
 use crate::net::ClientCommand;
+use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
 use crate::{AppView, TogglePalette};
@@ -29,6 +33,12 @@ use crate::{AppView, TogglePalette};
 const RECENT_THREAD_LIMIT: usize = 12;
 /// Cap on fuzzy-filtered thread hits so commands stay reachable.
 const FILTERED_THREAD_LIMIT: usize = 12;
+/// `projects.searchEntries` file hits per query.
+const FILE_HIT_LIMIT: u64 = 12;
+/// `projects.searchContents` line hits per query.
+const CONTENT_HIT_LIMIT: u64 = 8;
+/// Query → project-search RPC delay (same cadence as search_dialog.rs).
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct State {
     /// Palette overlay visible. Read by `on_close_overlay` in lib.rs.
@@ -44,6 +54,13 @@ pub struct State {
     delete_confirm: bool,
     /// Thread id whose title the input is currently editing (rename mode).
     renaming: Option<SharedString>,
+    /// Debounced project-search results for `query` (path hits first, then
+    /// content hits) — the palette's search-everything half.
+    search_results: Vec<SearchHit>,
+    /// A project-search RPC is in flight or its debounce is armed.
+    search_pending: bool,
+    /// Bumped per keystroke; stale debounce timers and replies check it.
+    search_generation: u64,
     /// Scroll position of the results list.
     scroll: gpui::ScrollHandle,
     subs: Vec<Subscription>,
@@ -59,6 +76,9 @@ impl Default for State {
             selection: 0,
             delete_confirm: false,
             renaming: None,
+            search_results: Vec::new(),
+            search_pending: false,
+            search_generation: 0,
             scroll: gpui::ScrollHandle::new(),
             subs: Vec::new(),
             hooks_installed: false,
@@ -75,6 +95,7 @@ enum CommandKind {
     Rename,
     Delete,
     Stop,
+    Triage,
 }
 
 /// One selectable palette entry.
@@ -82,6 +103,19 @@ enum CommandKind {
 enum Entry {
     Thread(SharedString),
     Command(CommandKind),
+    /// Project-search hit — opens the file in the explorer (line hits don't
+    /// scroll yet; same gap as the search dialog).
+    SearchHit(String),
+}
+
+/// One project-search result. `line_number == None` marks a
+/// `projects.searchEntries` path hit; `Some` a `projects.searchContents`
+/// line match.
+#[derive(Clone)]
+struct SearchHit {
+    path: String,
+    line_number: Option<u64>,
+    line: String,
 }
 
 /// A flat result row (section headers are derived from `section` at render).
@@ -100,9 +134,7 @@ struct Row {
 
 /// Case-insensitive subsequence match — every query char appears in order.
 fn fuzzy_match(query: &str, haystack: &str) -> bool {
-    let mut hay = haystack
-        .chars()
-        .flat_map(|c| c.to_lowercase());
+    let mut hay = haystack.chars().flat_map(|c| c.to_lowercase());
     query
         .chars()
         .flat_map(|c| c.to_lowercase())
@@ -150,19 +182,22 @@ impl AppView {
 
         // Keep the plain-string query mirror in sync so `&self` render can
         // filter. A changed query resets highlight + delete arming.
-        self.palette_state.subs.push(cx.observe(
-            &field,
-            |this, field, cx| {
+        self.palette_state
+            .subs
+            .push(cx.observe(&field, |this, field, cx| {
                 let query = field_text(&field, cx);
                 let state = &mut this.palette_state;
                 if state.query != query {
                     state.query = query;
                     state.selection = 0;
                     state.delete_confirm = false;
+                    // Rename prefill types the old title; don't search on it.
+                    if state.renaming.is_none() {
+                        this.schedule_palette_search(cx);
+                    }
                     cx.notify();
                 }
-            },
-        ));
+            }));
 
         // Enter normally routes here through the TextField's Submit action,
         // but the keystroke interceptor consumes it first; this subscription
@@ -210,6 +245,9 @@ impl AppView {
         self.palette_state.selection = 0;
         self.palette_state.delete_confirm = false;
         self.palette_state.renaming = None;
+        self.palette_state.search_results.clear();
+        self.palette_state.search_pending = false;
+        self.palette_state.search_generation = self.palette_state.search_generation.wrapping_add(1);
         self.palette_state.scroll.set_offset(point(px(0.), px(0.)));
 
         self.ensure_palette_field(window, cx);
@@ -301,11 +339,127 @@ impl AppView {
             state.selection = 0;
             state.delete_confirm = false;
             state.renaming = None;
+            state.search_results.clear();
+            state.search_pending = false;
+            state.search_generation = state.search_generation.wrapping_add(1);
         }
         if let Some(field) = self.palette_state.field.clone() {
             field.update(cx, |field, cx| field.reset(window, cx));
         }
         self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Arm the debounce; when it fires and the generation still matches,
+    /// `run_palette_search` issues the project-search RPCs. Mirrors
+    /// `schedule_search` in search_dialog.rs.
+    fn schedule_palette_search(&mut self, cx: &mut Context<Self>) {
+        self.palette_state.search_generation = self.palette_state.search_generation.wrapping_add(1);
+        let short = self.palette_state.query.trim().chars().count() < 2;
+        self.palette_state.search_pending = !short;
+        if short {
+            self.palette_state.search_results.clear();
+        }
+        let generation = self.palette_state.search_generation;
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(SEARCH_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.palette_state.open && this.palette_state.search_generation == generation {
+                    this.run_palette_search(generation, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Issue `projects.searchEntries` + `projects.searchContents` for the
+    /// palette query, scoped to the selected thread's project root — the
+    /// search-everything half of the palette.
+    fn run_palette_search(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let query = self.palette_state.query.trim().to_string();
+        let Some((cwd, _name)) = self.search_target() else {
+            self.palette_state.search_pending = false;
+            self.palette_state.search_results.clear();
+            cx.notify();
+            return;
+        };
+        let files_rx = self.send_query(
+            "projects.searchEntries",
+            json!({
+                "cwd": cwd,
+                "query": query,
+                "limit": FILE_HIT_LIMIT,
+                "kind": "file",
+            }),
+        );
+        let contents_rx = self.send_query(
+            "projects.searchContents",
+            json!({
+                "cwd": cwd,
+                "query": query,
+                "limit": CONTENT_HIT_LIMIT,
+            }),
+        );
+        self.palette_state.search_pending = files_rx.is_some() || contents_rx.is_some();
+        cx.spawn(async move |this, cx| {
+            let recv = |rx: Option<smol::channel::Receiver<Value>>| async move {
+                match rx {
+                    Some(rx) => rx.recv().await.unwrap_or_else(
+                        |_| json!({"_tag": "Failure", "cause": {"error": {"message": "closed"}}}),
+                    ),
+                    None => json!({"_tag": "Failure"}),
+                }
+            };
+            let files_exit = recv(files_rx).await;
+            let contents_exit = recv(contents_rx).await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_palette_search(generation, files_exit, contents_exit, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fold both search `Exit` frames into `search_results`; a stale
+    /// generation (newer query typed mid-flight) drops the reply untouched.
+    fn apply_palette_search(
+        &mut self,
+        generation: u64,
+        files_exit: Value,
+        contents_exit: Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_state.search_generation != generation {
+            return;
+        }
+        self.palette_state.search_pending = false;
+        let mut results = Vec::new();
+        if files_exit["_tag"].as_str() == Some("Success") {
+            for e in files_exit["value"]["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                results.push(SearchHit {
+                    path: e["path"].as_str().unwrap_or_default().to_string(),
+                    line_number: None,
+                    line: String::new(),
+                });
+            }
+        }
+        if contents_exit["_tag"].as_str() == Some("Success") {
+            for m in contents_exit["value"]["matches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                results.push(SearchHit {
+                    path: m["path"].as_str().unwrap_or_default().to_string(),
+                    line_number: m["lineNumber"].as_u64(),
+                    line: m["lineContent"].as_str().unwrap_or_default().to_string(),
+                });
+            }
+        }
+        self.palette_state.search_results = results;
         cx.notify();
     }
 
@@ -362,20 +516,22 @@ impl AppView {
 
         // Commands that act on a thread always target `state.selected` (the
         // "current thread"), like the web palette's thread commands.
-        let commands: [(CommandKind, &str, Option<&str>, Option<&str>, bool); 7] = [
-            (
-                CommandKind::NewThread,
-                "New thread",
-                None,
-                Some("⌘N"),
-                true,
-            ),
+        let connected = matches!(self.state.connection, ConnectionStatus::Connected);
+        let commands: [(CommandKind, &str, Option<&str>, Option<&str>, bool); 8] = [
+            (CommandKind::NewThread, "New thread", None, Some("⌘N"), true),
             (
                 CommandKind::OpenSettings,
                 "Open settings",
                 None,
                 Some("⌘,"),
                 true,
+            ),
+            (
+                CommandKind::Triage,
+                "Triage an issue…",
+                Some("Start a triage thread in the scratch project"),
+                None,
+                connected,
             ),
             // model::Thread drops archived threads on ingest, so "Unarchive"
             // is unreachable here — only the archive direction is listed.
@@ -420,6 +576,7 @@ impl AppView {
             let keywords = match kind {
                 CommandKind::NewThread => "create start newthread",
                 CommandKind::OpenSettings => "preferences options config",
+                CommandKind::Triage => "triage bug issue report broken debug help support",
                 CommandKind::Archive => "unarchive close hide",
                 CommandKind::Pin => "unpin favorite star",
                 CommandKind::Rename => "title edit retitle",
@@ -450,6 +607,43 @@ impl AppView {
             });
         }
 
+        // Search-everything: debounced project hits trail the commands.
+        if filtering {
+            for hit in &self.palette_state.search_results {
+                match hit.line_number {
+                    None => rows.push(Row {
+                        entry: Entry::SearchHit(hit.path.clone()),
+                        section: "Files",
+                        label: hit.path.clone(),
+                        detail: None,
+                        hint: None,
+                        enabled: true,
+                        danger: false,
+                    }),
+                    Some(line_number) => rows.push(Row {
+                        entry: Entry::SearchHit(hit.path.clone()),
+                        section: "Matching content",
+                        label: format!("{}:{line_number}", hit.path),
+                        detail: Some(hit.line.trim().chars().take(80).collect()),
+                        hint: None,
+                        enabled: true,
+                        danger: false,
+                    }),
+                }
+            }
+            if self.palette_state.search_pending {
+                rows.push(Row {
+                    entry: Entry::SearchHit(String::new()),
+                    section: "Files",
+                    label: "Searching project…".to_string(),
+                    detail: None,
+                    hint: None,
+                    enabled: false,
+                    danger: false,
+                });
+            }
+        }
+
         rows
     }
 
@@ -476,12 +670,7 @@ impl AppView {
         self.run_palette_selection(window, cx);
     }
 
-    fn execute_palette_entry(
-        &mut self,
-        entry: Entry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn execute_palette_entry(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
         match entry {
             Entry::Thread(id) => {
                 self.state.selected = Some(id.clone());
@@ -514,22 +703,7 @@ impl AppView {
                 self.close_palette(window, cx);
             }
             Entry::Command(CommandKind::Pin) => {
-                if let Some(id) = self.state.selected.clone() {
-                    let pinned = self
-                        .state
-                        .threads
-                        .iter()
-                        .find(|t| t.id == id)
-                        .is_some_and(|t| t.pinned);
-                    if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == id) {
-                        thread.pinned = !pinned;
-                    }
-                    self.dispatch(json!({
-                        "type": if pinned { "thread.unpin" } else { "thread.pin" },
-                        "commandId": Uuid::new_v4().to_string(),
-                        "threadId": id.to_string(),
-                    }));
-                }
+                self.toggle_selected_thread_pin();
                 self.close_palette(window, cx);
             }
             Entry::Command(CommandKind::Rename) => {
@@ -576,7 +750,219 @@ impl AppView {
                 }
                 self.close_palette(window, cx);
             }
+            Entry::Command(CommandKind::Triage) => {
+                self.close_palette(window, cx);
+                self.start_triage(cx);
+            }
+            Entry::SearchHit(path) => {
+                self.panel_state.tab = Some(crate::right_panel::Tab::Files);
+                self.close_palette(window, cx);
+                // Line hits open at the file — the preview has no line
+                // anchors (same gap as the search dialog).
+                self.explorer_reveal(path, cx);
+            }
         }
+    }
+
+    /// `thread.pin`/`thread.unpin` on the selected thread — shared by the
+    /// palette command and the ctrl-shift-p binding.
+    pub(crate) fn toggle_selected_thread_pin(&mut self) {
+        let Some(id) = self.state.selected.clone() else {
+            return;
+        };
+        let pinned = self
+            .state
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.pinned);
+        if let Some(thread) = self.state.threads.iter_mut().find(|t| t.id == id) {
+            thread.pinned = !pinned;
+        }
+        self.dispatch(json!({
+            "type": if pinned { "thread.unpin" } else { "thread.pin" },
+            "commandId": Uuid::new_v4().to_string(),
+            "threadId": id.to_string(),
+        }));
+    }
+
+    /// ctrl-{ / ctrl-} — the web `thread.previous`/`thread.next` commands:
+    /// step through the flat sidebar order (projects in order, threads
+    /// pinned-first then recency, snoozed last).
+    pub(crate) fn step_thread_selection(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let mut ordered: Vec<SharedString> = Vec::new();
+        for project in &self.state.projects {
+            let mut threads: Vec<&crate::model::Thread> = self
+                .state
+                .threads
+                .iter()
+                .filter(|t| t.project_id == project.id)
+                .collect();
+            threads.sort_by_key(|t| {
+                (
+                    !t.pinned,
+                    t.pin_order_key.is_none(),
+                    t.pin_order_key.clone().unwrap_or_default(),
+                    t.snoozed_until.is_some(),
+                    std::cmp::Reverse(t.updated_at.clone()),
+                )
+            });
+            ordered.extend(threads.iter().map(|t| t.id.clone()));
+        }
+        if ordered.is_empty() {
+            return;
+        }
+        let ix = self
+            .state
+            .selected
+            .as_ref()
+            .and_then(|sel| ordered.iter().position(|id| id == sel))
+            .unwrap_or(0);
+        let next = (ix as i32 + dir).rem_euclid(ordered.len() as i32) as usize;
+        let id = ordered[next].clone();
+        if self.state.selected.as_ref() != Some(&id) {
+            self.select_thread(id, cx);
+        }
+    }
+
+    /// ctrl-shift-m — the web `modelPicker.toggle` command.
+    pub(crate) fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.composer_state.picker =
+            if self.composer_state.picker == Some(crate::composer::PickerKind::Model) {
+                None
+            } else {
+                Some(crate::composer::PickerKind::Model)
+            };
+        cx.notify();
+    }
+
+    /// "Triage an issue…" — mirror of the web `useStartTriage` flow:
+    /// `server.prepareTriage` writes the session files, `projects.ensureScratch`
+    /// gives a "No project" home, then a new thread opens with the playbook
+    /// prompt drafted in the composer (the user adds the bug report and sends).
+    fn start_triage(&mut self, cx: &mut Context<Self>) {
+        let Some(rx) = self.send_query(
+            "server.prepareTriage",
+            json!({
+                "client": {
+                    "label": "67 Code (native)",
+                    "os": std::env::consts::OS,
+                }
+            }),
+        ) else {
+            self.push_toast(
+                ToastKind::Error,
+                "Couldn't start triage",
+                Some("Not connected to a server.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let exit = rx.recv().await.unwrap_or_else(|_| {
+                json!({"_tag": "Failure", "cause": {"error": {"message": "Connection closed before the reply arrived."}}})
+            });
+            let prompt = if exit["_tag"].as_str() == Some("Success") {
+                exit["value"]["prompt"].as_str().map(str::to_string)
+            } else {
+                None
+            };
+            let Some(prompt) = prompt else {
+                let _ = this.update(cx, |this, cx| {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Couldn't start triage",
+                        Some(
+                            exit["cause"]["error"]["message"]
+                                .as_str()
+                                .unwrap_or("The server did not return a triage prompt.")
+                                .to_string(),
+                        ),
+                        None,
+                        cx,
+                    );
+                });
+                return;
+            };
+            let scratch_rx = this
+                .update(cx, |this, _cx| {
+                    this.send_query("projects.ensureScratch", json!({}))
+                })
+                .ok()
+                .flatten();
+            let project_id = match scratch_rx {
+                Some(rx) => {
+                    let exit = rx.recv().await.unwrap_or_else(|_| json!({"_tag": "Failure"}));
+                    exit["value"]["projectId"].as_str().map(str::to_string)
+                }
+                None => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(project_id) = project_id else {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Couldn't start triage",
+                        Some("The scratch project is unavailable on this server.".to_string()),
+                        None,
+                        cx,
+                    );
+                    return;
+                };
+                let thread_id = Uuid::new_v4().to_string();
+                this.dispatch(json!({
+                    "type": "thread.create",
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": thread_id,
+                    "projectId": project_id,
+                    "title": "Triage",
+                    "modelSelection": this.model_selection(),
+                    "runtimeMode": this.composer_state.runtime_mode.clone(),
+                    "interactionMode": this.composer_state.interaction_mode.clone(),
+                    "branch": null,
+                    "worktreePath": null,
+                    "createdBy": "user",
+                    "creationSource": "web",
+                }));
+                this.thread_items.clear();
+                if let Some(commands) = &this.commands {
+                    let _ = commands.send(ClientCommand::SubscribeThread {
+                        thread_id: thread_id.clone(),
+                    });
+                }
+                this.state.selected = Some(thread_id.into());
+                // Leave the playbook prompt as a composer draft — the user
+                // describes the problem, then sends.
+                let composer = this.composer.clone();
+                let prompt2 = prompt.clone();
+                let view_id = cx.entity_id();
+                let filled = cx
+                    .with_window(view_id, |window, app| {
+                        composer.update(app, |field, cx| {
+                            field.replace_text_in_range(None, &prompt2, window, cx);
+                        });
+                        composer.read(app).focus_handle(app).focus(window, app);
+                    })
+                    .is_some();
+                if !filled {
+                    for handle in cx.windows() {
+                        if handle
+                            .update(cx, |_root, window, app| {
+                                composer.update(app, |field, cx| {
+                                    field.replace_text_in_range(None, &prompt, window, cx);
+                                });
+                                composer.read(app).focus_handle(app).focus(window, app);
+                            })
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Enter pressed while `renaming` is set: dispatch `thread.metadata.update`
@@ -705,11 +1091,7 @@ impl AppView {
             return div().id("palette-closed");
         }
 
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0();
+        let mut body = div().flex().flex_col().flex_1().min_h_0();
 
         if self.palette_state.renaming.is_some() {
             body = body.child(
@@ -806,7 +1188,13 @@ impl AppView {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_sm()
-                    .child(div().flex_1().min_w_0().text_color(theme::fg()).child(field)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(theme::fg())
+                            .child(field),
+                    ),
             );
         }
 

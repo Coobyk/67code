@@ -216,7 +216,11 @@ fn line_segments(line: &str, ranges: &[(u64, u64)]) -> Vec<(String, bool)> {
         match utf16.binary_search(&off) {
             Ok(i) => i,
             Err(i) => {
-                if ceil { i } else { i.saturating_sub(1) }
+                if ceil {
+                    i
+                } else {
+                    i.saturating_sub(1)
+                }
             }
         }
     };
@@ -243,7 +247,8 @@ fn line_segments(line: &str, ranges: &[(u64, u64)]) -> Vec<(String, bool)> {
 impl AppView {
     /// Selected thread's project → (workspace root, project name). `None`
     /// means there is nothing to search (no thread, or project missing).
-    fn search_target(&self) -> Option<(String, String)> {
+    /// Shared with the palette's search-everything results.
+    pub(crate) fn search_target(&self) -> Option<(String, String)> {
         let thread = self.state.selected_thread()?;
         let project = self
             .state
@@ -268,9 +273,9 @@ impl AppView {
 
         // Keep the plain-string query mirror in sync so render can draw the
         // status row; a changed query re-arms the debounce.
-        self.search_state.subs.push(cx.observe(
-            &field,
-            |this, field, cx| {
+        self.search_state
+            .subs
+            .push(cx.observe(&field, |this, field, cx| {
                 let query = field_text(&field, cx);
                 let changed = {
                     let s = &mut this.search_state;
@@ -288,8 +293,7 @@ impl AppView {
                     this.schedule_search(cx);
                     cx.notify();
                 }
-            },
-        ));
+            }));
 
         // Enter is consumed by the keystroke interceptor before the field's
         // Submit action can run; this covers any path that emits
@@ -505,9 +509,7 @@ impl AppView {
             let value = &exit["value"];
             s.error = None;
             s.truncated = value["truncated"].as_bool() == Some(true);
-            s.regex_fallback = value["regexFallbackError"]
-                .as_str()
-                .map(str::to_string);
+            s.regex_fallback = value["regexFallbackError"].as_str().map(str::to_string);
             s.result_limit = match s.mode {
                 Mode::Contents => CONTENT_LIMIT,
                 Mode::Files => ENTRIES_LIMIT,
@@ -520,19 +522,13 @@ impl AppView {
                             .map(|m| Hit {
                                 path: m["path"].as_str().unwrap_or_default().to_string(),
                                 line_number: m["lineNumber"].as_u64(),
-                                line: m["lineContent"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                line: m["lineContent"].as_str().unwrap_or_default().to_string(),
                                 ranges: m["matchRanges"]
                                     .as_array()
                                     .map(|rs| {
                                         rs.iter()
                                             .filter_map(|r| {
-                                                Some((
-                                                    r["start"].as_u64()?,
-                                                    r["end"].as_u64()?,
-                                                ))
+                                                Some((r["start"].as_u64()?, r["end"].as_u64()?))
                                             })
                                             .collect()
                                     })
@@ -588,6 +584,20 @@ impl AppView {
         self.search_activate(cx);
     }
 
+    /// `OpenFilePicker` (ctrl-p / cmd-p): the dialog's Files mode — the web
+    /// client's `filePicker.toggle` command. Reuses the open edge so field,
+    /// hooks, and focus go through `search_opened` like ctrl-shift-f.
+    pub(crate) fn open_file_picker(&mut self, cx: &mut Context<Self>) {
+        if self.search_state.open && self.search_state.mode == Mode::Files {
+            self.search_state.open = false;
+            cx.notify();
+            return;
+        }
+        self.set_search_mode(Mode::Files, cx);
+        self.search_state.open = true;
+        cx.notify();
+    }
+
     fn set_search_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.search_state.mode == mode {
             return;
@@ -625,11 +635,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (id, label, active) = match option {
-            SearchOption::Case => (
-                "search-opt-case",
-                "Aa",
-                self.search_state.case_sensitive,
-            ),
+            SearchOption::Case => ("search-opt-case", "Aa", self.search_state.case_sensitive),
             SearchOption::Word => ("search-opt-word", "ab", self.search_state.whole_word),
             SearchOption::Regex => ("search-opt-regex", ".*", self.search_state.use_regex),
         };
@@ -1053,16 +1059,15 @@ impl AppView {
                     .child(self.render_search_option(SearchOption::Word, cx))
                     .child(self.render_search_option(SearchOption::Regex, cx));
             }
-            accessories = accessories
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_0p5()
-                        .ml_2()
-                        .child(self.render_search_mode_chip(Mode::Contents, "Contents", cx))
-                        .child(self.render_search_mode_chip(Mode::Files, "Files", cx)),
-                );
+            accessories = accessories.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .ml_2()
+                    .child(self.render_search_mode_chip(Mode::Contents, "Contents", cx))
+                    .child(self.render_search_mode_chip(Mode::Files, "Files", cx)),
+            );
             panel = panel.child(
                 div()
                     .flex()
