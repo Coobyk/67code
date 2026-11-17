@@ -104,7 +104,10 @@ fn parse_iso_epoch(s: &str) -> Option<i64> {
     if rest.starts_with('.') {
         rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     }
-    if let Some(sign) = rest.strip_prefix('+').map(|_| 1i64).or_else(|| rest.strip_prefix('-').map(|_| -1))
+    if let Some(sign) = rest
+        .strip_prefix('+')
+        .map(|_| 1i64)
+        .or_else(|| rest.strip_prefix('-').map(|_| -1))
     {
         let hours: i64 = rest.get(1..3)?.parse().ok()?;
         let minutes: i64 = rest.get(4..6).unwrap_or("0").parse().unwrap_or(0);
@@ -247,19 +250,13 @@ impl AppView {
                         a.iter()
                             .map(|t| ArchivedThread {
                                 id: t["id"].as_str().unwrap_or_default().to_string(),
-                                project_id: t["projectId"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                project_id: t["projectId"].as_str().unwrap_or_default().to_string(),
                                 title: t["title"].as_str().unwrap_or("Untitled").to_string(),
                                 archived_at: t["archivedAt"]
                                     .as_str()
                                     .unwrap_or_default()
                                     .to_string(),
-                                created_at: t["createdAt"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                created_at: t["createdAt"].as_str().unwrap_or_default().to_string(),
                             })
                             .collect()
                     })
@@ -487,7 +484,10 @@ impl AppView {
             if threads.is_empty() {
                 continue;
             }
-            let mut group = div().flex().flex_col().child(group_label(project.title.clone()));
+            let mut group = div()
+                .flex()
+                .flex_col()
+                .child(group_label(project.title.clone()));
             for thread in threads {
                 group = group.child(self.render_archived_row(thread, row_ix, cx));
                 row_ix += 1;
@@ -524,12 +524,7 @@ impl AppView {
                     .flex_col()
                     .gap_1()
                     .child(div().text_sm().text_color(theme::fg()).child(title))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(detail),
-                    ),
+                    .child(div().text_xs().text_color(theme::fg_muted()).child(detail)),
             )
         } else {
             // A failed refresh keeps the stale list visible with a warning.

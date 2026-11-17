@@ -14,8 +14,16 @@ use crate::{AppView, theme};
 /// (mode, label, description) rows; order matches the task spec and the web
 /// panel groups the same three choices.
 const THEME_MODES: &[(ThemeMode, &str, &str)] = &[
-    (ThemeMode::Light, "Light", "Bright surfaces for daylight work."),
-    (ThemeMode::Dark, "Dark", "Dim surfaces that are easy on the eyes."),
+    (
+        ThemeMode::Light,
+        "Light",
+        "Bright surfaces for daylight work.",
+    ),
+    (
+        ThemeMode::Dark,
+        "Dark",
+        "Dim surfaces that are easy on the eyes.",
+    ),
     (ThemeMode::System, "System", "Follow the OS appearance."),
 ];
 

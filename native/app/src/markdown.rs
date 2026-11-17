@@ -10,9 +10,9 @@
 use std::ops::Range;
 
 use gpui::{
-    prelude::*, AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveText, SharedString, StrikethroughStyle, StyledText, TextAlign, UnderlineStyle, div,
-    px, rems, rgb, rgba,
+    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText,
+    SharedString, StrikethroughStyle, StyledText, TextAlign, UnderlineStyle, div, prelude::*, px,
+    rems, rgb, rgba,
 };
 
 use crate::theme;
@@ -116,9 +116,15 @@ fn fnv1a(s: &str) -> u64 {
 // ---------------------------------------------------------------------------
 
 enum Block {
-    Heading { level: usize, text: String },
+    Heading {
+        level: usize,
+        text: String,
+    },
     Paragraph(String),
-    Code { language: Option<String>, code: String },
+    Code {
+        language: Option<String>,
+        code: String,
+    },
     Quote(Vec<Block>),
     List(Vec<ListItem>),
     Table(Table),
@@ -232,14 +238,15 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             }
             i += 2;
             let mut rows = Vec::new();
-            while i < lines.len()
-                && !lines[i].trim().is_empty()
-                && lines[i].contains('|')
-            {
+            while i < lines.len() && !lines[i].trim().is_empty() && lines[i].contains('|') {
                 rows.push(split_table_row(lines[i]));
                 i += 1;
             }
-            blocks.push(Block::Table(Table { header, aligns, rows }));
+            blocks.push(Block::Table(Table {
+                header,
+                aligns,
+                rows,
+            }));
             continue;
         }
 
@@ -504,12 +511,10 @@ fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
             .text_color(theme::fg())
             .child(inline_element(text, ctx))
             .into_any_element(),
-        Block::Code { language, code } => {
-            div()
-                .mt(gap)
-                .child(render_code_block(code, language.as_deref()))
-                .into_any_element()
-        }
+        Block::Code { language, code } => div()
+            .mt(gap)
+            .child(render_code_block(code, language.as_deref()))
+            .into_any_element(),
         Block::Quote(inner) => div()
             .mt(gap)
             .border_l_2()
@@ -579,12 +584,16 @@ fn render_list(items: &[ListItem], first: bool, ctx: &mut RenderCtx) -> AnyEleme
                             theme::fg_muted()
                         })
                         .when(checked, |d| {
-                            d.bg(theme::primary()).flex().items_center().justify_center().child(
-                                div()
-                                    .text_size(px(9.))
-                                    .text_color(theme::canvas())
-                                    .child("✓"),
-                            )
+                            d.bg(theme::primary())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_size(px(9.))
+                                        .text_color(theme::canvas())
+                                        .child("✓"),
+                                )
                         }),
                 )
                 .into_any_element(),
@@ -749,12 +758,7 @@ fn find_underscore_close(rest: &str) -> Option<usize> {
 }
 
 /// Recursively scan `src`, appending flat (text, style) spans to `out`.
-fn parse_inline(
-    src: &str,
-    style: &InlineStyle,
-    depth: u8,
-    out: &mut Vec<(String, InlineStyle)>,
-) {
+fn parse_inline(src: &str, style: &InlineStyle, depth: u8, out: &mut Vec<(String, InlineStyle)>) {
     let mut plain = String::new();
     let mut i = 0;
 
@@ -825,7 +829,9 @@ fn parse_inline(
             }
 
             // Autolink: `<https://…>` / `<mailto:…>`.
-            if c == '<' && let Some(end) = rest.find('>') {
+            if c == '<'
+                && let Some(end) = rest.find('>')
+            {
                 let inner = &rest[1..end];
                 if (inner.starts_with("http://")
                     || inner.starts_with("https://")
@@ -993,8 +999,7 @@ fn inline_element(src: &str, ctx: &mut RenderCtx) -> AnyElement {
     if laid.links.is_empty() {
         styled.into_any_element()
     } else {
-        let (ranges, urls): (Vec<Range<usize>>, Vec<SharedString>) =
-            laid.links.into_iter().unzip();
+        let (ranges, urls): (Vec<Range<usize>>, Vec<SharedString>) = laid.links.into_iter().unzip();
         InteractiveText::new(ctx.next_id(), styled)
             .on_click(ranges, move |ix, _window, cx| cx.open_url(&urls[ix]))
             .into_any_element()
@@ -1022,18 +1027,71 @@ fn syn_number() -> Hsla {
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
     "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
-    "use", "where", "while",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
 ];
 
 const JS_KEYWORDS: &[&str] = &[
-    "abstract", "arguments", "async", "await", "break", "case", "catch", "class", "const",
-    "continue", "debugger", "declare", "default", "delete", "do", "else", "enum", "export",
-    "extends", "false", "finally", "for", "from", "function", "get", "if", "implements", "import",
-    "in", "infer", "instanceof", "interface", "keyof", "let", "namespace", "new", "null", "of",
-    "private", "protected", "public", "readonly", "return", "satisfies", "set", "static", "super",
-    "switch", "this", "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while",
-    "with", "yield",
+    "abstract",
+    "arguments",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "declare",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "infer",
+    "instanceof",
+    "interface",
+    "keyof",
+    "let",
+    "namespace",
+    "new",
+    "null",
+    "of",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "return",
+    "satisfies",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 const PY_KEYWORDS: &[&str] = &[
@@ -1044,9 +1102,10 @@ const PY_KEYWORDS: &[&str] = &[
 ];
 
 const SH_KEYWORDS: &[&str] = &[
-    "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "case", "esac", "while", "until",
-    "function", "select", "echo", "cd", "export", "local", "readonly", "return", "exit", "set",
-    "shift", "source", "eval", "exec", "trap", "wait", "read", "printf", "test", "true", "false",
+    "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "case", "esac", "while",
+    "until", "function", "select", "echo", "cd", "export", "local", "readonly", "return", "exit",
+    "set", "shift", "source", "eval", "exec", "trap", "wait", "read", "printf", "test", "true",
+    "false",
 ];
 
 const JSON_KEYWORDS: &[&str] = &["true", "false", "null"];
@@ -1229,7 +1288,9 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
         let c = rest.chars().next().unwrap();
 
         // TOML `[section]` headers.
-        if spec.section_headers && c == '[' && at_line_start
+        if spec.section_headers
+            && c == '['
+            && at_line_start
             && let Some(close) = rest.find(']')
         {
             push(TokenKind::Keyword, i..i + close + 1);
@@ -1327,7 +1388,8 @@ mod tests {
 
     #[test]
     fn parses_block_structure() {
-        let md = "# Title\n\npara one\ntwo\n\n```rust\nlet x = 1;\n```\n\n- a\n- b\n\n> quoted\n\n---\n";
+        let md =
+            "# Title\n\npara one\ntwo\n\n```rust\nlet x = 1;\n```\n\n- a\n- b\n\n> quoted\n\n---\n";
         let blocks = parse_blocks(md);
         assert!(matches!(blocks[0], Block::Heading { level: 1, .. }));
         if let Block::Paragraph(t) = &blocks[1] {

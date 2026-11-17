@@ -12,12 +12,12 @@ use gpui::{
     Window, div, prelude::*, px, rgb,
 };
 
+use crate::AppView;
 use crate::config::SavedEnvironment;
 use crate::model::ConnectionStatus;
 use crate::net::{ClientCommand, ServerEndpoint};
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
-use crate::AppView;
 
 #[derive(Default)]
 pub struct State {
@@ -176,27 +176,24 @@ impl AppView {
 
         // Keep the draft_* mirrors in sync so `&self` render can gate the Add
         // button on a plausible URL.
-        self.env_state.subs.push(cx.observe(
-            &label_field,
-            |this, field, cx| {
+        self.env_state
+            .subs
+            .push(cx.observe(&label_field, |this, field, cx| {
                 this.env_state.draft_label = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
-        self.env_state.subs.push(cx.observe(
-            &url_field,
-            |this, field, cx| {
+            }));
+        self.env_state
+            .subs
+            .push(cx.observe(&url_field, |this, field, cx| {
                 this.env_state.draft_url = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
-        self.env_state.subs.push(cx.observe(
-            &token_field,
-            |this, field, cx| {
+            }));
+        self.env_state
+            .subs
+            .push(cx.observe(&token_field, |this, field, cx| {
                 this.env_state.draft_token = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
+            }));
 
         // Enter in any field submits the whole form.
         for field in [&label_field, &url_field, &token_field] {
@@ -320,8 +317,7 @@ impl AppView {
     ) {
         let url = url.trim().to_string();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            self.env_state.error =
-                Some("URL must start with http:// or https://".into());
+            self.env_state.error = Some("URL must start with http:// or https://".into());
             if let Some((field, text)) = restore {
                 set_field_text(&field, &text, cx);
             }
@@ -453,7 +449,12 @@ impl AppView {
                         .rounded_full()
                         .bg(dot_color),
                 )
-                .child(div().flex_none().text_color(theme::fg()).child(status_label))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme::fg())
+                        .child(status_label),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -628,8 +629,7 @@ impl AppView {
                 .any(|e| &e.http_url == url)
         });
         if let Some(url) = live_url.filter(|_| !live_is_saved) {
-            let from_env =
-                ServerEndpoint::from_env().is_some_and(|e| e.http_url == url);
+            let from_env = ServerEndpoint::from_env().is_some_and(|e| e.http_url == url);
             let label = if from_env {
                 "Current (from environment)"
             } else {
@@ -687,12 +687,7 @@ impl AppView {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::fg_muted())
-                                    .child(caption),
-                            )
+                            .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
                             .child(
                                 div()
                                     .px_2()
@@ -710,8 +705,7 @@ impl AppView {
             }
 
             let draft_url = self.env_state.draft_url.trim();
-            let url_ok =
-                draft_url.starts_with("http://") || draft_url.starts_with("https://");
+            let url_ok = draft_url.starts_with("http://") || draft_url.starts_with("https://");
             let mut add_button = div()
                 .id("env-add-submit")
                 .px_3()
@@ -772,7 +766,9 @@ impl AppView {
                         )
                     }),
             );
-            section = section.child(env_group_label("New environment")).child(form);
+            section = section
+                .child(env_group_label("New environment"))
+                .child(form);
         } else {
             section = section.child(
                 div().pt_3().flex().child(

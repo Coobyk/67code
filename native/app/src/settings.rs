@@ -194,9 +194,7 @@ impl AppView {
                     .rounded_md()
                     .text_sm()
                     .cursor_pointer()
-                    .when(active, |s| {
-                        s.bg(theme::selected()).text_color(theme::fg())
-                    })
+                    .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
                     .when(!active, |s| {
                         s.text_color(theme::fg_muted())
                             .hover(|s| s.bg(theme::hover()))
@@ -320,12 +318,9 @@ impl AppView {
                     .rounded_md()
                     .text_sm()
                     .cursor_pointer()
-                    .when(active, |s| {
-                        s.bg(theme::selected()).text_color(theme::fg())
-                    })
+                    .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
                     .when(!active, |s| {
-                        s.text_color(theme::fg())
-                            .hover(|s| s.bg(theme::hover()))
+                        s.text_color(theme::fg()).hover(|s| s.bg(theme::hover()))
                     })
                     .on_mouse_down(
                         MouseButton::Left,

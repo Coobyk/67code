@@ -556,17 +556,11 @@ impl AppView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _window, cx| {
-                            this.acp_state.project_menu_open =
-                                !this.acp_state.project_menu_open;
+                            this.acp_state.project_menu_open = !this.acp_state.project_menu_open;
                             cx.notify();
                         }),
                     )
-                    .child(
-                        div()
-                            .max_w(px(160.))
-                            .truncate()
-                            .child(project_title),
-                    )
+                    .child(div().max_w(px(160.)).truncate().child(project_title))
                     .child(div().text_color(theme::fg_muted()).child("▾")),
             );
 
@@ -578,16 +572,17 @@ impl AppView {
                 "List sessions"
             };
             let list_enabled = connected && !state.loading && project_id.is_some();
-            controls = controls.child(
-                acp_button("acp-list", list_label, list_enabled).when(list_enabled, |s| {
+            controls = controls.child(acp_button("acp-list", list_label, list_enabled).when(
+                list_enabled,
+                |s| {
                     s.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _window, cx| {
                             this.acp_load_sessions(None, cx);
                         }),
                     )
-                }),
-            );
+                },
+            ));
         }
 
         section = section.child(
@@ -709,10 +704,8 @@ impl AppView {
                 let imported = session.imported_thread_id.is_some();
                 let importing_this =
                     state.importing.as_deref() == Some(session.session_id.as_str());
-                let deleting_this =
-                    state.deleting.as_deref() == Some(session.session_id.as_str());
-                let armed =
-                    state.confirm_delete.as_deref() == Some(session.session_id.as_str());
+                let deleting_this = state.deleting.as_deref() == Some(session.session_id.as_str());
+                let armed = state.confirm_delete.as_deref() == Some(session.session_id.as_str());
 
                 let import_label = if imported {
                     "Imported"
@@ -721,23 +714,18 @@ impl AppView {
                 } else {
                     "Import"
                 };
-                let import_enabled =
-                    can_import && !imported && state.importing.is_none();
+                let import_enabled = can_import && !imported && state.importing.is_none();
 
                 let mut left = div()
                     .min_w_0()
                     .flex_1()
                     .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme::fg())
-                            .child(
-                                session
-                                    .title
-                                    .clone()
-                                    .unwrap_or_else(|| session.session_id.clone()),
-                            ),
+                        div().truncate().text_xs().text_color(theme::fg()).child(
+                            session
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| session.session_id.clone()),
+                        ),
                     )
                     .child(
                         div()
@@ -783,8 +771,7 @@ impl AppView {
                 buttons = buttons.child(import_btn);
 
                 if state.can_delete {
-                    let delete_enabled =
-                        !imported && state.deleting.is_none();
+                    let delete_enabled = !imported && state.deleting.is_none();
                     let delete_label = if deleting_this {
                         "Deleting…"
                     } else if armed {
@@ -831,19 +818,13 @@ impl AppView {
                         .justify_between()
                         .gap_3()
                         .py_2()
-                        .when(index > 0, |s| {
-                            s.border_t_1().border_color(theme::border())
-                        })
+                        .when(index > 0, |s| s.border_t_1().border_color(theme::border()))
                         .child(left)
                         .child(buttons),
                 );
             }
             section = section.child(list);
-        } else if state.listed
-            && !state.loading
-            && state.error.is_none()
-            && has_projects
-        {
+        } else if state.listed && !state.loading && state.error.is_none() && has_projects {
             section = section.child(hint("No sessions found for this project."));
         }
 
@@ -854,7 +835,11 @@ impl AppView {
                 div().flex().child(
                     acp_button(
                         "acp-load-more",
-                        if state.loading { "Loading…" } else { "Load more" },
+                        if state.loading {
+                            "Loading…"
+                        } else {
+                            "Load more"
+                        },
                         more_enabled,
                     )
                     .when(more_enabled, |s| {

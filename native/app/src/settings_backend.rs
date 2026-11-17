@@ -210,12 +210,7 @@ fn labeled_field(caption: &'static str, field: &Entity<TextField>) -> gpui::Div 
         .flex()
         .flex_col()
         .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme::fg_muted())
-                .child(caption),
-        )
+        .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
         .child(
             div()
                 .px_2()
@@ -331,8 +326,12 @@ fn parse_schedule(text: &str) -> Result<Value, String> {
             && stamp.as_bytes()[7] == b'-'
             && stamp.ends_with('Z')
             && stamp[..4].parse::<i32>().is_ok()
-            && stamp[5..7].parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
-            && stamp[8..10].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d));
+            && stamp[5..7]
+                .parse::<u8>()
+                .is_ok_and(|m| (1..=12).contains(&m))
+            && stamp[8..10]
+                .parse::<u8>()
+                .is_ok_and(|d| (1..=31).contains(&d));
         if !ok {
             return Err("once needs a date+time like 2026-03-01 09:30.".to_string());
         }
@@ -354,7 +353,9 @@ fn parse_schedule(text: &str) -> Result<Value, String> {
     if unit_ms > 0 {
         return match num_part.parse::<i64>() {
             Ok(n) if n > 0 => Ok(json!({ "type": "interval", "everyMs": n * unit_ms })),
-            _ => Err(format!("Unparsable interval '{spec}' — try 30m, 2h, 1d, 1w.")),
+            _ => Err(format!(
+                "Unparsable interval '{spec}' — try 30m, 2h, 1d, 1w."
+            )),
         };
     }
     // fixed_time: `daily HH:MM` / `at HH:MM` / bare `HH:MM` / `mon,wed HH:MM`.
@@ -567,8 +568,7 @@ impl AppView {
         if state.stream_started && state.stream_id.is_some() {
             return;
         }
-        let Some((stream_id, rx)) = self.open_stream("scheduledTasks.subscribe", json!({}))
-        else {
+        let Some((stream_id, rx)) = self.open_stream("scheduledTasks.subscribe", json!({})) else {
             self.backend_settings_state.tasks.error =
                 Some("Not connected to a server.".to_string());
             return;
@@ -644,9 +644,7 @@ impl AppView {
         if self.backend_settings_state.tasks.running.is_some() {
             return;
         }
-        let Some(rx) =
-            self.send_query("scheduledTasks.runNow", json!({ "id": id }))
-        else {
+        let Some(rx) = self.send_query("scheduledTasks.runNow", json!({ "id": id })) else {
             self.backend_toast(
                 ToastKind::Error,
                 "Could not run task",
@@ -703,8 +701,7 @@ impl AppView {
             return;
         }
         self.backend_settings_state.tasks.confirm_delete = None;
-        let Some(rx) = self.send_query("scheduledTasks.delete", json!({ "id": id }))
-        else {
+        let Some(rx) = self.send_query("scheduledTasks.delete", json!({ "id": id })) else {
             self.backend_toast(
                 ToastKind::Error,
                 "Could not delete task",
@@ -745,19 +742,20 @@ impl AppView {
             return;
         }
         let title_field = cx.new(|cx| TextField::new("Name (e.g. Nightly review)", cx));
-        let prompt_field = cx.new(|cx| {
-            TextField::new("Prompt the task sends to a new thread", cx)
-        });
+        let prompt_field = cx.new(|cx| TextField::new("Prompt the task sends to a new thread", cx));
         let schedule_field = cx.new(|cx| {
-            TextField::new("30m · daily 09:30 · mon,wed 09:30 · once 2026-03-01 09:30 · webhook", cx)
+            TextField::new(
+                "30m · daily 09:30 · mon,wed 09:30 · once 2026-03-01 09:30 · webhook",
+                cx,
+            )
         });
-        self.backend_settings_state.tasks.subs.push(cx.observe(
-            &title_field,
-            |this, field, cx| {
+        self.backend_settings_state
+            .tasks
+            .subs
+            .push(cx.observe(&title_field, |this, field, cx| {
                 this.backend_settings_state.tasks.draft_title = field_text(&field, cx);
                 cx.notify();
-            },
-        ));
+            }));
         self.backend_settings_state.tasks.subs.push(cx.observe(
             &prompt_field,
             |this, field, cx| {
@@ -957,8 +955,7 @@ impl AppView {
             .thread_items
             .iter()
             .filter(|i| {
-                i.kind == "secret_request"
-                    && i.raw["secretStatus"].as_str() == Some("pending")
+                i.kind == "secret_request" && i.raw["secretStatus"].as_str() == Some("pending")
             })
             .map(|i| i.id.clone())
             .collect();
@@ -1276,15 +1273,9 @@ impl AppView {
                                     }
                                     Some(UsageBucket {
                                         when,
-                                        provider: str_of(b, "provider")
-                                            .unwrap_or("?")
-                                            .to_string(),
-                                        model: str_of(b, "model")
-                                            .unwrap_or("?")
-                                            .to_string(),
-                                        input: totals["uncachedInputTokens"]
-                                            .as_u64()
-                                            .unwrap_or(0),
+                                        provider: str_of(b, "provider").unwrap_or("?").to_string(),
+                                        model: str_of(b, "model").unwrap_or("?").to_string(),
+                                        input: totals["uncachedInputTokens"].as_u64().unwrap_or(0),
                                         cache_read: totals["cachedInputTokens"]
                                             .as_u64()
                                             .unwrap_or(0),
@@ -1292,9 +1283,7 @@ impl AppView {
                                             .as_u64()
                                             .unwrap_or(0),
                                         output: totals["outputTokens"].as_u64().unwrap_or(0),
-                                        reasoning: totals["reasoningTokens"]
-                                            .as_u64()
-                                            .unwrap_or(0),
+                                        reasoning: totals["reasoningTokens"].as_u64().unwrap_or(0),
                                         records: b["records"].as_u64().unwrap_or(0),
                                         sessions: b["sessions"].as_u64().unwrap_or(0),
                                     })
@@ -1302,8 +1291,7 @@ impl AppView {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    state.pricing_status = str_of(&value["pricing"], "status")
-                        .map(str::to_owned);
+                    state.pricing_status = str_of(&value["pricing"], "status").map(str::to_owned);
                     state.read_at = str_of(value, "readAt").map(str::to_owned);
                 } else {
                     state.error = Some(exit_message(&exit));
@@ -1369,9 +1357,7 @@ impl AppView {
 
     pub(crate) fn render_tasks_section(&self, cx: &mut Context<Self>) -> Div {
         // First render on this section opens the subscribe stream.
-        if self.backend_settings_state.tasks.stream_id.is_none()
-            && self.commands.is_some()
-        {
+        if self.backend_settings_state.tasks.stream_id.is_none() && self.commands.is_some() {
             cx.spawn(async move |this, cx| {
                 let _ = this.update(cx, |this, cx| this.tasks_ensure_stream(cx));
             })
@@ -1399,9 +1385,7 @@ impl AppView {
                 .state
                 .projects
                 .iter()
-                .find(|p| {
-                    Some(p.id.as_ref()) == self.tasks_project_id().as_deref()
-                })
+                .find(|p| Some(p.id.as_ref()) == self.tasks_project_id().as_deref())
                 .map(|p| p.name.to_string())
                 .unwrap_or_else(|| "Select project".to_string());
             let picker_open = state.project_menu_open;
@@ -1454,8 +1438,7 @@ impl AppView {
                     .py_1();
                 for (index, project) in self.state.projects.iter().enumerate() {
                     let pid = project.id.to_string();
-                    let active =
-                        self.tasks_project_id().as_deref() == Some(pid.as_str());
+                    let active = self.tasks_project_id().as_deref() == Some(pid.as_str());
                     menu = menu.child(
                         div()
                             .id(("task-project", index))
@@ -1511,7 +1494,11 @@ impl AppView {
                     .child(
                         row_button(
                             "task-create",
-                            if state.saving { "Saving…" } else { "Create task" },
+                            if state.saving {
+                                "Saving…"
+                            } else {
+                                "Create task"
+                            },
                             can_save,
                         )
                         .when(can_save, |s| {
@@ -1523,17 +1510,15 @@ impl AppView {
                             )
                         }),
                     )
-                    .child(
-                        row_button("task-cancel", "Cancel", true).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                let state = &mut this.backend_settings_state.tasks;
-                                state.form_open = false;
-                                state.form_error = None;
-                                cx.notify();
-                            }),
-                        ),
-                    ),
+                    .child(row_button("task-cancel", "Cancel", true).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            let state = &mut this.backend_settings_state.tasks;
+                            state.form_open = false;
+                            state.form_error = None;
+                            cx.notify();
+                        }),
+                    )),
             );
             if let Some(error) = &state.form_error {
                 form = form.child(
@@ -1549,21 +1534,17 @@ impl AppView {
             section = section.child(form);
         } else {
             let add_enabled = connected && !self.state.projects.is_empty();
-            section = section.child(
-                div().flex().child(
-                    row_button("task-new", "+ New scheduled task", add_enabled).when(
-                        add_enabled,
-                        |s| {
-                            s.on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, window, cx| {
-                                    this.open_task_form(window, cx)
-                                }),
-                            )
-                        },
-                    ),
+            section = section.child(div().flex().child(
+                row_button("task-new", "+ New scheduled task", add_enabled).when(
+                    add_enabled,
+                    |s| {
+                        s.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, window, cx| this.open_task_form(window, cx)),
+                        )
+                    },
                 ),
-            );
+            ));
         }
 
         if let Some(error) = &state.error {
@@ -1588,8 +1569,7 @@ impl AppView {
                 let id = task.id.clone();
                 let enabled = task.enabled;
                 let running_this = state.running.as_deref() == Some(task.id.as_str());
-                let toggling_this =
-                    state.toggling.as_deref() == Some(task.id.as_str());
+                let toggling_this = state.toggling.as_deref() == Some(task.id.as_str());
                 let armed = state.confirm_delete.as_deref() == Some(task.id.as_str());
                 let project_name = self
                     .state
@@ -1689,9 +1669,8 @@ impl AppView {
                 } else {
                     "Enable"
                 };
-                let toggle_enabled = connected
-                    && state.toggling.is_none()
-                    && task.blocked.is_none();
+                let toggle_enabled =
+                    connected && state.toggling.is_none() && task.blocked.is_none();
                 let toggle_id = id.clone();
                 buttons = buttons.child(
                     div()
@@ -1707,11 +1686,7 @@ impl AppView {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _ev, _window, cx| {
-                                        this.tasks_set_enabled(
-                                            toggle_id.clone(),
-                                            !enabled,
-                                            cx,
-                                        );
+                                        this.tasks_set_enabled(toggle_id.clone(), !enabled, cx);
                                     }),
                                 )
                         })
@@ -1747,7 +1722,11 @@ impl AppView {
                         .when(!run_enabled, |s| {
                             s.text_color(theme::fg_muted()).opacity(0.7)
                         })
-                        .child(if running_this { "Running…" } else { "Run now" }),
+                        .child(if running_this {
+                            "Running…"
+                        } else {
+                            "Run now"
+                        }),
                 );
 
                 let delete_label = if armed { "Confirm" } else { "Delete" };
@@ -1785,9 +1764,7 @@ impl AppView {
                         .justify_between()
                         .gap_3()
                         .py_2()
-                        .when(index > 0, |s| {
-                            s.border_t_1().border_color(theme::border())
-                        })
+                        .when(index > 0, |s| s.border_t_1().border_color(theme::border()))
                         .child(left)
                         .child(buttons),
                 );
@@ -1860,16 +1837,13 @@ impl AppView {
             let delivery_file = item.raw["delivery"].as_str() == Some("file");
             let answering_this = state.answering.as_deref() == Some(item_id.as_str());
 
-            let mut left = div()
-                .min_w_0()
-                .flex_1()
-                .child(
-                    div()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme::fg())
-                        .child(label.to_string()),
-                );
+            let mut left = div().min_w_0().flex_1().child(
+                div()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::fg())
+                    .child(label.to_string()),
+            );
             if !reason.is_empty() {
                 left = left.child(
                     div()
@@ -1969,9 +1943,7 @@ impl AppView {
                                         }),
                                     )
                             })
-                            .when(!save_ok, |s| {
-                                s.text_color(theme::fg_muted()).opacity(0.7)
-                            })
+                            .when(!save_ok, |s| s.text_color(theme::fg_muted()).opacity(0.7))
                             .child(if answering_this { "…" } else { "Save" }),
                     )
                     .child(
@@ -2006,9 +1978,7 @@ impl AppView {
                     .justify_between()
                     .gap_3()
                     .py_2()
-                    .when(index > 0, |s| {
-                        s.border_t_1().border_color(theme::border())
-                    })
+                    .when(index > 0, |s| s.border_t_1().border_color(theme::border()))
                     .child(left)
                     .child(right),
             );
@@ -2035,9 +2005,24 @@ impl AppView {
         if let Some(p) = &state.process {
             let proc0 = &p["processes"][0];
             let rows: Vec<(&'static str, String)> = vec![
-                ("PID", proc0["pid"].as_i64().map(|n| n.to_string()).unwrap_or_default()),
-                ("Parent PID", proc0["ppid"].as_i64().map(|n| n.to_string()).unwrap_or_default()),
-                ("Uptime", proc0["elapsed"].as_str().unwrap_or("").to_string()),
+                (
+                    "PID",
+                    proc0["pid"]
+                        .as_i64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "Parent PID",
+                    proc0["ppid"]
+                        .as_i64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "Uptime",
+                    proc0["elapsed"].as_str().unwrap_or("").to_string(),
+                ),
                 (
                     "CPU",
                     proc0["cpuPercent"]
@@ -2106,7 +2091,10 @@ impl AppView {
                 ),
                 (
                     "CPU count",
-                    h["cpuCount"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+                    h["cpuCount"]
+                        .as_u64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                 ),
                 (
                     "Memory",
@@ -2115,7 +2103,11 @@ impl AppView {
                         h["totalMemoryBytes"].as_u64(),
                     ) {
                         (Some(avail), Some(total)) => {
-                            format!("{} available of {}", format_bytes(avail), format_bytes(total))
+                            format!(
+                                "{} available of {}",
+                                format_bytes(avail),
+                                format_bytes(total)
+                            )
                         }
                         _ => "n/a".to_string(),
                     },
@@ -2237,15 +2229,17 @@ impl AppView {
                 .child(
                     row_button(
                         "diag-refresh",
-                        if state.loading { "Loading…" } else { "Refresh" },
+                        if state.loading {
+                            "Loading…"
+                        } else {
+                            "Refresh"
+                        },
                         refresh_enabled,
                     )
                     .when(refresh_enabled, |s| {
                         s.on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.diagnostics_load(cx)
-                            }),
+                            cx.listener(|this, _ev, _window, cx| this.diagnostics_load(cx)),
                         )
                     }),
                 )
@@ -2262,9 +2256,7 @@ impl AppView {
                     .when(cleanup_enabled, |s| {
                         s.on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.diagnostics_cleanup(cx)
-                            }),
+                            cx.listener(|this, _ev, _window, cx| this.diagnostics_cleanup(cx)),
                         )
                     }),
                 )
@@ -2281,9 +2273,7 @@ impl AppView {
                     .when(reclaim_enabled, |s| {
                         s.on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.diagnostics_reclaim(cx)
-                            }),
+                            cx.listener(|this, _ev, _window, cx| this.diagnostics_reclaim(cx)),
                         )
                     }),
                 ),
@@ -2322,9 +2312,7 @@ impl AppView {
                     .rounded_md()
                     .text_xs()
                     .cursor_pointer()
-                    .when(active, |s| {
-                        s.bg(theme::selected()).text_color(theme::fg())
-                    })
+                    .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
                     .when(!active, |s| {
                         s.text_color(theme::fg_muted())
                             .hover(|s| s.bg(theme::hover()))
@@ -2348,7 +2336,11 @@ impl AppView {
         controls = controls.child(
             row_button(
                 "usage-refresh",
-                if state.loading { "Loading…" } else { "Refresh" },
+                if state.loading {
+                    "Loading…"
+                } else {
+                    "Refresh"
+                },
                 refresh_enabled,
             )
             .when(refresh_enabled, |s| {
@@ -2372,9 +2364,7 @@ impl AppView {
             .when(rates_enabled, |s| {
                 s.on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _ev, _window, cx| {
-                        this.usage_refresh_rates(cx)
-                    }),
+                    cx.listener(|this, _ev, _window, cx| this.usage_refresh_rates(cx)),
                 )
             }),
         );
@@ -2435,9 +2425,7 @@ impl AppView {
                         .items_center()
                         .gap_2()
                         .py_1p5()
-                        .when(index > 0, |s| {
-                            s.border_t_1().border_color(theme::border())
-                        })
+                        .when(index > 0, |s| s.border_t_1().border_color(theme::border()))
                         .child(
                             div()
                                 .w(px(150.))

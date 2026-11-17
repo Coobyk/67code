@@ -304,8 +304,7 @@ impl AppView {
             url = DEFAULT_ENDPOINT.to_string();
         }
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            self.welcome_state.error =
-                Some("URL must start with http:// or https://".into());
+            self.welcome_state.error = Some("URL must start with http:// or https://".into());
             if let Some((field, text)) = restore {
                 set_field_text(&field, &text, cx);
             }
@@ -494,12 +493,7 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .child(caption),
-                        )
+                        .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
                         .child(
                             div()
                                 .px_2()
@@ -571,26 +565,24 @@ impl AppView {
             );
         }
 
-        actions = actions
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("welcome-skip")
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(theme::fg_muted())
-                    .hover(|s| s.text_color(theme::fg()))
-                    .child("Skip — explore offline")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev, _window, cx| {
-                            this.welcome_skip(cx);
-                        }),
-                    ),
-            );
+        actions = actions.child(div().flex_1()).child(
+            div()
+                .id("welcome-skip")
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(theme::fg_muted())
+                .hover(|s| s.text_color(theme::fg()))
+                .child("Skip — explore offline")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.welcome_skip(cx);
+                    }),
+                ),
+        );
 
         let mut step_connect = step("3", "Connect", actions);
         if let Some(error) = self.welcome_state.error.clone() {

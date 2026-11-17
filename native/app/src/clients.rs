@@ -13,10 +13,10 @@ use gpui::{
 };
 use serde_json::{Value, json};
 
+use crate::AppView;
 use crate::net::ServerEndpoint;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
-use crate::AppView;
 
 const DANGER: u32 = 0xf87171;
 const DANGER_BORDER: u32 = 0x7a2e2e;
@@ -307,10 +307,7 @@ fn humanize(seconds: i64) -> String {
 /// "5m ago" / "in 45m" for an ISO timestamp, or None when unparseable.
 fn relative_time(iso: &str) -> Option<String> {
     let ts = parse_iso_epoch(iso)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let diff = now - ts;
     Some(if diff < -60 {
         format!("in {}", humanize(-diff))
@@ -410,10 +407,7 @@ impl AppView {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            state.pairing_links = snap["pairingLinks"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            state.pairing_links = snap["pairingLinks"].as_array().cloned().unwrap_or_default();
             state.loaded = true;
             cx.notify();
             return;
@@ -661,8 +655,7 @@ impl AppView {
                         if let Some(credential) = credential {
                             // Same URL shape the web builds via
                             // resolveDesktopPairingUrl: <endpoint>/pair#token=…
-                            state.created_url =
-                                Some(format!("{base}/pair#token={credential}"));
+                            state.created_url = Some(format!("{base}/pair#token={credential}"));
                             state.copied = false;
                             state.create_open = false;
                         } else {
@@ -692,9 +685,9 @@ impl AppView {
         // Device bits · scope summary on line 2; created/last-seen on line 3.
         let mut detail = device_bits(session);
         detail.push(scope_summary(session));
-        let mut times: Vec<String> = [
-            session["createdAt"].as_str().or_else(|| session["issuedAt"].as_str()),
-        ]
+        let mut times: Vec<String> = [session["createdAt"]
+            .as_str()
+            .or_else(|| session["issuedAt"].as_str())]
         .into_iter()
         .flatten()
         .filter_map(|iso| relative_time(iso).map(|r| format!("created {r}")))
@@ -808,20 +801,14 @@ impl AppView {
         let id = link["id"].as_str().unwrap_or_default().to_string();
         // The web skips expired links entirely.
         if let Some(expires) = link["expiresAt"].as_str().and_then(parse_iso_epoch) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_secs() as i64;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
             if expires <= now {
                 return None;
             }
         }
         let revoking = state.revoking.as_deref() == Some(id.as_str());
 
-        let label = link["label"]
-            .as_str()
-            .unwrap_or("Pairing link")
-            .to_string();
+        let label = link["label"].as_str().unwrap_or("Pairing link").to_string();
         let mut detail = Vec::new();
         if let Some(r) = link["expiresAt"].as_str().and_then(relative_time) {
             detail.push(format!("expires {r}"));
@@ -933,18 +920,13 @@ impl AppView {
             );
         }
 
-        let mut presets = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .pb_1()
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Permissions — limit what the paired client can do."),
-            );
+        let mut presets = div().flex().items_center().gap_2().pb_1().child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .child("Permissions — limit what the paired client can do."),
+        );
         for (index, (name, scopes)) in [
             ("Read only", READ_ONLY_SCOPES),
             ("Standard", STANDARD_SCOPES),
@@ -1014,7 +996,11 @@ impl AppView {
 
         let create_enabled = !state.creating && !state.draft_scopes.is_empty();
         let mut create = action_button(
-            if state.creating { "Creating…" } else { "Create link" },
+            if state.creating {
+                "Creating…"
+            } else {
+                "Create link"
+            },
             create_enabled,
             false,
         )
@@ -1153,7 +1139,11 @@ impl AppView {
         }
         let create_enabled = connected && !state.creating;
         let mut create = action_button(
-            if state.create_open { "Close" } else { "Create link" },
+            if state.create_open {
+                "Close"
+            } else {
+                "Create link"
+            },
             create_enabled,
             false,
         )
@@ -1184,13 +1174,7 @@ impl AppView {
         );
 
         if let Some(error) = state.error.clone() {
-            section = section.child(
-                div()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(rgb(DANGER))
-                    .child(error),
-            );
+            section = section.child(div().pt_2().text_xs().text_color(rgb(DANGER)).child(error));
         }
 
         if state.create_open {

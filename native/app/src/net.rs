@@ -115,23 +115,44 @@ pub enum ShellEvent {
     Connected,
     Snapshot(ShellSnapshot),
     ProjectUpserted(ShellProject),
-    ProjectRemoved { project_id: String },
-    ThreadUpserted { thread: ShellThread },
-    ThreadRemoved { thread_id: String },
-    ThreadSnapshot { items: Vec<TurnItemView> },
-    ThreadItemUpdated { item: TurnItemView },
-    OlderSettledThreads { threads: Vec<ShellThread> },
+    ProjectRemoved {
+        project_id: String,
+    },
+    ThreadUpserted {
+        thread: ShellThread,
+    },
+    ThreadRemoved {
+        thread_id: String,
+    },
+    ThreadSnapshot {
+        items: Vec<TurnItemView>,
+    },
+    ThreadItemUpdated {
+        item: TurnItemView,
+    },
+    OlderSettledThreads {
+        threads: Vec<ShellThread>,
+    },
     /// Enrichment refresh: `resolvedRepositoryIdentityRoots` is present, so the
     /// snapshot carries project updates only — threads must be preserved.
-    ProjectsRefreshed { projects: Vec<ShellProject> },
+    ProjectsRefreshed {
+        projects: Vec<ShellProject>,
+    },
     /// Raw auth-access stream value (`{type:"clientUpserted"|"clientRemoved"|
     /// "snapshot"|…, payload}`); the clients surface folds these into state.
-    AuthAccessChange { value: Value },
+    AuthAccessChange {
+        value: Value,
+    },
     /// Chunk values from a `ClientCommand::Subscribe` stream, raw and
     /// unparsed — the owning surface decodes its own event shapes.
-    StreamChunk { stream_id: String, values: Vec<Value> },
+    StreamChunk {
+        stream_id: String,
+        values: Vec<Value>,
+    },
     /// The stream exited (success, failure, or socket drop).
-    StreamEnd { stream_id: String },
+    StreamEnd {
+        stream_id: String,
+    },
     Error(String),
     Disconnected(String),
 }
@@ -143,9 +164,13 @@ pub enum ClientCommand {
     /// `subscribeAuthAccess` stream — authorized clients + pairing links.
     /// Chunk values arrive as ShellEvent::AuthAccessChange.
     SubscribeAuthAccess,
-    SubscribeThread { thread_id: String },
+    SubscribeThread {
+        thread_id: String,
+    },
     /// A raw `OrchestrationV2Command` JSON payload.
-    Dispatch { command: Value },
+    Dispatch {
+        command: Value,
+    },
     /// Request/response RPC (`{"_tag":"Request","tag":<tag>}`); the reply
     /// sender resolves once with the `Exit` frame's value or an error object.
     Query {
@@ -162,19 +187,29 @@ pub enum ClientCommand {
         stream_id: String,
     },
     /// Interrupt an open `Subscribe` stream by its `stream_id`.
-    InterruptStream { stream_id: String },
+    InterruptStream {
+        stream_id: String,
+    },
     /// Drop the current socket (or pending backoff) and reconnect now.
     Reconnect,
     /// Point the connection loop at a different server (environment switch).
-    SwitchEndpoint { http_url: String, token: String },
+    SwitchEndpoint {
+        http_url: String,
+        token: String,
+    },
     #[allow(dead_code)]
-    Interrupt { request_id: u64 },
+    Interrupt {
+        request_id: u64,
+    },
 }
 
 fn parse_project(v: &Value) -> ShellProject {
     ShellProject {
         id: v["id"].as_str().unwrap_or_default().to_string(),
-        title: v["title"].as_str().unwrap_or("Untitled project").to_string(),
+        title: v["title"]
+            .as_str()
+            .unwrap_or("Untitled project")
+            .to_string(),
         workspace_root: v["workspaceRoot"].as_str().unwrap_or_default().to_string(),
     }
 }
@@ -193,7 +228,12 @@ fn parse_thread(v: &Value) -> ShellThread {
         has_actionable_proposed_plan: v["hasActionableProposedPlan"].as_bool() == Some(true),
         provider_instances: v["providerInstanceHistory"]
             .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
             .unwrap_or_default(),
         pinned: v["pinned"].as_bool() == Some(true)
             || !v["pinnedOrderKey"].is_null()
@@ -231,7 +271,10 @@ fn turn_item_body(item: &Value) -> Option<String> {
     let kind = item["type"].as_str()?;
     let text = match kind {
         "user_message" | "assistant_message" | "reasoning" | "system_notice" | "error" => {
-            item["text"].as_str().or_else(|| item["message"].as_str()).map(|s| s.to_string())
+            item["text"]
+                .as_str()
+                .or_else(|| item["message"].as_str())
+                .map(|s| s.to_string())
         }
         "proposed_plan" => item["markdown"].as_str().map(|s| s.to_string()),
         "command_execution" => {
@@ -270,7 +313,10 @@ fn turn_item_body(item: &Value) -> Option<String> {
             let steps = item["steps"].as_array()?;
             let mut lines = Vec::new();
             for s in steps.iter().take(12) {
-                let title = s["content"].as_str().or_else(|| s["title"].as_str()).unwrap_or("step");
+                let title = s["content"]
+                    .as_str()
+                    .or_else(|| s["title"].as_str())
+                    .unwrap_or("step");
                 let status = s["status"].as_str().unwrap_or("pending");
                 let mark = match status {
                     "completed" => "☑",
@@ -281,7 +327,9 @@ fn turn_item_body(item: &Value) -> Option<String> {
             }
             Some(lines.join("\n"))
         }
-        "checkpoint" => item["files"].as_array().map(|f| format!("checkpoint: {} files", f.len())),
+        "checkpoint" => item["files"]
+            .as_array()
+            .map(|f| format!("checkpoint: {} files", f.len())),
         "user_input_request" => {
             let qs = item["questions"].as_array()?;
             let line = qs
@@ -292,15 +340,24 @@ fn turn_item_body(item: &Value) -> Option<String> {
             Some(line)
         }
         "approval_request" => Some(
-            item["prompt"].as_str().unwrap_or("approval requested").to_string(),
+            item["prompt"]
+                .as_str()
+                .unwrap_or("approval requested")
+                .to_string(),
         ),
-        "notification" => item["message"].as_str().or_else(|| item["text"].as_str()).map(|s| s.to_string()),
+        "notification" => item["message"]
+            .as_str()
+            .or_else(|| item["text"].as_str())
+            .map(|s| s.to_string()),
         "compaction" => Some("context compacted".to_string()),
         "subagent" => {
             let p = item["prompt"].as_str().unwrap_or("subagent");
             let mut out = format!("subagent: {}", p.chars().take(80).collect::<String>());
             if let Some(r) = item["result"].as_str() {
-                out.push_str(&format!("\n{}", r.lines().take(6).collect::<Vec<_>>().join("\n")));
+                out.push_str(&format!(
+                    "\n{}",
+                    r.lines().take(6).collect::<Vec<_>>().join("\n")
+                ));
             }
             Some(out)
         }
@@ -464,7 +521,10 @@ fn run_inner(
     deferred: &mut std::collections::VecDeque<ClientCommand>,
 ) -> Result<(), (bool, String)> {
     let ticket = mint_ticket(endpoint).map_err(|e| (false, e))?;
-    let ws_url = format!("{}/ws?wsTicket={ticket}&frameParts=1&orchestrationProtocol=2", endpoint.ws_url());
+    let ws_url = format!(
+        "{}/ws?wsTicket={ticket}&frameParts=1&orchestrationProtocol=2",
+        endpoint.ws_url()
+    );
 
     let (mut socket, _response) = tungstenite::connect(&ws_url)
         .map_err(|e| (false, format!("websocket connect failed: {e}")))?;
@@ -491,32 +551,30 @@ fn run_inner(
     let mut pending = String::new();
 
     loop {
-        let mut send_one = |socket: &mut _,
-                            subscriptions: &mut _,
-                            queries: &mut std::collections::HashMap<
-                                u64,
-                                smol::channel::Sender<Value>,
-                            >,
-                            id: u64,
-                            command: &ClientCommand|
-         -> Result<Option<String>, tungstenite::Error> {
-            match command {
-                ClientCommand::Reconnect => return Ok(Some("reconnect requested".into())),
-                ClientCommand::SwitchEndpoint { http_url, token } => {
-                    *endpoint = ServerEndpoint {
-                        http_url: http_url.clone(),
-                        token: token.clone(),
-                    };
-                    return Ok(Some("switching environment".into()));
+        let mut send_one =
+            |socket: &mut _,
+             subscriptions: &mut _,
+             queries: &mut std::collections::HashMap<u64, smol::channel::Sender<Value>>,
+             id: u64,
+             command: &ClientCommand|
+             -> Result<Option<String>, tungstenite::Error> {
+                match command {
+                    ClientCommand::Reconnect => return Ok(Some("reconnect requested".into())),
+                    ClientCommand::SwitchEndpoint { http_url, token } => {
+                        *endpoint = ServerEndpoint {
+                            http_url: http_url.clone(),
+                            token: token.clone(),
+                        };
+                        return Ok(Some("switching environment".into()));
+                    }
+                    ClientCommand::Query { reply, .. } => {
+                        queries.insert(id, reply.clone());
+                    }
+                    _ => {}
                 }
-                ClientCommand::Query { reply, .. } => {
-                    queries.insert(id, reply.clone());
-                }
-                _ => {}
-            }
-            send_command(socket, subscriptions, id, command)?;
-            Ok(None)
-        };
+                send_command(socket, subscriptions, id, command)?;
+                Ok(None)
+            };
 
         if let Some(command) = pending_commands.pop_front() {
             if let Some(reason) = send_one(
@@ -635,11 +693,9 @@ fn send_command(
             subscriptions.insert(id, SubKind::Dynamic(stream_id.clone()));
         }
         ClientCommand::InterruptStream { stream_id } => {
-            let rid = subscriptions
-                .iter()
-                .find_map(|(rid, kind)| {
-                    matches!(kind, SubKind::Dynamic(s) if s == stream_id).then_some(*rid)
-                });
+            let rid = subscriptions.iter().find_map(|(rid, kind)| {
+                matches!(kind, SubKind::Dynamic(s) if s == stream_id).then_some(*rid)
+            });
             if let Some(rid) = rid {
                 subscriptions.remove(&rid);
                 return socket.send(tungstenite::Message::Text(
@@ -708,7 +764,7 @@ fn send_command(
         // Handled in the run loop — they never produce a frame.
         ClientCommand::Reconnect | ClientCommand::SwitchEndpoint { .. } => {
             unreachable!("control commands are handled in the run loop")
-        },
+        }
         // InterruptStream emits its frame in the subscription match above.
         ClientCommand::InterruptStream { .. } => unreachable!(),
         ClientCommand::Interrupt { request_id } => json!({
@@ -743,10 +799,13 @@ fn handle_frame(
 
     for frame in frames {
         if std::env::var("C67_DEBUG").is_ok() {
-        eprintln!("[frame] tag={:?} req={:?}",
-            frame["_tag"].as_str(), frame["requestId"]);
-    }
-    match frame["_tag"].as_str() {
+            eprintln!(
+                "[frame] tag={:?} req={:?}",
+                frame["_tag"].as_str(),
+                frame["requestId"]
+            );
+        }
+        match frame["_tag"].as_str() {
             Some("Chunk") => {
                 let request_id = frame["requestId"].as_u64().unwrap_or(0);
                 // Stream chunks are windowed (8 per request): ack each one so the
@@ -764,8 +823,13 @@ fn handle_frame(
                     _ => None,
                 };
                 if std::env::var("C67_DEBUG").is_ok() {
-                    eprintln!("[chunk] req={request_id} is_thread={is_thread} kinds={:?}",
-                        frame["values"].as_array().map(|a| a.iter().map(|v| v["kind"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>()));
+                    eprintln!(
+                        "[chunk] req={request_id} is_thread={is_thread} kinds={:?}",
+                        frame["values"].as_array().map(|a| a
+                            .iter()
+                            .map(|v| v["kind"].as_str().unwrap_or("?").to_string())
+                            .collect::<Vec<_>>())
+                    );
                 }
                 if let Some(values) = frame["values"].as_array() {
                     if let Some(sid) = dynamic_stream {
@@ -786,9 +850,11 @@ fn handle_frame(
                             if std::env::var("C67_DEBUG").is_ok()
                                 && value["kind"].as_str() == Some("event")
                             {
-                                eprintln!("[ev] type={:?} parsed={}",
+                                eprintln!(
+                                    "[ev] type={:?} parsed={}",
                                     value["event"]["type"].as_str(),
-                                    parse_thread_stream_item(value).is_some());
+                                    parse_thread_stream_item(value).is_some()
+                                );
                             }
                             parse_thread_stream_item(value)
                         } else {
