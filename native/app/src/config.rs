@@ -19,6 +19,8 @@ pub struct SavedEnvironment {
 pub const MAX_PROMPT_HISTORY: usize = 50;
 /// Stashed drafts kept per project.
 pub const MAX_STASHED_DRAFTS: usize = 20;
+/// Sidebar draft threads kept per client.
+pub const MAX_DRAFT_THREADS: usize = 50;
 
 /// A file attachment parked with a stashed draft (re-staged on restore;
 /// image/text attachments are dropped since they don't serialize cheaply).
@@ -90,9 +92,33 @@ pub struct ClientConfig {
     /// survive restart, same as the web's localStorage drafts.
     #[serde(default)]
     pub draft_threads: Vec<DraftThread>,
+    /// Diff layout for diff/PR views ("stacked" | "split") — mirrors the
+    /// web's device-local `ClientSettings.diffLayout` (default "stacked").
+    #[serde(default = "default_diff_layout")]
+    pub diff_layout: String,
+    /// Ignore whitespace-only changes in diffs by default — mirrors the
+    /// web's `ClientSettings.diffIgnoreWhitespace` (default true).
+    #[serde(default = "default_true")]
+    pub diff_ignore_whitespace: bool,
+    /// Start diff files collapsed — mirrors the web's
+    /// `ClientSettings.diffFilesCollapsed` (default true).
+    #[serde(default = "default_true")]
+    pub diff_files_collapsed: bool,
+    /// Open linked pull requests / changes panels proactively — mirrors the
+    /// web's `ClientSettings.proactivePanelsEnabled` (default false).
+    #[serde(default)]
+    pub proactive_panels: bool,
 }
 
 fn default_in_app_notifications() -> bool {
+    true
+}
+
+fn default_diff_layout() -> String {
+    "stacked".to_string()
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -181,5 +207,39 @@ impl ClientConfig {
     /// How many drafts are stashed under `project`.
     pub fn stash_count(&self, project: &str) -> usize {
         self.stashed_drafts.get(project).map_or(0, Vec::len)
+    }
+
+    /// Park a sidebar draft thread (appended in creation order), capped at
+    /// `MAX_DRAFT_THREADS` (oldest dropped).
+    pub fn push_draft_thread(&mut self, draft: DraftThread) {
+        self.draft_threads.push(draft);
+        while self.draft_threads.len() > MAX_DRAFT_THREADS {
+            self.draft_threads.remove(0);
+        }
+        self.save();
+    }
+
+    /// Remove and return the draft thread with `thread_id` — opening a draft
+    /// consumes it (the live composer takes over as the editable copy).
+    pub fn take_draft_thread(&mut self, thread_id: &str) -> Option<DraftThread> {
+        let index = self
+            .draft_threads
+            .iter()
+            .position(|d| d.thread_id == thread_id)?;
+        let draft = self.draft_threads.remove(index);
+        self.save();
+        Some(draft)
+    }
+
+    /// Delete a draft thread without consuming it (the row's ✕). Returns
+    /// whether one was removed.
+    pub fn remove_draft_thread(&mut self, thread_id: &str) -> bool {
+        let before = self.draft_threads.len();
+        self.draft_threads.retain(|d| d.thread_id != thread_id);
+        let removed = self.draft_threads.len() != before;
+        if removed {
+            self.save();
+        }
+        removed
     }
 }
