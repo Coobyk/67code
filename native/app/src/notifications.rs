@@ -137,6 +137,35 @@ fn is_live_status(status: &str) -> bool {
     )
 }
 
+/// Deliver an OS-level alert per `ClientConfig.notification_mode`
+/// (`off`/`notifications`/`sound`/`notifications-and-sound`). Best-effort:
+/// silently no-ops when the platform helpers are missing (e.g. headless).
+fn os_notify(mode: &str, title: &str, body: Option<&str>) {
+    if mode.contains("notifications") {
+        let mut cmd = std::process::Command::new("notify-send");
+        cmd.arg(title);
+        if let Some(b) = body {
+            cmd.arg(b);
+        }
+        let _ = cmd.spawn();
+    }
+    if mode.contains("sound") {
+        for (bin, args) in [
+            ("canberra-gtk-play", vec!["-i", "complete"]),
+            ("paplay", vec!["/usr/share/sounds/freedesktop/stereo/complete.oga"]),
+            ("aplay", vec!["/usr/share/sounds/freedesktop/stereo/complete.wav"]),
+        ] {
+            if std::process::Command::new(bin)
+                .args(&args)
+                .spawn()
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
 /// Single-line, `max`-char summary of a wire string for the toast detail.
 fn truncate(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -286,29 +315,25 @@ impl AppView {
                     return;
                 }
                 // The user is already watching the selected thread; only a
-                // live→settled transition in the background is worth a toast.
-                if !previous.as_deref().is_some_and(is_live_status)
-                    || !self.in_app_notifications_enabled()
-                {
+                // live→settled transition in the background is worth alerting.
+                if !previous.as_deref().is_some_and(is_live_status) {
                     return;
                 }
-                match thread.status.as_str() {
-                    "completed" => self.push_toast(
-                        ToastKind::Success,
-                        "Turn completed",
-                        Some(truncate(&thread.title, 60)),
-                        Some(thread.id.clone().into()),
-                        cx,
-                    ),
-                    "failed" => self.push_toast(
-                        ToastKind::Error,
-                        "Turn failed",
-                        Some(truncate(&thread.title, 60)),
-                        Some(thread.id.clone().into()),
-                        cx,
-                    ),
-                    _ => {}
+                let (title, kind) = match thread.status.as_str() {
+                    "completed" => ("Turn completed", ToastKind::Success),
+                    "failed" => ("Turn failed", ToastKind::Error),
+                    _ => return,
+                };
+                let detail = truncate(&thread.title, 60);
+                os_notify(
+                    &self.client_config.notification_mode,
+                    title,
+                    Some(&detail),
+                );
+                if !self.in_app_notifications_enabled() {
+                    return;
                 }
+                self.push_toast(kind, title, Some(detail), Some(thread.id.clone().into()), cx);
             }
             ShellEvent::ThreadItemUpdated { item } => {
                 let kind = item.kind.as_str();
@@ -343,6 +368,15 @@ impl AppView {
                     .find(|t| t.id.as_ref() == thread_id)
                     .map(|t| t.title.to_string())
                     .filter(|t| !t.is_empty());
+                os_notify(
+                    &self.client_config.notification_mode,
+                    if kind == "approval_request" {
+                        "Approval needed"
+                    } else {
+                        "Input needed"
+                    },
+                    thread_title.as_deref().map(|t| truncate(t, 60)).as_deref(),
+                );
                 self.push_toast(
                     ToastKind::Approval,
                     if kind == "approval_request" {

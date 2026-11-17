@@ -160,9 +160,9 @@ pub struct State {
     // (seeded on startup; written back on change).
     notification_mode: String,
     in_app_notifications: bool,
-    // `in_app_notifications` gates the "another thread finished" toasts
-    // (notifications.rs). `notification_mode` still awaits a native alert
-    // backend (OS toast / sound) to consume the other three modes.
+    // `in_app_notifications` gates the "another thread finished" toasts;
+    // `notification_mode` drives `os_notify` (notify-send + sound, best-effort)
+    // for settle/approval alerts in notifications.rs.
 
     // ── Projects section ────────────────────────────────────────────
     /// Add-project form visible.
