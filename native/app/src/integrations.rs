@@ -111,12 +111,61 @@ pub enum Probe {
     Failed(String),
 }
 
+/// `cloud.getRelayClientStatus` outcome (RelayClientStatusSchema).
+#[derive(Clone)]
+pub enum RelayProbe {
+    InFlight,
+    /// `{"status":"available", executablePath, source, version}`.
+    Available {
+        version: String,
+        source: String,
+        path: String,
+    },
+    /// `{"status":"missing", version}` — install is offered.
+    Missing {
+        version: String,
+    },
+    /// `{"status":"unsupported", platform, arch, version}`.
+    Unsupported {
+        platform: String,
+        arch: String,
+        version: String,
+    },
+    Failed(String),
+}
+
+/// One `device.list` device row (DeviceSummary).
+pub struct DeviceRow {
+    name: String,
+    platform: String,
+    version: String,
+    booted: bool,
+    physical: bool,
+}
+
+/// `device.list` outcome (DeviceServiceState).
+pub enum DevicesProbe {
+    InFlight,
+    Ready {
+        host_status: String,
+        detail: Option<String>,
+        devices: Vec<DeviceRow>,
+    },
+    Failed(String),
+}
+
 #[derive(Default)]
 pub struct State {
     /// toolInfo outcome per turn-item id.
     pub probes: RefCell<HashMap<String, Probe>>,
     /// Thread id the auto-probe last ran for; switching threads re-probes.
     pub probed_thread: RefCell<Option<String>>,
+    /// `cloud.getRelayClientStatus` — probed once per run (None = not yet).
+    pub relay: RefCell<Option<RelayProbe>>,
+    /// `cloud.installRelayClient` stream stage while an install runs.
+    pub relay_install: RefCell<Option<String>>,
+    /// `device.list` — probed once per run (None = not yet).
+    pub devices: RefCell<Option<DevicesProbe>>,
 }
 
 fn exit_error_message(exit: &Value) -> String {
@@ -244,6 +293,173 @@ impl AppView {
         .detach();
     }
 
+    // ---------------------------------------------------------------------
+    // 67 Connect relay + devices (the `cloud.*` / `device.*` wire surface)
+    // ---------------------------------------------------------------------
+
+    /// Map a `RelayClientStatus` wire value onto `RelayProbe`.
+    fn relay_from_wire(v: &Value) -> RelayProbe {
+        match v["status"].as_str() {
+            Some("available") => RelayProbe::Available {
+                version: v["version"].as_str().unwrap_or("?").to_string(),
+                source: v["source"].as_str().unwrap_or("?").to_string(),
+                path: v["executablePath"].as_str().unwrap_or("?").to_string(),
+            },
+            Some("unsupported") => RelayProbe::Unsupported {
+                platform: v["platform"].as_str().unwrap_or("?").to_string(),
+                arch: v["arch"].as_str().unwrap_or("?").to_string(),
+                version: v["version"].as_str().unwrap_or("?").to_string(),
+            },
+            Some("missing") | _ => RelayProbe::Missing {
+                version: v["version"].as_str().unwrap_or("?").to_string(),
+            },
+        }
+    }
+
+    /// Fire `cloud.getRelayClientStatus` once; a retry chips clears the probe
+    /// back to None which re-fires it on the next render.
+    fn probe_relay_status(&self, cx: &mut Context<Self>) {
+        *self.integrations_state.relay.borrow_mut() = Some(RelayProbe::InFlight);
+        let Some(rx) = self.send_query("cloud.getRelayClientStatus", json!({})) else {
+            *self.integrations_state.relay.borrow_mut() =
+                Some(RelayProbe::Failed("Not connected to a server.".into()));
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let reply = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                let probe = match reply {
+                    Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
+                        Self::relay_from_wire(&exit["value"])
+                    }
+                    Ok(exit) => RelayProbe::Failed(exit_error_message(&exit)),
+                    Err(_) => {
+                        RelayProbe::Failed("Lost connection before the reply arrived.".into())
+                    }
+                };
+                *this.integrations_state.relay.borrow_mut() = Some(probe);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fire `device.list` once — the real device inventory (local / SSH /
+    /// EAS / Simlock hosts) or the server's honest unavailable reason.
+    fn probe_devices(&self, cx: &mut Context<Self>) {
+        *self.integrations_state.devices.borrow_mut() = Some(DevicesProbe::InFlight);
+        let Some(rx) = self.send_query("device.list", json!({})) else {
+            *self.integrations_state.devices.borrow_mut() =
+                Some(DevicesProbe::Failed("Not connected to a server.".into()));
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let reply = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                let probe = match reply {
+                    Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
+                        let v = &exit["value"];
+                        DevicesProbe::Ready {
+                            host_status: v["hostStatus"].as_str().unwrap_or("unknown").to_string(),
+                            detail: v["hostStatusDetail"].as_str().map(str::to_owned),
+                            devices: v["devices"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|d| DeviceRow {
+                                            name: d["name"]
+                                                .as_str()
+                                                .unwrap_or("device")
+                                                .to_string(),
+                                            platform: d["platform"]
+                                                .as_str()
+                                                .unwrap_or("?")
+                                                .to_string(),
+                                            version: d["version"]
+                                                .as_str()
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            booted: d["booted"].as_bool() == Some(true),
+                                            physical: d["physical"].as_bool() == Some(true),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }
+                    }
+                    Ok(exit) => DevicesProbe::Failed(exit_error_message(&exit)),
+                    Err(_) => {
+                        DevicesProbe::Failed("Lost connection before the reply arrived.".into())
+                    }
+                };
+                *this.integrations_state.devices.borrow_mut() = Some(probe);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lazy-fire both connectivity probes on first render, like
+    /// `maybe_probe_integrations` gates `mcpApps.toolInfo`.
+    fn maybe_probe_connectivity(&self, cx: &mut Context<Self>) {
+        if self.integrations_state.relay.borrow().is_none() {
+            self.probe_relay_status(cx);
+        }
+        if self.integrations_state.devices.borrow().is_none() {
+            self.probe_devices(cx);
+        }
+    }
+
+    /// "Install relay client" — `cloud.installRelayClient` is a streaming
+    /// RPC: each chunk is `{type:"progress",stage}` and the last is
+    /// `{type:"complete",status}` (a fresh RelayClientStatus).
+    fn install_relay_client(&mut self, cx: &mut Context<Self>) {
+        let Some((_stream_id, rx)) = self.open_stream("cloud.installRelayClient", json!({})) else {
+            *self.integrations_state.relay.borrow_mut() =
+                Some(RelayProbe::Failed("Not connected to a server.".into()));
+            return;
+        };
+        *self.integrations_state.relay_install.borrow_mut() = Some("checking".to_string());
+        cx.spawn(async move |this, cx| {
+            let mut completed: Option<Value> = None;
+            while let Ok(chunk) = rx.recv().await {
+                let alive = this
+                    .update(cx, |this, cx| {
+                        match chunk["type"].as_str() {
+                            Some("progress") => {
+                                *this.integrations_state.relay_install.borrow_mut() =
+                                    Some(chunk["stage"].as_str().unwrap_or("working").to_string());
+                            }
+                            Some("complete") => {
+                                completed = Some(chunk["status"].clone());
+                            }
+                            _ => {}
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                *this.integrations_state.relay_install.borrow_mut() = None;
+                // The stream Exit isn't surfaced past StreamEnd — a close
+                // with no `complete` event is the honest failure shape.
+                let probe = match completed {
+                    Some(status) => Self::relay_from_wire(&status),
+                    None => {
+                        RelayProbe::Failed("The install stream ended without a result.".to_string())
+                    }
+                };
+                *this.integrations_state.relay.borrow_mut() = Some(probe);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn render_integrations_section(&self, cx: &mut Context<Self>) -> Div {
         let mut apps: Vec<(String, AppRefLite)> = Vec::new();
         for item in &self.thread_items {
@@ -252,6 +468,7 @@ impl AppView {
             }
         }
         self.maybe_probe_integrations(cx, &apps);
+        self.maybe_probe_connectivity(cx);
         let connected = self.commands.is_some();
         let probes = self.integrations_state.probes.borrow();
 
@@ -381,6 +598,203 @@ impl AppView {
                     .text_color(theme::fg_muted())
                     .child("Offline — connect to a server to probe the app bridge."),
             );
+        }
+
+        // ── 67 Connect relay ─────────────────────────────────────────
+        section = section.child(group_label("67 Connect relay"));
+        section = section.child(div().pb_2().text_xs().text_color(theme::fg_muted()).child(
+            "T3 Connect tunnels reach this server through the managed relay client \
+                 binary. The wire exposes only its status and installer — sign-in/pairing \
+                 happens inside the relay itself (the pair URL it prints), and pointing \
+                 this app at another server is the Environments settings section.",
+        ));
+        if let Some(stage) = self.integrations_state.relay_install.borrow().clone() {
+            section = section.child(info_row("Install", format!("in progress — {stage}")));
+        }
+        match self.integrations_state.relay.borrow().clone() {
+            None | Some(RelayProbe::InFlight) => {
+                section = section.child(info_row("Status", "checking…"));
+            }
+            Some(RelayProbe::Available {
+                version,
+                source,
+                path,
+            }) => {
+                section = section
+                    .child(info_row("Status", "installed"))
+                    .child(info_row("Version", version))
+                    .child(info_row("Source", source))
+                    .child(info_row("Binary", path));
+            }
+            Some(RelayProbe::Missing { version }) => {
+                let installing = self.integrations_state.relay_install.borrow().is_some();
+                let mut install_chip = div()
+                    .id("relay-install")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(theme::hover())
+                    .text_color(theme::fg())
+                    .hover(|s| s.bg(theme::selected()))
+                    .child("Install relay client")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.install_relay_client(cx);
+                        }),
+                    );
+                if installing {
+                    install_chip = install_chip.opacity(0.45);
+                }
+                section = section
+                    .child(info_row("Status", "not installed"))
+                    .child(info_row("Available", format!("relay client {version}")))
+                    .child(div().py_1p5().flex().child(install_chip));
+            }
+            Some(RelayProbe::Unsupported {
+                platform,
+                arch,
+                version,
+            }) => {
+                section = section
+                    .child(info_row(
+                        "Status",
+                        format!("no managed build for {platform}/{arch}"),
+                    ))
+                    .child(info_row("Version", version));
+            }
+            Some(RelayProbe::Failed(message)) => {
+                section = section
+                    .child(info_row("Status", "unavailable"))
+                    .child(info_row("Error", message))
+                    .child(
+                        div().py_1p5().flex().child(
+                            div()
+                                .id("relay-retry")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::hover())
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::selected()))
+                                .child("Retry")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.probe_relay_status(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                    );
+            }
+        }
+
+        // ── Devices ──────────────────────────────────────────────────
+        section = section.child(group_label("Devices"));
+        match &*self.integrations_state.devices.borrow() {
+            None | Some(DevicesProbe::InFlight) => {
+                section = section.child(info_row("Status", "loading…"));
+            }
+            Some(DevicesProbe::Failed(message)) => {
+                section = section
+                    .child(info_row("Status", "unavailable"))
+                    .child(info_row("Reason", message.clone()))
+                    .child(
+                        div().py_1p5().flex().child(
+                            div()
+                                .id("devices-retry")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::hover())
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::selected()))
+                                .child("Retry")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.probe_devices(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                    );
+            }
+            Some(DevicesProbe::Ready {
+                host_status,
+                detail,
+                devices,
+            }) => {
+                let host = match detail {
+                    Some(detail) if !detail.is_empty() => format!("{host_status} — {detail}"),
+                    _ => host_status.clone(),
+                };
+                section = section.child(info_row("Host", host));
+                if devices.is_empty() {
+                    section = section.child(
+                        div()
+                            .py_1p5()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(
+                                "No devices. Simulator/emulator inventory needs a mobile dev \
+                             host (or an EAS / Simlock host) configured on the server.",
+                            ),
+                    );
+                }
+                for (index, device) in devices.iter().enumerate() {
+                    let mut tags = Vec::new();
+                    if device.booted {
+                        tags.push("booted");
+                    }
+                    if device.physical {
+                        tags.push("physical");
+                    }
+                    let detail = format!(
+                        "{} {}{}",
+                        device.platform,
+                        device.version,
+                        if tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", tags.join(" · "))
+                        },
+                    );
+                    section = section.child(
+                        div()
+                            .id(("device-row", index))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .py_1p5()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_color(theme::fg())
+                                    .child(device.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .child(detail),
+                            ),
+                    );
+                }
+            }
         }
 
         section

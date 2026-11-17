@@ -12,11 +12,13 @@
 //! in lib.rs cover this surface; palette list keys are consumed by the
 //! palette's own keystroke interceptor before they can reach the TextField.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EntityInputHandler, Focusable, KeystrokeEvent, MouseButton, SharedString,
-    Subscription, Window, div, point, prelude::*, px,
+    Bounds, Context, Entity, EntityInputHandler, Focusable, KeystrokeEvent, MouseButton,
+    SharedString, Subscription, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
+    size,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -26,7 +28,7 @@ use crate::net::ClientCommand;
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
-use crate::{AppView, TogglePalette};
+use crate::{AppConfig, AppView, CenterView, TogglePalette};
 
 /// Threads shown under "Recent threads" when the query is empty (matches
 /// `RECENT_THREAD_LIMIT` in the web palette).
@@ -64,7 +66,6 @@ pub struct State {
     /// Scroll position of the results list.
     scroll: gpui::ScrollHandle,
     subs: Vec<Subscription>,
-    hooks_installed: bool,
 }
 
 impl Default for State {
@@ -81,7 +82,6 @@ impl Default for State {
             search_generation: 0,
             scroll: gpui::ScrollHandle::new(),
             subs: Vec::new(),
-            hooks_installed: false,
         }
     }
 }
@@ -96,6 +96,10 @@ enum CommandKind {
     Delete,
     Stop,
     Triage,
+    OpenInWindow,
+    ConnectToServer,
+    UsageView,
+    PullRequestsView,
 }
 
 /// One selectable palette entry.
@@ -216,18 +220,25 @@ impl AppView {
     /// Install the app-wide keystroke hook once. It runs before keymap/action
     /// dispatch, which is what lets Up/Down/Enter drive the list while the
     /// `TextField` owns focus.
+    ///
+    /// The interceptor is registered on `App`, not the window — with multiple
+    /// windows open, one registration per AppView would multiply-fire on the
+    /// same keystroke. Install once process-wide and leak the Subscription
+    /// (it lives for the app's lifetime anyway); the callback resolves the
+    /// AppView through the event's own window, so each window's palette is
+    /// still driven by its own view.
     fn ensure_palette_hooks(&mut self, cx: &mut Context<Self>) {
-        if self.palette_state.hooks_installed {
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        if INSTALLED.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.palette_state.hooks_installed = true;
         let subscription = cx.intercept_keystrokes(|event, window, cx| {
             let Some(view) = app_view(window) else {
                 return;
             };
             view.update(cx, |this, cx| this.on_palette_keystroke(event, window, cx));
         });
-        self.palette_state.subs.push(subscription);
+        std::mem::forget(subscription);
     }
 
     pub fn on_toggle_palette(
@@ -517,7 +528,35 @@ impl AppView {
         // Commands that act on a thread always target `state.selected` (the
         // "current thread"), like the web palette's thread commands.
         let connected = matches!(self.state.connection, ConnectionStatus::Connected);
-        let commands: [(CommandKind, &str, Option<&str>, Option<&str>, bool); 8] = [
+        let commands: [(CommandKind, &str, Option<&str>, Option<&str>, bool); 12] = [
+            (
+                CommandKind::OpenInWindow,
+                "Open thread in new window",
+                thread_title.as_deref(),
+                None,
+                has_thread,
+            ),
+            (
+                CommandKind::UsageView,
+                "Open usage view",
+                Some("Token totals per day, provider, and model"),
+                Some("⌘U"),
+                true,
+            ),
+            (
+                CommandKind::PullRequestsView,
+                "Open pull requests view",
+                Some("Pull requests for the selected thread's project"),
+                None,
+                has_thread,
+            ),
+            (
+                CommandKind::ConnectToServer,
+                "Connect to server…",
+                Some("Add a server URL + token, or pick a saved environment"),
+                None,
+                true,
+            ),
             (CommandKind::NewThread, "New thread", None, Some("⌘N"), true),
             (
                 CommandKind::OpenSettings,
@@ -582,6 +621,10 @@ impl AppView {
                 CommandKind::Rename => "title edit retitle",
                 CommandKind::Delete => "remove destroy trash",
                 CommandKind::Stop => "interrupt cancel halt",
+                CommandKind::OpenInWindow => "window detach pop out duplicate",
+                CommandKind::ConnectToServer => "connect pair url token environment remote",
+                CommandKind::UsageView => "usage tokens cost limits billing",
+                CommandKind::PullRequestsView => "pull request pr github forge review",
             };
             let haystack = format!("{label} {keywords}");
             if filtering && !fuzzy_match(query, &haystack) {
@@ -681,11 +724,35 @@ impl AppView {
                     });
                 }
                 self.close_palette(window, cx);
+                self.set_center_view(CenterView::Chat, cx);
             }
             Entry::Command(CommandKind::NewThread) => {
                 self.state.selected = None;
                 self.thread_items.clear();
                 self.close_palette(window, cx);
+                self.set_center_view(CenterView::Chat, cx);
+            }
+            Entry::Command(CommandKind::OpenInWindow) => {
+                self.open_thread_in_new_window(cx);
+                self.close_palette(window, cx);
+            }
+            Entry::Command(CommandKind::ConnectToServer) => {
+                // The connect dialog is Settings → Environments: server URL +
+                // token fields write `ClientConfig.environments` and
+                // `SwitchEndpoint` reconnects (envs.rs).
+                self.settings_state.open = true;
+                self.settings_state.section = crate::settings::Section::Environments;
+                self.close_palette(window, cx);
+            }
+            Entry::Command(CommandKind::UsageView) => {
+                self.close_palette(window, cx);
+                // After close_palette: it refocuses the (now unmounted)
+                // composer, so the center-view focus park must win.
+                self.set_center_view(CenterView::Usage, cx);
+            }
+            Entry::Command(CommandKind::PullRequestsView) => {
+                self.close_palette(window, cx);
+                self.set_center_view(CenterView::PullRequests, cx);
             }
             Entry::Command(CommandKind::OpenSettings) => {
                 self.settings_state.open = true;
@@ -786,10 +853,10 @@ impl AppView {
         }));
     }
 
-    /// ctrl-{ / ctrl-} — the web `thread.previous`/`thread.next` commands:
-    /// step through the flat sidebar order (projects in order, threads
-    /// pinned-first then recency, snoozed last).
-    pub(crate) fn step_thread_selection(&mut self, dir: i32, cx: &mut Context<Self>) {
+    /// The sidebar's flat thread order (projects in order, threads
+    /// pinned-first then recency, snoozed last) — shared by
+    /// `step_thread_selection` and `jump_to_thread`.
+    fn ordered_thread_ids(&self) -> Vec<SharedString> {
         let mut ordered: Vec<SharedString> = Vec::new();
         for project in &self.state.projects {
             let mut threads: Vec<&crate::model::Thread> = self
@@ -809,6 +876,13 @@ impl AppView {
             });
             ordered.extend(threads.iter().map(|t| t.id.clone()));
         }
+        ordered
+    }
+
+    /// ctrl-{ / ctrl-} — the web `thread.previous`/`thread.next` commands:
+    /// step through the flat sidebar order.
+    pub(crate) fn step_thread_selection(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let ordered = self.ordered_thread_ids();
         if ordered.is_empty() {
             return;
         }
@@ -822,6 +896,78 @@ impl AppView {
         let id = ordered[next].clone();
         if self.state.selected.as_ref() != Some(&id) {
             self.select_thread(id, cx);
+        }
+    }
+
+    /// ctrl-1..9 — the web `thread.jump.N` commands: select the Nth thread
+    /// in the flat sidebar order (pinned threads land first, matching the
+    /// "jump to pinned thread" intent).
+    pub(crate) fn jump_to_thread(&mut self, index: usize, cx: &mut Context<Self>) {
+        let ordered = self.ordered_thread_ids();
+        let Some(id) = ordered.get(index).cloned() else {
+            return;
+        };
+        if self.state.selected.as_ref() != Some(&id) {
+            self.select_thread(id, cx);
+        }
+    }
+
+    /// "Open thread in new window" — GPUI supports multiple windows, but the
+    /// net loop routes every event to the single `events_tx` consumer, so two
+    /// windows can't share one connection entity. Each window gets a full
+    /// AppView with its own socket to the same endpoint — the same shape as
+    /// a second browser tab in the web client — preselected on this thread.
+    fn open_thread_in_new_window(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.state.selected.clone() else {
+            return;
+        };
+        let config = AppConfig {
+            endpoint: self.active_endpoint.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+        };
+        let title = self
+            .state
+            .selected_thread()
+            .map(|t| format!("{} — 67 Code", t.title))
+            .unwrap_or_else(|| "67 Code".to_string());
+        let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            move |window, cx| {
+                cx.new(|cx| {
+                    let mut view = AppView::new(window, cx, &config);
+                    if config.endpoint.is_some() {
+                        // Preselect before the first snapshot; `did_auto_select`
+                        // keeps the snapshot from re-picking `threads.first()`
+                        // and the Connected handler re-subscribes the stream.
+                        view.state.selected = Some(thread_id.clone());
+                        view.did_auto_select = true;
+                        if let Some(commands) = &view.commands {
+                            let _ = commands.send(ClientCommand::SubscribeThread {
+                                thread_id: thread_id.to_string(),
+                            });
+                        }
+                    }
+                    view
+                })
+            },
+        );
+        if let Err(error) = opened {
+            self.push_toast(
+                ToastKind::Error,
+                "Couldn't open a new window",
+                Some(error.to_string()),
+                None,
+                cx,
+            );
         }
     }
 

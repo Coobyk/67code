@@ -52,8 +52,29 @@ gpui::actions!(
         NextThread,
         TogglePin,
         ToggleModelPicker,
+        OpenUsageView,
     ]
 );
+
+/// Jump to the Nth thread in sidebar order — the web `thread.jump.N`
+/// bindings (`mod+1..9`, gated to the desktop app there too). Bound as
+/// `ctrl+1..9`; `no_json` since keymaps here are code, not JSON.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = app, no_json)]
+struct ThreadJump {
+    /// 0-based index into the sidebar's flat thread order.
+    index: usize,
+}
+
+/// What the center column shows — the web's `/usage` and pull-request
+/// routes flattened into the main window instead of separate pages.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum CenterView {
+    #[default]
+    Chat,
+    Usage,
+    PullRequests,
+}
 
 /// How the app reaches a server and which provider new threads use.
 #[derive(Clone)]
@@ -149,6 +170,13 @@ struct AppView {
     stream_sinks: std::collections::HashMap<String, smol::channel::Sender<serde_json::Value>>,
     /// Counter minting unique stream ids.
     next_stream_id: u64,
+    /// Center-column mode: chat timeline vs. standalone usage/PR views.
+    center_view: CenterView,
+    /// Focus handle parked on the root div (always mounted). When a
+    /// non-Chat center view unmounts the composer, the window's focused
+    /// node leaves the dispatch tree and every "App"-context binding goes
+    /// dead — moving focus here keeps the whole keymap alive.
+    app_focus: gpui::FocusHandle,
 }
 
 impl AppView {
@@ -253,6 +281,8 @@ impl AppView {
             backend_settings_state: settings_backend::State::default(),
             stream_sinks: std::collections::HashMap::new(),
             next_stream_id: 0,
+            center_view: CenterView::Chat,
+            app_focus: cx.focus_handle(),
         }
     }
 
@@ -502,10 +532,63 @@ impl AppView {
         cx.notify();
     }
 
+    /// Switch the center column and move focus to a node that stays
+    /// mounted: Chat refocuses the composer, Usage/PullRequests park focus
+    /// on the root div's handle. Without this, leaving Chat unmounts the
+    /// focused TextField, the dispatch path falls back to the view node
+    /// (no key context), and every "App" binding goes dead. Deferred so it
+    /// runs after the dispatch-time window borrow is released — and after
+    /// `close_palette` re-points focus at the now-unmounted composer.
+    pub(crate) fn set_center_view(&mut self, view: CenterView, cx: &mut Context<Self>) {
+        self.center_view = view;
+        let entity_id = cx.entity_id();
+        let app_focus = self.app_focus.clone();
+        let composer = self.composer.clone();
+        let chat = view == CenterView::Chat;
+        cx.defer(move |cx| {
+            for handle in cx.windows() {
+                let _ = handle.update(cx, |root, window, app| {
+                    let matches = root
+                        .downcast::<AppView>()
+                        .is_ok_and(|view| view.entity_id() == entity_id);
+                    if !matches {
+                        return;
+                    }
+                    if chat {
+                        composer.read(app).focus_handle(app).focus(window, app);
+                    } else {
+                        app_focus.focus(window, app);
+                    }
+                });
+            }
+        });
+        cx.notify();
+    }
+
     fn on_new_thread(&mut self, _action: &NewThread, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.selected = None;
         self.thread_items.clear();
-        cx.notify();
+        self.set_center_view(CenterView::Chat, cx);
+    }
+
+    /// ctrl-1..9 — the web `thread.jump.N` commands.
+    fn on_thread_jump(
+        &mut self,
+        action: &ThreadJump,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_to_thread(action.index, cx);
+    }
+
+    /// ctrl-u — the web `usage.open` command.
+    fn on_open_usage_view(
+        &mut self,
+        _action: &OpenUsageView,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_center_view(CenterView::Usage, cx);
     }
 
     fn on_toggle_panel(
@@ -576,6 +659,8 @@ impl AppView {
             self.composer_state.picker = None;
         } else if self.vcs_dismiss_picker(cx) {
             return;
+        } else if self.center_view != CenterView::Chat {
+            self.set_center_view(CenterView::Chat, cx);
         } else {
             return;
         }
@@ -701,7 +786,72 @@ impl AppView {
             }
         }
         self.state.selected = Some(thread_id);
-        cx.notify();
+        self.set_center_view(CenterView::Chat, cx);
+    }
+
+    /// Center-column content for the standalone modes: a back-to-chat
+    /// header over the shared usage section / pull-requests pane. Both
+    /// bodies self-load against the wire (server.getUsageSummary and the
+    /// pullRequests.* calls respectively).
+    fn render_center_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (label, body) = match self.center_view {
+            CenterView::Usage => ("Usage", self.render_usage_section(cx)),
+            CenterView::PullRequests => ("Pull requests", self.render_prs_pane(cx)),
+            // render() only calls this for non-chat modes; keep a cheap body
+            // anyway so an unexpected Chat can't panic the draw path.
+            CenterView::Chat => ("Chat", div()),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .id("center-back-chat")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .hover(|s| s.bg(theme::hover()))
+                            .child("← Chat")
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _ev, _window, cx| {
+                                    this.set_center_view(CenterView::Chat, cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .id("center-standalone")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_2()
+                    .child(body),
+            )
     }
 }
 
@@ -749,6 +899,7 @@ impl Render for AppView {
         }
         div()
             .key_context("App")
+            .track_focus(&self.app_focus)
             .flex()
             .size_full()
             .bg(theme::canvas())
@@ -761,6 +912,43 @@ impl Render for AppView {
             .on_action(cx.listener(AppView::on_new_thread))
             .on_action(cx.listener(AppView::on_close_overlay))
             .on_action(cx.listener(AppView::on_focus_search))
+            // Parameterized — element-level so the dispatched index lands in
+            // the window that saw the keystroke.
+            .on_action(cx.listener(AppView::on_thread_jump))
+            // Parity bindings stay element-level: a `cx.on_action` global has
+            // no `&mut Window`, and re-borrowing the window during dispatch
+            // fails — these listeners must not move back to `app_handler!`.
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &OpenFilePicker, _window, cx| {
+                    this.open_file_picker(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &ClosePanel, window, cx| {
+                    this.close_panel_or_drawer(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &PrevThread, _window, cx| {
+                    this.step_thread_selection(-1, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &NextThread, _window, cx| {
+                    this.step_thread_selection(1, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &TogglePin, _window, _cx| {
+                    this.toggle_selected_thread_pin()
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut AppView, _: &ToggleModelPicker, _window, cx| {
+                    this.toggle_model_picker(cx)
+                }),
+            )
+            .on_action(cx.listener(AppView::on_open_usage_view))
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -830,9 +1018,18 @@ impl Render for AppView {
                                     ),
                             ),
                     )
-                    .child(self.render_timeline())
-                    .child(self.render_terminal_drawer(cx))
-                    .child(self.render_composer()),
+                    .child(match self.center_view {
+                        CenterView::Chat => div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.render_timeline())
+                            .child(self.render_terminal_drawer(cx))
+                            .child(self.render_composer())
+                            .into_any_element(),
+                        _ => self.render_center_view(cx).into_any_element(),
+                    }),
             )
             .child(self.render_right_panel(cx))
             .child(self.render_palette(cx))
@@ -885,45 +1082,26 @@ pub fn run(config: AppConfig) {
             KeyBinding::new("ctrl-shift-m", ToggleModelPicker, Some("App")),
             KeyBinding::new("ctrl-shift-o", NewThread, Some("App")),
             KeyBinding::new("ctrl-shift-n", NewThread, Some("App")),
+            // Web `chat.new` is mod+n (already above); ctrl-t additionally
+            // opens a fresh thread draft like the browser's new-tab chord.
+            KeyBinding::new("ctrl-t", NewThread, Some("App")),
+            // Web `usage.open` is mod+u.
+            KeyBinding::new("ctrl-u", OpenUsageView, Some("App")),
+            // Web `thread.jump.N` is mod+N (desktop-only there too).
+            KeyBinding::new("ctrl-1", ThreadJump { index: 0 }, Some("App")),
+            KeyBinding::new("ctrl-2", ThreadJump { index: 1 }, Some("App")),
+            KeyBinding::new("ctrl-3", ThreadJump { index: 2 }, Some("App")),
+            KeyBinding::new("ctrl-4", ThreadJump { index: 3 }, Some("App")),
+            KeyBinding::new("ctrl-5", ThreadJump { index: 4 }, Some("App")),
+            KeyBinding::new("ctrl-6", ThreadJump { index: 5 }, Some("App")),
+            KeyBinding::new("ctrl-7", ThreadJump { index: 6 }, Some("App")),
+            KeyBinding::new("ctrl-8", ThreadJump { index: 7 }, Some("App")),
+            KeyBinding::new("ctrl-9", ThreadJump { index: 8 }, Some("App")),
+            // Web `navigation.back`/`navigation.forward` (mod+[/mod+]) —
+            // closest native equivalent is stepping the thread order.
+            KeyBinding::new("ctrl-[", PrevThread, Some("App")),
+            KeyBinding::new("ctrl-]", NextThread, Some("App")),
         ]);
-        // Global handlers for the parity bindings above; the element-level
-        // `on_action`s on the root view handle the original set.
-        macro_rules! app_handler {
-            ($action:ty, $body:expr) => {
-                cx.on_action::<$action>(move |_action, app| {
-                    let Some(handle) = app.active_window() else {
-                        return;
-                    };
-                    let _ = handle.update(app, move |root, window, app| {
-                        if let Ok(view) = root.downcast::<AppView>() {
-                            view.update(app, |this, cx| {
-                                let body: fn(&mut AppView, &mut Window, &mut Context<AppView>) =
-                                    $body;
-                                body(this, window, cx);
-                            });
-                        }
-                    });
-                });
-            };
-        }
-        app_handler!(OpenFilePicker, |this, _window, cx| {
-            this.open_file_picker(cx)
-        });
-        app_handler!(ClosePanel, |this, window, cx| {
-            this.close_panel_or_drawer(window, cx)
-        });
-        app_handler!(PrevThread, |this, _window, cx| {
-            this.step_thread_selection(-1, cx)
-        });
-        app_handler!(NextThread, |this, _window, cx| {
-            this.step_thread_selection(1, cx)
-        });
-        app_handler!(TogglePin, |this, _window, _cx| {
-            this.toggle_selected_thread_pin()
-        });
-        app_handler!(ToggleModelPicker, |this, _window, cx| {
-            this.toggle_model_picker(cx)
-        });
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         cx.open_window(
             WindowOptions {
