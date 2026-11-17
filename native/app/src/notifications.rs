@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, deferred, div, prelude::*,
     px, rgb,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::ConnectionStatus;
@@ -23,8 +23,6 @@ const AUTO_DISMISS_SECS: u64 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToastKind {
-    /// Reserved for neutral notices; no event arm produces one yet.
-    #[allow(dead_code)]
     Info,
     Success,
     Error,
@@ -53,12 +51,20 @@ pub enum ToastAction {
     UnarchiveThread { thread_id: SharedString },
     /// "Undo" a snooze — `thread.unsnooze`.
     UnsnoozeThread { thread_id: SharedString },
+    /// Open an external URL via `xdg-open` (GitHub repo, release notes).
+    OpenUrl {
+        url: SharedString,
+        label: SharedString,
+    },
 }
 
 impl ToastAction {
-    /// Button label. Both current actions undo something.
-    fn label(&self) -> &'static str {
-        "Undo"
+    /// Button label. The undo actions share one; URL actions carry their own.
+    fn label(&self) -> SharedString {
+        match self {
+            ToastAction::OpenUrl { label, .. } => label.clone(),
+            _ => "Undo".into(),
+        }
     }
 }
 
@@ -87,6 +93,22 @@ pub struct State {
     /// Runtime-request turn-item ids already toasted. Approval items update
     /// repeatedly while pending; only the first update should notify.
     pub requests_seen: HashSet<String>,
+    /// `has_pending_request` last seen per thread — the shell stream is the
+    /// only way a non-selected (e.g. delegated child) thread's pending
+    /// approval reaches this client, so edges are tracked here.
+    pub pending_requests: HashSet<String>,
+    /// `bedtimeReminder.subscribe` stream bookkeeping.
+    pub bedtime_stream_started: bool,
+    pub bedtime_stream_id: Option<String>,
+    /// `nightStartedAt` values already toasted (dedupe across reconnects).
+    pub bedtime_reminded: HashSet<String>,
+    /// Once-per-session prompts (no persisted flag — `config.rs` belongs to
+    /// another workstream; matches the web's once-per-session part).
+    pub star_prompt_done: bool,
+    pub update_toast_done: bool,
+    pub legacy_fold_toasted: bool,
+    /// Reentrancy guard for the `server.getConfig` probe.
+    pub config_probe_running: bool,
     next_id: u64,
 }
 
@@ -216,6 +238,23 @@ impl AppView {
         .detach();
     }
 
+    /// A toast that stays until dismissed — for calls to action the user
+    /// must be able to click (web parity: star/update prompts never
+    /// auto-expire).
+    pub(crate) fn push_sticky_toast_with_action(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<SharedString>,
+        detail: Option<String>,
+        thread_id: Option<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notifications_state
+            .push(kind, title, detail, thread_id, action);
+        cx.notify();
+    }
+
     fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         self.notifications_state.toasts.retain(|t| t.id != id);
         cx.notify();
@@ -250,6 +289,9 @@ impl AppView {
                     "reason": "user",
                 }));
             }
+            ToastAction::OpenUrl { url, .. } => {
+                crate::explorer::open_external(url);
+            }
         }
         cx.notify();
     }
@@ -263,8 +305,20 @@ impl AppView {
                 if !matches!(self.state.connection, ConnectionStatus::Connected) {
                     self.push_toast(ToastKind::Success, "Connected", None, None, cx);
                 }
+                // (Re)opened socket: reconnect the reminder stream and re-run
+                // the one-shot config probes; the guards inside keep them
+                // once-per-session / deduped across reconnects.
+                self.ensure_bedtime_stream(cx);
+                self.probe_server_config(cx);
+                self.maybe_prompt_github_star(cx);
             }
             ShellEvent::Disconnected(reason) => {
+                // Dynamic stream subscriptions die with the socket; drop the
+                // sink so the recv loop ends and a reconnect can reopen it.
+                if let Some(sid) = self.notifications_state.bedtime_stream_id.take() {
+                    self.stream_sinks.remove(&sid);
+                }
+                self.notifications_state.bedtime_stream_started = false;
                 self.push_toast(
                     ToastKind::Error,
                     "Connection lost",
@@ -284,6 +338,15 @@ impl AppView {
                     self.notifications_state
                         .thread_status
                         .insert(thread.id.clone(), thread.status.clone());
+                    // Pending requests present at snapshot are the baseline,
+                    // not something new — seed without toasting.
+                    if thread.has_pending_request {
+                        self.notifications_state
+                            .pending_requests
+                            .insert(thread.id.clone());
+                    } else {
+                        self.notifications_state.pending_requests.remove(&thread.id);
+                    }
                 }
             }
             // Project shells carry `icon` (net::parse_project drops it); the
@@ -301,12 +364,27 @@ impl AppView {
             }
             ShellEvent::ThreadRemoved { thread_id } => {
                 self.notifications_state.thread_status.remove(thread_id);
+                self.notifications_state.pending_requests.remove(thread_id);
             }
             ShellEvent::ThreadUpserted { thread } => {
                 let previous = self
                     .notifications_state
                     .thread_status
                     .insert(thread.id.clone(), thread.status.clone());
+                // Track pending-request edges regardless of selection: a
+                // delegated child's approval only reaches us via its own
+                // shell row, never a turn item on the parent's stream.
+                let was_pending = self
+                    .notifications_state
+                    .pending_requests
+                    .contains(thread.id.as_str());
+                if thread.deleted || !thread.has_pending_request {
+                    self.notifications_state.pending_requests.remove(&thread.id);
+                } else {
+                    self.notifications_state
+                        .pending_requests
+                        .insert(thread.id.clone());
+                }
                 if thread.deleted
                     || self
                         .state
@@ -314,6 +392,32 @@ impl AppView {
                         .as_ref()
                         .is_some_and(|id| id.as_ref() == thread.id)
                 {
+                    return;
+                }
+                if !was_pending && thread.has_pending_request {
+                    // `pendingRuntimeRequest.kind` isn't in the shell view;
+                    // a subagent item pointing at this thread as
+                    // `childThreadId` marks it a delegated-task request.
+                    let delegated = self.thread_items.iter().any(|i| {
+                        i.kind == "subagent"
+                            && i.raw["childThreadId"].as_str() == Some(thread.id.as_str())
+                    });
+                    let title = if delegated {
+                        "Approval needed in delegated task"
+                    } else {
+                        "Needs attention"
+                    };
+                    let detail = truncate(&thread.title, 60);
+                    os_notify(&self.client_config.notification_mode, title, Some(&detail));
+                    if self.in_app_notifications_enabled() {
+                        self.push_toast(
+                            ToastKind::Approval,
+                            title,
+                            Some(detail),
+                            Some(thread.id.clone().into()),
+                            cx,
+                        );
+                    }
                     return;
                 }
                 // The user is already watching the selected thread; only a
@@ -399,6 +503,189 @@ impl AppView {
             }
             _ => {}
         }
+    }
+
+    /// Open `bedtimeReminder.subscribe` once per connection. The stream
+    /// pushes `BedtimeReminderState` (off | scheduled | reminding); only the
+    /// "reminding" state toasts, deduped by `nightStartedAt` across
+    /// reconnects.
+    fn ensure_bedtime_stream(&mut self, cx: &mut Context<Self>) {
+        if self.notifications_state.bedtime_stream_started
+            && self.notifications_state.bedtime_stream_id.is_some()
+        {
+            return;
+        }
+        let Some((stream_id, rx)) = self.open_stream("bedtimeReminder.subscribe", json!({})) else {
+            return;
+        };
+        self.notifications_state.bedtime_stream_started = true;
+        self.notifications_state.bedtime_stream_id = Some(stream_id.clone());
+        cx.spawn(async move |this, cx| {
+            while let Ok(chunk) = rx.recv().await {
+                if chunk["kind"].as_str() != Some("reminding") {
+                    continue;
+                }
+                let night = chunk["nightStartedAt"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| chunk["nightStartedAt"].as_i64().map(|v| v.to_string()))
+                    .unwrap_or_default();
+                let _ = this.update(cx, |this, cx| {
+                    if this.notifications_state.bedtime_reminded.insert(night) {
+                        os_notify(
+                            &this.client_config.notification_mode,
+                            "Bedtime reminder",
+                            Some("It's getting late — wrap up tonight's runs."),
+                        );
+                        if this.in_app_notifications_enabled() {
+                            // Body click focuses the current thread — the
+                            // reminder isn't tied to a specific one.
+                            this.push_toast(
+                                ToastKind::Info,
+                                "Bedtime reminder",
+                                Some("It's bedtime — consider pausing tonight's runs.".to_string()),
+                                this.state.selected.clone(),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            // Stream ended (server exit frame) or the sink was dropped on
+            // disconnect — clear the id so a reconnect reopens it, but only
+            // if a newer subscription hasn't already taken over.
+            let _ = this.update(cx, |this, _cx| {
+                if this.notifications_state.bedtime_stream_id.as_deref() == Some(stream_id.as_str())
+                {
+                    this.notifications_state.bedtime_stream_id = None;
+                    this.notifications_state.bedtime_stream_started = false;
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// One `server.getConfig` round trip per connect — feeds the
+    /// update-available check and the legacy-settings-fold notice.
+    fn probe_server_config(&mut self, cx: &mut Context<Self>) {
+        if self.notifications_state.config_probe_running {
+            return;
+        }
+        let Some(rx) = self.send_query("server.getConfig", json!({})) else {
+            return;
+        };
+        self.notifications_state.config_probe_running = true;
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                this.notifications_state.config_probe_running = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    let value = exit["value"].clone();
+                    this.handle_server_config(&value, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn handle_server_config(&mut self, config: &Value, cx: &mut Context<Self>) {
+        // Legacy migration notice (one-time): the server folds
+        // projectAgentBrowserAccessOverrides / projectAutoPullOverrides /
+        // projectScriptOverrides into the new project settings and reports
+        // `settings.projectSettingsFolded: true`.
+        if config["settings"]["projectSettingsFolded"].as_bool() == Some(true)
+            && !self.notifications_state.legacy_fold_toasted
+        {
+            self.notifications_state.legacy_fold_toasted = true;
+            self.push_toast(
+                ToastKind::Info,
+                "Project settings migrated",
+                Some("Legacy per-project overrides were folded into project settings.".to_string()),
+                None,
+                cx,
+            );
+        }
+        // Update check — the web only asks the registry when the server
+        // advertises `capabilities.npmReleaseLookup`.
+        if self.notifications_state.update_toast_done {
+            return;
+        }
+        let capable = config["environment"]["capabilities"]["npmReleaseLookup"]
+            .as_bool()
+            .unwrap_or(false);
+        let current = config["environment"]["serverVersion"]
+            .as_str()
+            .unwrap_or("");
+        if !capable || current.is_empty() {
+            return;
+        }
+        let Some(rx) = self.send_query("server.getNpmRelease", json!({"spec": "latest"})) else {
+            return;
+        };
+        let current = current.to_string();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let latest = exit["value"]["version"].as_str().unwrap_or("").to_string();
+            let _ = this.update(cx, |this, cx| {
+                if exit["_tag"].as_str() == Some("Success")
+                    && semver_newer(&latest, &current)
+                    && !this.notifications_state.update_toast_done
+                {
+                    this.notifications_state.update_toast_done = true;
+                    this.push_sticky_toast_with_action(
+                        ToastKind::Info,
+                        "Update available",
+                        Some(format!(
+                            "v{current} → v{latest} — run npm/pnpm update on the server"
+                        )),
+                        None,
+                        None,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Web `GitHubStarPrompt` parity, best-effort: the web gates on >5
+    /// prompts sent, idle, and an unstarred repo check; persists "sent" /
+    /// "dismissed" to localStorage. Native has no persisted flag yet
+    /// (`config.rs` is another workstream's file), so this is once per
+    /// session and the prompt-count gate reads the session's
+    /// `prompt_history`.
+    fn maybe_prompt_github_star(&mut self, cx: &mut Context<Self>) {
+        if self.notifications_state.star_prompt_done {
+            return;
+        }
+        let prompts_sent: usize = self
+            .client_config
+            .prompt_history
+            .values()
+            .map(Vec::len)
+            .sum();
+        if prompts_sent <= 5 {
+            return;
+        }
+        self.notifications_state.star_prompt_done = true;
+        self.push_sticky_toast_with_action(
+            ToastKind::Info,
+            "Enjoying T3 Code?",
+            Some("It helps a lot if you star the repo.".to_string()),
+            None,
+            Some(ToastAction::OpenUrl {
+                url: "https://github.com/pingdotgg/t3code".into(),
+                label: "Star on GitHub".into(),
+            }),
+            cx,
+        );
     }
 
     /// Transient toast stack rendered above the composer, bottom-right.
@@ -520,5 +807,34 @@ impl AppView {
             );
         }
         card.into_any_element()
+    }
+}
+
+/// `X.Y.Z[-pre]` → comparable parts. `serverVersion` can be a dev-build
+/// label rather than semver — `None` there just means "no nag".
+fn semver_parts(v: &str) -> Option<(u64, u64, u64, String)> {
+    let (core, pre) = match v.trim().split_once('-') {
+        Some((c, p)) => (c, p),
+        None => (v.trim(), ""),
+    };
+    let mut it = core.split('.');
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    let c = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((a, b, c, pre.to_string()))
+}
+
+/// `latest` is strictly newer than `current`; a stable release also beats
+/// the same version's prerelease (npm `latest` vs a `-dev`/`-nightly` build).
+fn semver_newer(latest: &str, current: &str) -> bool {
+    match (semver_parts(latest), semver_parts(current)) {
+        (Some(l), Some(c)) => {
+            (l.0, l.1, l.2) > (c.0, c.1, c.2)
+                || ((l.0, l.1, l.2) == (c.0, c.1, c.2) && l.3.is_empty() && !c.3.is_empty())
+        }
+        _ => false,
     }
 }

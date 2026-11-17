@@ -9,11 +9,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{AnyElement, ClipboardItem, Rgba, div, prelude::*, px, rgb, rgba};
+use gpui::{
+    AnyElement, ClipboardItem, Entity, EntityInputHandler, Focusable, Rgba, Subscription, div,
+    prelude::*, px, rgb, rgba,
+};
 use serde_json::{Value, json};
 
 use crate::model::{ConnectionStatus, Role};
 use crate::net::TurnItemView;
+use crate::notifications::ToastKind;
+use crate::text_field::{PromptSubmitted, TextField};
 use crate::{AppView, theme};
 
 /// Expanded tool/command output is capped so a multi-megabyte result can't
@@ -33,6 +38,15 @@ pub struct State {
     /// Option selections for pending user-input cards, before Submit:
     /// requestId -> questionId -> selected option values in click order.
     pub user_input_answers: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Assistant items whose 👍/👎 upload was confirmed by the server.
+    pub feedback_sent: HashSet<String>,
+    /// Assistant items with a `provider.uploadFeedback` call in flight.
+    pub feedback_in_flight: HashSet<String>,
+    /// While the thumbs-down comment input is open: (item id, thread id,
+    /// field). Created on first use — `cx.new` needs a context.
+    pub feedback_comment: Option<(String, String, Entity<TextField>)>,
+    /// Keeps the feedback field's `PromptSubmitted` (Enter) subscription.
+    pub feedback_sub: Option<Subscription>,
 }
 
 fn success() -> Rgba {
@@ -264,6 +278,284 @@ fn copy_chip(
             });
         })
         .child(if copied { "Copied" } else { "Copy" })
+}
+
+// ---------------------------------------------------------------------------
+// Assistant citations (user-authored quote annotations)
+// ---------------------------------------------------------------------------
+//
+// There is no provider-emitted citation turn-item kind: the
+// `OrchestrationV2TurnItem` union has no citation member. The only citations
+// on the wire are user-authored `AssistantCitation`s, embedded in message
+// text as `[Assistant quote](t3-citation://v1/<env>/<thread>/<msg>?…)` links
+// (`packages/shared/src/assistantCitations.ts`). ChatMarkdown renders them as
+// `AssistantCitationChip`s — a quote chip that navigates to the source
+// thread. Below is the same treatment.
+
+/// A parsed `t3-citation:` link — only the fields the chip needs.
+struct AssistantCitation {
+    thread_id: String,
+    text: String,
+    comment: Option<String>,
+}
+
+const CITATION_PREFIX: &str = "t3-citation://v1/";
+const CITATION_LINK_LABEL: &str = "[Assistant quote](";
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `application/x-www-form-urlencoded` decode: `%XX` bytes, and `+` → space
+/// when `plus` (JS `URLSearchParams` encodes query spaces as `+` while
+/// `encodeURIComponent` path segments use `%20`).
+fn pct_decode(s: &str, plus: bool) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' if plus => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Mirrors `parseAssistantCitationHref`: three path segments, exactly the
+/// five required query keys plus optional `comment`, numeric start/end.
+fn parse_citation_href(href: &str) -> Option<AssistantCitation> {
+    let rest = href.strip_prefix(CITATION_PREFIX)?;
+    let (path, query) = rest.split_once('?')?;
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for kv in query.split('&') {
+        let (k, v) = kv.split_once('=')?;
+        if seen.insert(k.to_string(), pct_decode(v, true)).is_some() {
+            return None;
+        }
+    }
+    for k in ["text", "start", "end", "prefix", "suffix"] {
+        if !seen.contains_key(k) {
+            return None;
+        }
+    }
+    if seen.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "text" | "start" | "end" | "prefix" | "suffix" | "comment"
+        )
+    }) {
+        return None;
+    }
+    if !(seen["start"].chars().all(|c| c.is_ascii_digit())
+        && seen["end"].chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(AssistantCitation {
+        thread_id: pct_decode(parts[1], false),
+        text: seen.remove("text").unwrap_or_default(),
+        comment: seen.remove("comment"),
+    })
+}
+
+/// Pull `[Assistant quote](t3-citation://…)` links out of message text.
+/// Returns the text without the links plus the parsed citations — unparseable
+/// links degrade to their label like the web's anchor fallback.
+fn extract_assistant_citations(text: &str) -> (String, Vec<AssistantCitation>) {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut citations = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(CITATION_LINK_LABEL) {
+        cleaned.push_str(&rest[..pos]);
+        let href_start = pos + CITATION_LINK_LABEL.len();
+        match rest[href_start..].find(')') {
+            Some(len) => {
+                let href = &rest[href_start..href_start + len];
+                match parse_citation_href(href) {
+                    Some(c) => citations.push(c),
+                    None => cleaned.push_str("[Assistant quote]"),
+                }
+                rest = &rest[href_start + len + 1..];
+            }
+            None => {
+                cleaned.push_str(&rest[pos..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    (cleaned.trim().to_string(), citations)
+}
+
+/// `assistantCitationLabel`: comment (trimmed) or quoted text, whitespace
+/// squashed, capped at 64 chars.
+fn citation_label(c: &AssistantCitation) -> String {
+    let base = c
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&c.text);
+    let flat = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 64 {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(64).collect::<String>())
+    }
+}
+
+/// Compact quote chip replacing a `t3-citation:` link. Clicking navigates to
+/// the cited thread — the web routes to the source thread and reveals the
+/// quoted range; the native timeline can only land on the thread.
+fn citation_chip(
+    index: usize,
+    ci: usize,
+    citation: &AssistantCitation,
+) -> gpui::Stateful<gpui::Div> {
+    let label = citation_label(citation);
+    let quote = citation
+        .comment
+        .as_ref()
+        .map(|_| {
+            citation
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|q| !q.is_empty());
+    let thread_id = citation.thread_id.clone();
+    let mut chip = div()
+        .id(("cite", index * 64 + ci))
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::canvas())
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::hover()))
+        .on_click(move |_event, window, cx| {
+            let thread_id = thread_id.clone();
+            update_view(window, cx, move |this, cx| {
+                this.select_thread(thread_id.into(), cx);
+            });
+        })
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .flex_shrink_0()
+                .child("❝"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .truncate()
+                .max_w(px(320.))
+                .text_color(theme::fg())
+                .child(label),
+        );
+    if let Some(quote) = quote {
+        chip = chip.child(
+            div()
+                .text_xs()
+                .truncate()
+                .max_w(px(220.))
+                .text_color(theme::fg_muted())
+                .child(format!("· “{quote}”")),
+        );
+    }
+    chip
+}
+
+/// Run `f` on a TextField from a context that carries no `&mut Window` —
+/// same `with_window`/windows fallback as envs.rs `edit_field`.
+fn edit_text_field<R>(
+    field: &Entity<TextField>,
+    cx: &mut gpui::Context<AppView>,
+    f: impl Fn(&mut TextField, &mut gpui::Window, &mut gpui::Context<TextField>) -> R,
+) -> Option<R> {
+    if let Some(result) = cx.with_window(field.entity_id(), |window, app| {
+        field.update(app, |field, cx| f(field, window, cx))
+    }) {
+        return Some(result);
+    }
+    for handle in cx.windows() {
+        if let Ok(result) = handle.update(cx, |_root, window, app| {
+            field.update(app, |field, cx| f(field, window, cx))
+        }) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// Focus a lazily-created TextField from a `&mut Context<AppView>` that has
+/// no `&mut Window` (the envs.rs `focus_field` pattern).
+fn focus_text_field(field: &Entity<TextField>, cx: &mut gpui::Context<AppView>) {
+    let focus = field.read(cx).focus_handle(cx);
+    if cx
+        .with_window(field.entity_id(), |window, app| focus.focus(window, app))
+        .is_some()
+    {
+        return;
+    }
+    for handle in cx.windows() {
+        if handle
+            .update(cx, |_root, window, app| focus.focus(window, app))
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Readable message out of a Failure `Exit` frame — same shape as
+/// composer.rs `rpc_error` (module-private there, so kept local).
+fn rpc_error_text(exit: &Value) -> String {
+    let error = &exit["cause"]["error"];
+    for key in ["requirement", "detail", "message", "reason"] {
+        if let Some(s) = error[key].as_str().filter(|s| !s.is_empty()) {
+            return s.to_string();
+        }
+    }
+    for candidate in [&exit["cause"]["message"], &exit["error"]["message"]] {
+        if let Some(s) = candidate.as_str() {
+            return s.to_string();
+        }
+    }
+    "The request failed.".to_string()
 }
 
 /// One selectable option row inside a pending user-input card. Clicking
@@ -634,10 +926,14 @@ impl AppView {
     }
 
     fn user_message_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
-        let text = raw_str(item, "text")
+        let raw_text = raw_str(item, "text")
             .map(str::to_owned)
             .or_else(|| item.body.clone())
             .unwrap_or_default();
+        // `[Assistant quote](t3-citation://…)` links become chips like the
+        // web's ChatMarkdown `AssistantCitationChip`; the raw href stays in
+        // `raw_text` so Copy still yields the full serialized citation.
+        let (text, citations) = extract_assistant_citations(&raw_text);
         let mut bubble = div()
             .px_3()
             .py_2()
@@ -647,6 +943,13 @@ impl AppView {
             .bg(theme::user_bubble())
             .text_color(theme::fg())
             .child(text.clone());
+        if !citations.is_empty() {
+            let mut chips = div().flex().flex_wrap().gap_1().pt_1();
+            for (ci, citation) in citations.iter().enumerate() {
+                chips = chips.child(citation_chip(index, ci, citation));
+            }
+            bubble = bubble.child(chips);
+        }
         let attachment_count = item.raw["attachments"].as_array().map_or(0, Vec::len);
         if attachment_count > 0 {
             bubble = bubble.child(div().pt_1().text_xs().text_color(theme::fg_muted()).child(
@@ -666,7 +969,13 @@ impl AppView {
             .justify_end()
             .items_end()
             .gap_1()
-            .child(copy_chip("copy-u", index, copied, item.id.clone(), text))
+            .child(copy_chip(
+                "copy-u",
+                index,
+                copied,
+                item.id.clone(),
+                raw_text,
+            ))
             .when(queued, |row| {
                 row.child(
                     div()
@@ -685,9 +994,13 @@ impl AppView {
     }
 
     fn assistant_message_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
-        let text = raw_str(item, "text")
+        let raw_text = raw_str(item, "text")
             .or(item.body.as_deref())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
+        // Quote annotations (`t3-citation:` links) become chips, same as the
+        // web's ChatMarkdown `AssistantCitationChip`.
+        let (text, citations) = extract_assistant_citations(&raw_text);
         let mut col = div()
             .flex()
             .flex_col()
@@ -696,25 +1009,316 @@ impl AppView {
             .gap_1()
             .max_w(px(760.))
             .when(item.streaming, |d| d.opacity(0.85))
-            .children(crate::markdown::render_markdown(text));
+            .children(crate::markdown::render_markdown(&text));
+        if !citations.is_empty() {
+            let mut chips = div().flex().flex_wrap().gap_1();
+            for (ci, citation) in citations.iter().enumerate() {
+                chips = chips.child(citation_chip(index, ci, citation));
+            }
+            col = col.child(chips);
+        }
         if item.streaming {
             col = col.child(streaming_dot());
         }
+        // 👎 opens the optional-comment field inline under the message.
+        if let Some((_, _, field)) = self
+            .timeline_state
+            .feedback_comment
+            .as_ref()
+            .filter(|(id, _, _)| id == &item.id)
+        {
+            col = col.child(self.feedback_comment_row(index, item, field));
+        }
         let copied = self.timeline_state.copied.as_deref() == Some(item.id.as_str());
+        let mut actions = div().flex().flex_col().gap_0p5().child(copy_chip(
+            "copy-a",
+            index,
+            copied,
+            item.id.clone(),
+            raw_text,
+        ));
+        // Hover feedback thumbs on every settled assistant message; a click
+        // on a non-Codex thread explains provider.uploadFeedback isn't
+        // available there (same message as the web's /feedback gate).
+        if !item.streaming {
+            let sent = self.timeline_state.feedback_sent.contains(&item.id);
+            let busy = self.timeline_state.feedback_in_flight.contains(&item.id);
+            // The item's own threadId is canonical; fall back to the
+            // selected thread (this row only renders in it anyway).
+            let thread_id = raw_str(item, "threadId")
+                .map(str::to_owned)
+                .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()))
+                .unwrap_or_default();
+            for (up, glyph, eid) in [(true, "👍", 0usize), (false, "👎", 1usize)] {
+                let tid = thread_id.clone();
+                let iid = item.id.clone();
+                let mut chip = div()
+                    .id(("fb", index * 4 + eid))
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .opacity(if sent { 0.4 } else { 0. })
+                    .group_hover("msg", |s| s.opacity(if sent { 0.4 } else { 1. }));
+                if sent || busy {
+                    chip = chip.child(if sent { "✓" } else { "…" });
+                } else {
+                    chip = chip
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                        .on_click(move |_event, window, cx| {
+                            let tid = tid.clone();
+                            let iid = iid.clone();
+                            update_view(window, cx, move |this, cx| {
+                                if up {
+                                    this.send_message_feedback(
+                                        tid,
+                                        "thumbs up".to_string(),
+                                        iid,
+                                        cx,
+                                    );
+                                } else {
+                                    this.open_feedback_comment(iid, tid, cx);
+                                }
+                            });
+                        })
+                        .child(glyph);
+                }
+                actions = actions.child(chip);
+            }
+        }
         div()
             .group("msg")
             .flex()
             .items_start()
             .gap_2()
             .child(col)
-            .child(copy_chip(
-                "copy-a",
-                index,
-                copied,
-                item.id.clone(),
-                text.to_string(),
-            ))
+            .child(actions)
             .into_any_element()
+    }
+
+    /// provider.uploadFeedback only exists for the Codex adapter — same
+    /// gate the web puts on its `/feedback` composer command.
+    fn feedback_upload_allowed(&self) -> bool {
+        match self.state.selected_thread() {
+            Some(thread) if !thread.provider_instances.is_empty() => thread
+                .provider_instances
+                .iter()
+                .any(|p| p.as_ref() == "codex"),
+            _ => self.provider == "codex",
+        }
+    }
+
+    /// The Codex-only explanation shown when thumbs are clicked on a
+    /// non-Codex thread (mirrors composer.rs `/feedback` handling).
+    fn feedback_unsupported(&mut self, cx: &mut gpui::Context<Self>) {
+        self.push_toast(
+            ToastKind::Error,
+            "Feedback upload is only supported for Codex threads",
+            None,
+            None,
+            cx,
+        );
+    }
+
+    /// The 👎 inline comment row: free-text `reason` + Send / ×. Enter
+    /// submits through the field's `PromptSubmitted` subscription.
+    fn feedback_comment_row(
+        &self,
+        index: usize,
+        item: &TurnItemView,
+        field: &Entity<TextField>,
+    ) -> gpui::Div {
+        let thread_id = raw_str(item, "threadId").unwrap_or_default().to_string();
+        let item_id = item.id.clone();
+        let field = field.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .pt_1()
+            .child(div().text_xs().text_color(theme::fg_muted()).child("👎"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(theme::fg())
+                    .child(field.clone()),
+            )
+            .child({
+                let tid = thread_id.clone();
+                let iid = item_id.clone();
+                let f = field.clone();
+                div()
+                    .id(("fb-send", index))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(theme::primary())
+                    .text_color(gpui::white())
+                    .hover(|s| s.opacity(0.9))
+                    .on_click(move |_event, window, cx| {
+                        let comment = f.update(cx, |field, cx| {
+                            let len = field.text_length_utf16(window, cx).unwrap_or(0);
+                            field
+                                .text_for_range(0..len, &mut None, window, cx)
+                                .unwrap_or_default()
+                        });
+                        let tid = tid.clone();
+                        let iid = iid.clone();
+                        update_view(window, cx, move |this, cx| {
+                            let reason = match comment.trim() {
+                                "" => "thumbs down".to_string(),
+                                c => format!("thumbs down: {c}"),
+                            };
+                            this.send_message_feedback(tid, reason, iid, cx);
+                        });
+                    })
+                    .child("Send")
+            })
+            .child(
+                div()
+                    .id(("fb-cancel", index))
+                    .px_1()
+                    .py_0p5()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.text_color(theme::fg()))
+                    .on_click(move |_event, window, cx| {
+                        update_view(window, cx, move |this, cx| {
+                            this.timeline_state.feedback_comment = None;
+                            cx.notify();
+                        });
+                    })
+                    .child("×"),
+            )
+    }
+
+    /// 👎 opens the comment field; the entered text becomes the uploaded
+    /// `reason` (the only free field the feedback contract carries).
+    fn open_feedback_comment(
+        &mut self,
+        item_id: String,
+        thread_id: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.timeline_state.feedback_in_flight.contains(&item_id)
+            || self.timeline_state.feedback_sent.contains(&item_id)
+        {
+            return;
+        }
+        if !self.feedback_upload_allowed() {
+            self.feedback_unsupported(cx);
+            return;
+        }
+        let field = match &self.timeline_state.feedback_comment {
+            Some((_, _, field)) => {
+                let field = field.clone();
+                // Reopening on a different message starts the comment fresh.
+                edit_text_field(&field, cx, |field, window, cx| field.reset(window, cx));
+                field
+            }
+            None => {
+                let field = cx.new(|cx| TextField::new("Optional — what went wrong?", cx));
+                let sub = cx.subscribe(&field, move |this, _field, event: &PromptSubmitted, cx| {
+                    let (item_id, thread_id) = match &this.timeline_state.feedback_comment {
+                        Some((i, t, _)) => (i.clone(), t.clone()),
+                        None => return,
+                    };
+                    let reason = match event.0.trim() {
+                        "" => "thumbs down".to_string(),
+                        c => format!("thumbs down: {c}"),
+                    };
+                    this.send_message_feedback(thread_id, reason, item_id, cx);
+                });
+                self.timeline_state.feedback_sub = Some(sub);
+                field
+            }
+        };
+        focus_text_field(&field, cx);
+        self.timeline_state.feedback_comment = Some((item_id, thread_id, field));
+        cx.notify();
+    }
+
+    /// `provider.uploadFeedback` — payload mirrors the web `/feedback`
+    /// command exactly: `{threadId, reason}` (`reason` is the contract's
+    /// only free field; there is no rating field on the wire).
+    fn send_message_feedback(
+        &mut self,
+        thread_id: String,
+        reason: String,
+        item_id: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.timeline_state.feedback_in_flight.contains(&item_id)
+            || self.timeline_state.feedback_sent.contains(&item_id)
+        {
+            return;
+        }
+        if !self.feedback_upload_allowed() {
+            self.feedback_unsupported(cx);
+            return;
+        }
+        let mut payload = json!({ "threadId": thread_id });
+        if !reason.trim().is_empty() {
+            payload["reason"] = json!(reason.trim());
+        }
+        let Some(rx) = self.send_query("provider.uploadFeedback", payload) else {
+            self.push_toast(
+                ToastKind::Error,
+                "Feedback upload failed",
+                Some("Not connected to a server.".to_string()),
+                None,
+                cx,
+            );
+            return;
+        };
+        self.timeline_state
+            .feedback_in_flight
+            .insert(item_id.clone());
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                this.timeline_state.feedback_in_flight.remove(&item_id);
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.timeline_state.feedback_sent.insert(item_id.clone());
+                    // Close the comment row only if it's still this message's.
+                    if this
+                        .timeline_state
+                        .feedback_comment
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| id == &item_id)
+                    {
+                        this.timeline_state.feedback_comment = None;
+                    }
+                    this.push_toast(
+                        ToastKind::Success,
+                        "Feedback uploaded to provider",
+                        None,
+                        None,
+                        cx,
+                    );
+                } else {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Feedback upload failed",
+                        Some(rpc_error_text(&exit)),
+                        None,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn reasoning_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
@@ -1981,6 +2585,58 @@ impl AppView {
             .bg(theme::raised())
             .overflow_hidden()
             .child(header);
+
+        // Delegated-task approval routing: an app-owned subagent's request
+        // belongs to its child thread, not the parent — the child's own shell
+        // row carries `has_pending_request`. Surface a jump chip here like
+        // the web's `pendingSubagentRequest` flag on the parent thread.
+        let child_thread_id = raw_str(item, "childThreadId").map(str::to_owned);
+        let child_pending = child_thread_id.as_deref().is_some_and(|cid| {
+            self.state
+                .threads
+                .iter()
+                .any(|t| t.id.as_ref() == cid && t.has_pending_request)
+        });
+        if let Some(cid) = &child_thread_id {
+            if child_pending || item.status == "waiting" {
+                let cid = cid.clone();
+                card = card.child(
+                    div()
+                        .id(("subagent-pending", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_3()
+                        .mb_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(warning_border())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_click(move |_event, window, cx| {
+                            let cid = cid.clone();
+                            update_view(window, cx, move |this, cx| {
+                                this.select_thread(cid.into(), cx);
+                            });
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(warning())
+                                .flex_shrink_0()
+                                .child("⚠"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::fg())
+                                .child("Approval needed in delegated task — open thread"),
+                        ),
+                );
+            }
+        }
 
         if expanded {
             let body = raw_str(item, "result")
