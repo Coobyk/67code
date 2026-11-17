@@ -40,6 +40,7 @@ pub fn is_windowed_tag(tag: &str) -> bool {
             | "provider.chatgpt.handoff.subscribe"
             | "pullRequests.subscribeRefreshes"
             | "bedtimeReminder.subscribe"
+            | "cloud.installRelayClient"
     )
 }
 
