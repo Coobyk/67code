@@ -11,8 +11,7 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText,
-    SharedString, StrikethroughStyle, StyledText, TextAlign, UnderlineStyle, div, prelude::*, px,
-    rems, rgb, rgba,
+    SharedString, StrikethroughStyle, StyledText, TextAlign, div, prelude::*, px, rems, rgb,
 };
 
 use crate::theme;
@@ -38,16 +37,22 @@ pub fn render_markdown(text: &str) -> Vec<AnyElement> {
 }
 
 /// Render a fenced code block (used both standalone and inside markdown).
+///
+/// Mirrors the web `MarkdownCodeBlock`: `rounded-lg` card on
+/// `--code-background` with a `--contrast-border` hairline, a mono `text-2xs`
+/// language header at 72% code-foreground (pt-1.5 pr-1.5 pl-3, no divider),
+/// and the `pre` body at `--font-size-code` (13px) with `leading-snug` and
+/// `.chat-markdown pre` padding (0.8rem × 0.9rem).
 pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
     let code = code.trim_end_matches('\n');
     let mut card = div()
         .w_full()
         .flex()
         .flex_col()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
         .border_color(theme::border())
-        .bg(theme::canvas())
+        .bg(theme::code_bg())
         .overflow_hidden();
 
     if let Some(lang) = language.filter(|l| !l.trim().is_empty()) {
@@ -55,12 +60,12 @@ pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
             div()
                 .flex()
                 .w_full()
-                .px_3()
-                .py(px(4.))
-                .border_b_1()
-                .border_color(theme::border())
-                .text_xs()
-                .text_color(theme::fg_muted())
+                .pt(px(6.))
+                .pr(px(6.))
+                .pl_3()
+                .font_family(theme::FONT_MONO)
+                .text_size(theme::text_size::XS_2)
+                .text_color(theme::code_header_fg())
                 .child(lang.to_string()),
         );
     }
@@ -76,9 +81,11 @@ pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
             .id(("c67-md-code", fnv1a(code) as usize))
             .w_full()
             .overflow_x_scroll()
-            .p_3()
-            .font_family("monospace")
-            .text_xs()
+            .px(px(14.4))
+            .py(px(12.8))
+            .font_family(theme::FONT_MONO)
+            .text_size(theme::code_text_size())
+            .line_height(px(18.))
             .whitespace_nowrap()
             .text_color(theme::fg())
             .child(text),
@@ -479,23 +486,32 @@ fn render_blocks(blocks: &[Block], ctx: &mut RenderCtx) -> Vec<AnyElement> {
 }
 
 fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
-    // Blocks carry only top margin (like the web CSS's collapsed vertical
-    // rhythm); the first block in a document/quote hugs the top edge.
-    let gap = px(if first { 0. } else { 10. });
+    // Blocks carry only top margin, reproducing the collapsed-margin rhythm
+    // of the web CSS: every `.chat-markdown` block element has `margin:
+    // 0.65rem 0`, headings `1.25rem 0 0.5rem`; adjacent vertical margins
+    // collapse to their max, so a single top margin per block is equivalent.
+    let gap = px(if first { 0. } else { 10.4 });
     match block {
         Block::Heading { level, text } => {
             // Mirrors apps/web chat-markdown heading scale: 600 weight,
-            // h1 1.25rem, h2 1.125rem, h3 1rem, h4-h6 0.875rem, h6 muted.
+            // line-height 1.3, h1 1.25rem, h2 1.125rem, h3 1rem, h4-h6
+            // 0.875rem, h6 muted.
             let size = match level {
                 1 => rems(1.25),
                 2 => rems(1.125),
                 3 => rems(1.0),
                 _ => rems(0.875),
             };
+            let px_size = match level {
+                1 => 20.,
+                2 => 18.,
+                3 => 16.,
+                _ => 14.,
+            };
             div()
-                .mt(px(if first { 0. } else { 16. }))
-                .mb(px(6.))
+                .mt(px(if first { 0. } else { 20. }))
                 .text_size(size)
+                .line_height(px(px_size * 1.3))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(if *level == 6 {
                     theme::fg_muted()
@@ -508,7 +524,8 @@ fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
         Block::Paragraph(text) => div()
             .mt(gap)
             .text_sm()
-            .text_color(theme::fg())
+            .line_height(px(22.75))
+            .text_color(theme::chat_fg())
             .child(inline_element(text, ctx))
             .into_any_element(),
         Block::Code { language, code } => div()
@@ -518,8 +535,8 @@ fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
         Block::Quote(inner) => div()
             .mt(gap)
             .border_l_2()
-            .border_color(rgba(0xf5f5f559))
-            .pl_3()
+            .border_color(theme::quote_border())
+            .pl(px(12.8))
             .flex()
             .flex_col()
             .children(render_blocks(inner, ctx))
@@ -527,11 +544,10 @@ fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
         Block::List(items) => render_list(items, first, ctx),
         Block::Table(table) => render_table(table, first, ctx),
         Block::Rule => div()
-            .mt(px(if first { 0. } else { 12. }))
-            .mb(px(4.))
+            .mt(gap)
             .h(px(1.))
             .w_full()
-            .bg(theme::border())
+            .bg(theme::rule_color())
             .into_any_element(),
     }
 }
@@ -548,27 +564,29 @@ fn render_list(items: &[ListItem], first: bool, ctx: &mut RenderCtx) -> AnyEleme
     let mut col = div()
         .flex()
         .flex_col()
-        .mt(px(if first { 0. } else { 10. }))
+        .mt(px(if first { 0. } else { 10.4 }))
         .gap_1()
         .text_sm()
-        .text_color(theme::fg());
+        .line_height(px(22.75))
+        .text_color(theme::chat_fg());
 
     for item in items {
+        // Marker column = the web's `--list-gutter` (1.25rem = 20px).
         let marker: AnyElement = match item.marker {
             ListMarker::Number(n) => div()
-                .w(px(24.))
+                .w(px(20.))
                 .flex_none()
                 .text_color(theme::fg_muted())
                 .child(format!("{n}."))
                 .into_any_element(),
             ListMarker::Bullet => div()
-                .w(px(24.))
+                .w(px(20.))
                 .flex_none()
                 .text_color(theme::fg_muted())
                 .child(bullet_glyph(item.depth))
                 .into_any_element(),
             ListMarker::Task(checked) => div()
-                .w(px(24.))
+                .w(px(20.))
                 .flex_none()
                 .flex()
                 .justify_center()
@@ -637,17 +655,17 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
     let align_at = |ix: usize| table.aligns.get(ix).copied().unwrap_or(Align::Left);
 
     let mut tbl = div()
-        .mt(px(if first { 0. } else { 10. }))
+        .mt(px(if first { 0. } else { 10.4 }))
         .w_full()
         .flex()
         .flex_col()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
         .border_color(theme::border())
         .overflow_hidden()
         .bg(theme::canvas())
         .text_xs()
-        .text_color(theme::fg());
+        .text_color(theme::chat_fg());
 
     let mut hrow = div().flex().w_full().bg(theme::raised());
     for ix in 0..cols {
@@ -699,15 +717,15 @@ struct InlineStyle {
 
 fn inline_highlight(st: &InlineStyle) -> HighlightStyle {
     HighlightStyle {
-        color: st.link.is_some().then(|| theme::primary().into()),
+        // `.chat-markdown a` — `--info-foreground`, `text-decoration: none`
+        // (the dotted underline only appears on hover/focus, which styled
+        // spans can't express).
+        color: st.link.is_some().then(|| theme::info_fg().into()),
         font_weight: st.bold.then_some(FontWeight::BOLD),
         font_style: st.italic.then_some(FontStyle::Italic),
-        background_color: st.code.then(|| theme::user_bubble().into()),
-        underline: st.link.is_some().then_some(UnderlineStyle {
-            color: Some(theme::primary().into()),
-            thickness: px(1.),
-            wavy: false,
-        }),
+        // `:not(pre) > code` — fg·10% fill, 4px radius (radius/padding aren't
+        // expressible on a highlight run; the bg is the visible part).
+        background_color: st.code.then(|| theme::inline_code_bg().into()),
         strikethrough: st.strike.then_some(StrikethroughStyle {
             thickness: px(1.),
             color: None,

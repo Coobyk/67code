@@ -57,10 +57,6 @@ fn danger() -> Rgba {
     rgb(0xff5a5a)
 }
 
-fn danger_bg() -> Rgba {
-    rgba(0xff5a5a14)
-}
-
 fn danger_border() -> Rgba {
     rgba(0xff5a5a55)
 }
@@ -86,43 +82,226 @@ fn raw_str<'a>(item: &'a TurnItemView, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn status_color(item: &TurnItemView) -> Rgba {
-    if item.status == "failed" {
-        danger()
-    } else if item.status == "waiting" {
-        warning()
-    } else if is_live(item) {
-        theme::primary()
-    } else if item.status == "completed" {
-        success()
-    } else {
-        theme::fg_muted()
+// ── Work-log rows (apps/web WorkLog.tsx) ─────────────────────────
+//
+// Tool-ish turn items render as flat `WorkLogRow` lines — a 24-px icon
+// slot, a truncated `text-secondary-label` 14-px label, and a trailing
+// hover-revealed timestamp plus disclosure chevron. No card chrome.
+
+/// Kinds that take the flat work-log treatment rather than a card.
+fn is_work_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "reasoning"
+            | "command_execution"
+            | "dynamic_tool"
+            | "file_change"
+            | "subagent"
+            | "web_search"
+            | "file_search"
+            | "todo_list"
+            | "approval_request"
+            | "user_input_request"
+            | "system_notice"
+            | "notification"
+    )
+}
+
+/// DejaVu-covered stand-ins for the lucide `WorkEntryIconName` set the web
+/// maps each entry kind to (`toolIconFor` in TimelineWorkEntryRow.logic.ts).
+fn work_glyph(kind: &str) -> &'static str {
+    match kind {
+        // terminal
+        "command_execution" => "❯",
+        // square-pen
+        "file_change" => "✎",
+        // brain
+        "reasoning" => "☁",
+        // bot
+        "subagent" => "⌘",
+        // globe
+        "web_search" => "⊚",
+        // search
+        "file_search" => "◍",
+        // list-todo
+        "todo_list" => "☑",
+        // message-circle / shield
+        "approval_request" | "user_input_request" => "?",
+        // info
+        "system_notice" | "notification" => "ℹ",
+        // hammer / wrench
+        _ => "⚒",
     }
 }
 
-fn status_dot(color: Rgba) -> gpui::Div {
-    div()
-        .w(px(6.))
-        .h(px(6.))
-        .rounded_full()
-        .bg(color)
-        .flex_shrink_0()
+/// `approval_request`/`user_input_request` icon per `requestKind` — mirrors
+/// `APPROVAL_PRESENTATION` in TimelinePendingApprovalRow.tsx.
+fn approval_glyph(kind: &str) -> &'static str {
+    match kind {
+        "command" => "❯",
+        "file-change" => "✎",
+        "file-read" => "◉",
+        "permission" | "mcp-elicitation" => "⚒",
+        _ => "?",
+    }
 }
 
-fn chevron(expanded: bool) -> gpui::Div {
+/// The `w-6` icon slot: a `size-4` (16-px) glyph centered in 24 px.
+/// `text-icon-muted` normally; failed calls tint it `text-tool-error-icon/40`
+/// like `failedToolIconClassName` does for tintable icons.
+fn work_icon(glyph: &'static str, failed: bool) -> gpui::Div {
     div()
-        .text_xs()
-        .text_color(theme::fg_muted())
+        .w(px(24.))
         .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(15.))
+        .text_color(if failed {
+            theme::tool_error_icon()
+        } else {
+            theme::icon_muted()
+        })
+        .child(glyph)
+}
+
+/// Trailing `size-3` ChevronRight at `text-icon-muted opacity-70`, rotated
+/// 90° while expanded — rendered as ▸/▾ since there is no icon font.
+fn work_chevron(expanded: bool) -> gpui::Div {
+    div()
+        .w(px(16.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .opacity(0.7)
+        .text_color(theme::icon_muted())
         .child(if expanded { "▾" } else { "▸" })
 }
 
-fn streaming_dot() -> gpui::Div {
+/// Days since the Unix epoch for a civil `Y-M-D` (Howard Hinnant's
+/// days_from_civil) — lets timestamps pick today/yesterday/older like the
+/// web's `formatDayAwareTimestamp`.
+fn civil_days(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// `TimelineRowTimestamp` — `text-xs text-muted-foreground tabular-nums`,
+/// `opacity-0` until the `.group("timeline-row")` ancestor is hovered.
+/// Rendered UTC (the native build has no timezone database).
+fn item_timestamp(item: &TurnItemView) -> Option<gpui::Div> {
+    let iso = raw_str(item, "updatedAt")?;
+    let (date, time) = iso.split_once('T')?;
+    let (y, m, d) = (
+        date.get(..4)?.parse::<i64>().ok()?,
+        date.get(5..7)?.parse::<i64>().ok()?,
+        date.get(8..10)?.parse::<i64>().ok()?,
+    );
+    let (mut h, min) = (time.get(..2)?.parse::<u32>().ok()?, time.get(3..5)?);
+    // Locale default ≈ 12-hour for en-US.
+    let ampm = if h < 12 { "AM" } else { "PM" };
+    h %= 12;
+    if h == 0 {
+        h = 12;
+    }
+    let hhmm = format!("{h}:{min} {ampm}");
+    let days = civil_days(y, m, d);
+    let today = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        / 86_400) as i64;
+    let label = match today - days {
+        diff if diff <= 0 => hhmm,
+        1 => format!("yesterday at {hhmm}"),
+        _ => format!("{m}/{d}/{y} {hhmm}"),
+    };
+    // Both ancestors gate the reveal: "timeline-row" on work rows,
+    // "msg" on the under-bubble meta rows of user/assistant messages.
+    Some(
+        div()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(theme::fg_muted())
+            .opacity(0.)
+            .group_hover("timeline-row", |s| s.opacity(1.))
+            .group_hover("msg", |s| s.opacity(1.))
+            .child(label),
+    )
+}
+
+/// Row shell: `group/timeline-row … rounded-md px-0.5 py-0(.5)` over a
+/// `WorkLogLine` (`min-h-6 gap-1.5 text-sm`). Clickable rows toggle.
+fn work_row_line() -> gpui::Div {
     div()
+        .flex()
+        .items_center()
+        .min_h(px(24.))
+        .w_full()
+        .min_w_0()
+        .gap(px(6.))
+        .px(px(2.))
+        .py(px(2.))
         .text_sm()
-        .text_color(theme::primary())
-        .flex_shrink_0()
-        .child("●")
+}
+
+/// `WorkLogDetails kind="panel"`: the expanded body under a work row —
+/// `mt-0.5 mb-1.5 pb-2`, a mono `pre` at `--font-size-code` (13px) in
+/// `--secondary-label`, `leading-relaxed`, `whitespace-pre-wrap`, capped at
+/// `max-h-64` (256px).
+fn detail_panel(namespace: &'static str, index: usize) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id((namespace, index))
+        .w_full()
+        .mt(px(2.))
+        .mb(px(6.))
+        .pb_2()
+        .overflow_y_scroll()
+        .max_h(px(256.))
+        .font_family(theme::FONT_MONO)
+        .text_size(theme::code_text_size())
+        .line_height(px(21.))
+        .text_color(theme::secondary_label())
+}
+
+/// `WorkLogDetails kind="text"`: indented (`ms-7` = 28px) prose detail,
+/// `px-0.5 py-1`, capped at `max-h-96` (384px).
+fn detail_text(namespace: &'static str, index: usize) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id((namespace, index))
+        .w_full()
+        .ml(px(28.))
+        .px(px(2.))
+        .py_1()
+        .overflow_y_scroll()
+        .max_h(px(384.))
+        .text_sm()
+        .line_height(px(22.75))
+        .text_color(theme::secondary_label())
+}
+
+/// One-line `WorkLogRow` header: icon slot + truncated secondary-label +
+/// trailing slots. `index` seeds the toggle target's element id.
+fn work_header(
+    index: usize,
+    item: &TurnItemView,
+    glyph: &'static str,
+    label: gpui::Div,
+) -> gpui::Stateful<gpui::Div> {
+    let failed = item.status == "failed";
+    work_row_line()
+        .id(("head", index))
+        .group("timeline-row")
+        .cursor_pointer()
+        .on_click(toggle_expanded(item.id.clone()))
+        .child(work_icon(glyph, failed))
+        .child(label.flex_1().min_w_0().truncate())
 }
 
 /// `render_timeline` takes `&self`, so click handlers reach the view through
@@ -228,29 +407,33 @@ fn cap_detail(text: String) -> String {
     )
 }
 
-/// "Show output" / "Show detail" affordance next to a collapsible row's
-/// chevron — the whole header still toggles, the label just advertises it.
-fn disclosure_chip(expanded: bool, has_output: bool) -> gpui::Div {
-    let label = match (expanded, has_output) {
-        (true, true) => "Hide output",
-        (false, true) => "Show output",
-        (true, false) => "Hide detail",
-        (false, false) => "Show detail",
-    };
+/// Ghost icon button — the web's `MessageCopyButton variant="ghost"` / thumbs
+/// glyphs: a `size-6` muted target revealed on row hover (callers may set a
+/// starting opacity for "already sent" states).
+fn ghost_icon_chip(
+    id: impl Into<gpui::ElementId>,
+    glyph: &'static str,
+) -> gpui::Stateful<gpui::Div> {
     div()
-        .px_1p5()
-        .py_0p5()
+        .id(id)
+        .w(px(24.))
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded_md()
-        .border_1()
-        .border_color(theme::border())
-        .text_xs()
+        .text_sm()
+        .cursor_pointer()
         .text_color(theme::fg_muted())
-        .flex_shrink_0()
-        .child(label)
+        .opacity(0.)
+        .group_hover("msg", |s| s.opacity(1.))
+        .group_hover("timeline-row", |s| s.opacity(1.))
+        .hover(|s| s.text_color(theme::fg()))
+        .child(glyph)
 }
 
-/// Small "Copy" chip revealed when its `.group("msg")` ancestor is hovered;
-/// writes `text` to the clipboard and flips to "Copied".
+/// "Copy" ghost chip revealed when its `.group("msg")` ancestor is hovered;
+/// writes `text` to the clipboard and flips to a check.
 fn copy_chip(
     key: &'static str,
     index: usize,
@@ -258,26 +441,16 @@ fn copy_chip(
     item_id: String,
     text: String,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id((key, index))
-        .px_1p5()
-        .py_0p5()
-        .rounded_md()
-        .text_xs()
-        .cursor_pointer()
-        .text_color(theme::fg_muted())
-        .opacity(0.)
-        .group_hover("msg", |s| s.opacity(1.))
-        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-        .on_click(move |_event, window, cx| {
+    ghost_icon_chip((key, index), if copied { "✓" } else { "❐" }).on_click(
+        move |_event, window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             let item_id = item_id.clone();
             update_view(window, cx, move |this, cx| {
                 this.timeline_state.copied = Some(item_id);
                 cx.notify();
             });
-        })
-        .child(if copied { "Copied" } else { "Copy" })
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -721,25 +894,14 @@ fn diff_line_color(line: &str) -> Rgba {
     }
 }
 
-/// Scrollable detail area capped at roughly 16 lines; callers set the font
-/// (mono for command/tool output and diffs, regular for prose). The explicit
-/// x-scroller matters: nowrap diff lines would otherwise propagate their
-/// intrinsic width through the visible-x ancestor chain and widen the whole
-/// timeline column, pushing every header's trailing chip/chevron offscreen.
-fn detail_scroll(namespace: &'static str, index: usize) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id((namespace, index))
-        .w_full()
-        .overflow_y_scroll()
-        .overflow_x_scroll()
-        .max_h(px(288.))
-        .bg(theme::canvas())
-        .border_t_1()
-        .border_color(theme::border())
-        .px_3()
-        .py_2()
-        .text_xs()
-        .line_height(px(16.))
+/// `RuntimeRequestIcon`/`ToolActivityIconView` colors for a settled request
+/// outcome: approved green, declined/failed muted, in-flight warning.
+fn outcome_color(item: &TurnItemView) -> Rgba {
+    match item.status.as_str() {
+        "completed" => success(),
+        "cancelled" | "interrupted" | "failed" => theme::fg_muted(),
+        _ => warning(),
+    }
 }
 
 fn request_kind_label(kind: &str) -> &'static str {
@@ -767,68 +929,92 @@ impl AppView {
     }
 
     fn render_timeline_inner(&self) -> impl IntoElement {
-        let mut list = div()
-            .id("messages")
+        // `.chat-scroll` side gutter (3rem ≥ sm, 12px below — fixed 48px keeps
+        // the wide-layout look) around a `.chat-content-lane` centered at
+        // `--chat-content-max-width` = 736px.
+        let mut lane = div()
+            .mx_auto()
+            .w_full()
+            .max_w(px(theme::CHAT_MAX_W))
             .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_4()
-            .gap_3();
+            .flex_col();
+        let list = || {
+            div()
+                .id("messages")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+                .px(px(48.))
+        };
+        // Top/bottom spacers ≈ chat-list-header/footer (h-3 / h-4).
+        lane = lane.child(div().h(px(12.)).flex_shrink_0());
 
-        if self.state.connection != ConnectionStatus::Mock {
-            if self.thread_items.is_empty() {
-                if self.turn_started_at.is_some() {
-                    return list.child(self.render_working_row());
-                }
-                return list.child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(theme::fg_muted())
-                        .text_sm()
-                        .child("No messages yet — say something to the agent."),
-                );
-            }
-            for (i, item) in self.thread_items.iter().enumerate() {
-                list = list.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .max_w_full()
-                        .child(self.render_turn_item(i, item)),
-                );
-            }
-            if self.turn_started_at.is_some() {
-                list = list.child(self.render_working_row());
-            }
-            return list;
-        }
-
-        if self.state.messages.is_empty() {
-            return list.child(
+        let empty_state = |lane: gpui::Div| {
+            lane.child(
                 div()
                     .flex_1()
+                    .min_h(px(120.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(theme::fg_muted())
                     .text_sm()
-                    .child("No messages yet — say something to the agent."),
-            );
+                    .child("Send a message to start the conversation."),
+            )
+        };
+
+        if self.state.connection != ConnectionStatus::Mock {
+            if self.thread_items.is_empty() {
+                if self.turn_started_at.is_some() {
+                    lane = lane.child(self.render_working_row());
+                    return list().child(lane);
+                }
+                return list().child(empty_state(lane));
+            }
+            for (i, item) in self.thread_items.iter().enumerate() {
+                // Row rhythm: pb-4 under messages/plans, pb-2 under work-log
+                // entries and events; consecutive work entries touch (the
+                // web groups them at py-0 inside group-content).
+                let next = self.thread_items.get(i + 1);
+                let pad = if matches!(
+                    item.kind.as_str(),
+                    "user_message" | "assistant_message" | "proposed_plan"
+                ) {
+                    16.
+                } else if is_work_kind(&item.kind) && next.is_some_and(|n| is_work_kind(&n.kind)) {
+                    0.
+                } else {
+                    8.
+                };
+                lane = lane.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .max_w_full()
+                        .pb(px(pad))
+                        .child(self.render_turn_item(i, item)),
+                );
+            }
+            if self.turn_started_at.is_some() {
+                lane = lane.child(self.render_working_row());
+            }
+            lane = lane.child(div().h(px(16.)).flex_shrink_0());
+            return list().child(lane);
+        }
+
+        if self.state.messages.is_empty() {
+            return list().child(empty_state(lane));
         }
 
         for (i, message) in self.state.messages.iter().enumerate() {
             let bubble = div()
-                .px_3()
-                .py_2()
-                .rounded_lg()
+                .p_3()
+                .rounded(theme::radius::XL2)
                 .text_sm()
-                .max_w(px(560.))
+                .max_w(gpui::relative(0.8))
                 .child(message.text.clone());
             let copied = self.timeline_state.copied.as_deref() == Some(message.text.as_ref());
             let chip = copy_chip(
@@ -842,34 +1028,43 @@ impl AppView {
                 Role::User => div()
                     .group("msg")
                     .flex()
-                    .justify_end()
+                    .flex_col()
                     .items_end()
                     .gap_1()
-                    .child(chip)
-                    .child(bubble.bg(theme::user_bubble()).text_color(theme::fg())),
+                    .child(bubble.bg(theme::user_bubble()).text_color(theme::fg()))
+                    .child(
+                        div()
+                            .flex()
+                            .w_full()
+                            .max_w(gpui::relative(0.8))
+                            .justify_end()
+                            .pr_1()
+                            .child(chip),
+                    ),
                 Role::Agent => div()
                     .group("msg")
                     .flex()
-                    .justify_start()
-                    .items_end()
+                    .flex_col()
                     .gap_1()
                     .child(
-                        bubble
-                            .bg(theme::raised())
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_color(theme::fg()),
+                        div()
+                            .px_1()
+                            .py_0p5()
+                            .text_sm()
+                            .text_color(theme::chat_fg())
+                            .child(message.text.clone()),
                     )
-                    .child(chip),
+                    .child(div().flex().items_center().gap_0p5().child(chip)),
             };
-            list = list.child(div().id(("msg", i)).child(row));
+            lane = lane.child(div().id(("msg", i)).pb_4().child(row));
         }
-        list
+        lane = lane.child(div().h(px(16.)).flex_shrink_0());
+        list().child(lane)
     }
 
-    /// Live "Working for Ns" footer row shown while a turn runs, matching the
-    /// web `WorkingTimelineRow`: muted tabular-nums elapsed text plus a small
-    /// pulsing dot driven by `working_pulse` (repainted every 500 ms).
+    /// `WorkingTimelineRow`: `border-b border-border/60 pb-2 pt-1` around a
+    /// `h-6 items-baseline gap-2 px-1 text-sm text-muted-foreground
+    /// tabular-nums` "Working for Ns" line.
     fn render_working_row(&self) -> impl IntoElement {
         let elapsed = self
             .turn_started_at
@@ -882,23 +1077,21 @@ impl AppView {
         } else {
             format!("{}h {:02}m", elapsed / 3600, (elapsed % 3600) / 60)
         };
-        let pulse = self.working_pulse % 2 == 0;
         div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_1()
+            .border_b_1()
+            .border_color(theme::hairline())
+            .pb_2()
+            .pt_1()
             .child(
                 div()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded_full()
-                    .bg(theme::primary())
-                    .opacity(if pulse { 1.0 } else { 0.3 }),
-            )
-            .child(
-                div()
+                    .flex()
+                    .h(px(24.))
+                    .min_w_0()
+                    .items_baseline()
+                    .gap_2()
+                    .px_1()
                     .text_sm()
+                    .line_height(px(22.75))
                     .text_color(theme::fg_muted())
                     .child(format!("Working for {label}")),
             )
@@ -914,7 +1107,7 @@ impl AppView {
             "file_change" => self.file_change_row(index, item),
             "approval_request" => self.approval_row(index, item),
             "user_input_request" => self.user_input_row(index, item),
-            "todo_list" => self.todo_list_row(item),
+            "todo_list" => self.todo_list_row(index, item),
             "system_notice" | "notification" => self.notice_row(item),
             "error" => self.error_row(item),
             "proposed_plan" => self.proposed_plan_row(item),
@@ -934,15 +1127,17 @@ impl AppView {
         // web's ChatMarkdown `AssistantCitationChip`; the raw href stays in
         // `raw_text` so Copy still yields the full serialized citation.
         let (text, citations) = extract_assistant_citations(&raw_text);
+        // `UserMessageBubble`: `max-w-[80%] rounded-2xl bg-message p-3
+        // text-sm` rendered as ChatMarkdown, right-aligned.
         let mut bubble = div()
-            .px_3()
-            .py_2()
-            .rounded_lg()
+            .max_w(gpui::relative(0.8))
+            .p_3()
+            .rounded(theme::radius::XL2)
             .text_sm()
-            .max_w(px(560.))
+            .line_height(px(22.75))
             .bg(theme::user_bubble())
             .text_color(theme::fg())
-            .child(text.clone());
+            .children(crate::markdown::render_markdown(&text));
         if !citations.is_empty() {
             let mut chips = div().flex().flex_wrap().gap_1().pt_1();
             for (ci, citation) in citations.iter().enumerate() {
@@ -963,36 +1158,58 @@ impl AppView {
         // Queued turns (web `inputIntent: "queued_turn"`) get a marker chip —
         // they have not run yet, unlike a normal user message.
         let queued = raw_str(item, "inputIntent") == Some("queued_turn");
+        // Under-bubble meta row: `max-w-[80%] justify-end pe-1 text-xs` with
+        // the day-aware timestamp and ghost icon buttons, revealed on hover.
+        let mut meta = div()
+            .flex()
+            .w_full()
+            .max_w(gpui::relative(0.8))
+            .items_center()
+            .justify_end()
+            .gap_0p5()
+            .pr_1()
+            .text_xs()
+            .opacity(0.)
+            .group_hover("msg", |s| s.opacity(1.));
+        if queued {
+            meta = meta.child(
+                div()
+                    .mr_1()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .font_family(theme::FONT_MONO)
+                    .text_size(theme::text_size::XS_3)
+                    .text_color(theme::fg_muted())
+                    .child("queued"),
+            );
+        }
+        if let Some(ts) = item_timestamp(item) {
+            meta = meta.child(ts);
+        }
+        meta = meta.child(copy_chip(
+            "copy-u",
+            index,
+            copied,
+            item.id.clone(),
+            raw_text,
+        ));
         div()
             .group("msg")
             .flex()
-            .justify_end()
+            .flex_col()
             .items_end()
             .gap_1()
-            .child(copy_chip(
-                "copy-u",
-                index,
-                copied,
-                item.id.clone(),
-                raw_text,
-            ))
-            .when(queued, |row| {
-                row.child(
-                    div()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme::border())
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child("queued"),
-                )
-            })
             .child(bubble)
+            .child(meta)
             .into_any_element()
     }
 
+    /// `AssistantTimelineRow`: `px-1 py-0.5` unboxed ChatMarkdown (no dim
+    /// while streaming), then a `mt-1.5` meta row — status pill, ghost copy,
+    /// thumbs, day-aware timestamp — revealed by `group-hover/assistant`.
     fn assistant_message_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
         let raw_text = raw_str(item, "text")
             .or(item.body.as_deref())
@@ -1001,24 +1218,30 @@ impl AppView {
         // Quote annotations (`t3-citation:` links) become chips, same as the
         // web's ChatMarkdown `AssistantCitationChip`.
         let (text, citations) = extract_assistant_citations(&raw_text);
+        let show_empty = text.is_empty() && !item.streaming;
         let mut col = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .gap_1()
-            .max_w(px(760.))
-            .when(item.streaming, |d| d.opacity(0.85))
+            .px_1()
+            .py_0p5()
             .children(crate::markdown::render_markdown(&text));
+        if show_empty {
+            col = col.child(
+                div()
+                    .text_sm()
+                    .line_height(px(22.75))
+                    .text_color(theme::chat_fg())
+                    .child("(empty response)"),
+            );
+        }
         if !citations.is_empty() {
             let mut chips = div().flex().flex_wrap().gap_1();
             for (ci, citation) in citations.iter().enumerate() {
                 chips = chips.child(citation_chip(index, ci, citation));
             }
             col = col.child(chips);
-        }
-        if item.streaming {
-            col = col.child(streaming_dot());
         }
         // 👎 opens the optional-comment field inline under the message.
         if let Some((_, _, field)) = self
@@ -1029,8 +1252,34 @@ impl AppView {
         {
             col = col.child(self.feedback_comment_row(index, item, field));
         }
+
+        // `AssistantMessageMeta`: `flex items-center gap-2 text-xs
+        // tabular-nums`, opacity-0 → group-hover reveal.
         let copied = self.timeline_state.copied.as_deref() == Some(item.id.as_str());
-        let mut actions = div().flex().flex_col().gap_0p5().child(copy_chip(
+        let mut meta = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mt(px(6.))
+            .text_xs()
+            .opacity(0.)
+            .group_hover("msg", |s| s.opacity(1.));
+        // Non-completed projected items lead with a mono-3xs status pill.
+        if item.status != "completed" {
+            meta = meta.child(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .font_family(theme::FONT_MONO)
+                    .text_size(theme::text_size::XS_3)
+                    .text_color(theme::fg_muted())
+                    .child(item.status.clone()),
+            );
+        }
+        let mut buttons = div().flex().items_center().gap_0p5().child(copy_chip(
             "copy-a",
             index,
             copied,
@@ -1049,52 +1298,47 @@ impl AppView {
                 .map(str::to_owned)
                 .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()))
                 .unwrap_or_default();
-            for (up, glyph, eid) in [(true, "👍", 0usize), (false, "👎", 1usize)] {
+            for (up, glyph, eid) in [(true, "☝", 0usize), (false, "☟", 1usize)] {
                 let tid = thread_id.clone();
                 let iid = item.id.clone();
-                let mut chip = div()
-                    .id(("fb", index * 4 + eid))
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .opacity(if sent { 0.4 } else { 0. })
-                    .group_hover("msg", |s| s.opacity(if sent { 0.4 } else { 1. }));
-                if sent || busy {
-                    chip = chip.child(if sent { "✓" } else { "…" });
+                let shown = if sent {
+                    "✓"
+                } else if busy {
+                    "…"
                 } else {
-                    chip = chip
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .on_click(move |_event, window, cx| {
-                            let tid = tid.clone();
-                            let iid = iid.clone();
-                            update_view(window, cx, move |this, cx| {
-                                if up {
-                                    this.send_message_feedback(
-                                        tid,
-                                        "thumbs up".to_string(),
-                                        iid,
-                                        cx,
-                                    );
-                                } else {
-                                    this.open_feedback_comment(iid, tid, cx);
-                                }
-                            });
-                        })
-                        .child(glyph);
+                    glyph
+                };
+                let mut chip = ghost_icon_chip(("fb", index * 4 + eid), shown);
+                if sent || busy {
+                    chip = chip.opacity(0.4).group_hover("msg", |s| s.opacity(0.4));
+                } else {
+                    chip = chip.on_click(move |_event, window, cx| {
+                        let tid = tid.clone();
+                        let iid = iid.clone();
+                        update_view(window, cx, move |this, cx| {
+                            if up {
+                                this.send_message_feedback(tid, "thumbs up".to_string(), iid, cx);
+                            } else {
+                                this.open_feedback_comment(iid, tid, cx);
+                            }
+                        });
+                    });
                 }
-                actions = actions.child(chip);
+                buttons = buttons.child(chip);
+            }
+        }
+        meta = meta.child(buttons);
+        if !item.streaming {
+            if let Some(ts) = item_timestamp(item) {
+                meta = meta.child(ts);
             }
         }
         div()
             .group("msg")
             .flex()
-            .items_start()
-            .gap_2()
+            .flex_col()
             .child(col)
-            .child(actions)
+            .child(meta)
             .into_any_element()
     }
 
@@ -1138,7 +1382,7 @@ impl AppView {
             .items_center()
             .gap_2()
             .pt_1()
-            .child(div().text_xs().text_color(theme::fg_muted()).child("👎"))
+            .child(div().text_xs().text_color(theme::fg_muted()).child("☟"))
             .child(
                 div()
                     .flex_1()
@@ -1321,6 +1565,17 @@ impl AppView {
         .detach();
     }
 
+    /// `live-activity-focus` approximation: while an entry runs, the label
+    /// alternates between `--secondary-label` and `--foreground` each
+    /// `working_pulse` tick (500ms repaint).
+    fn live_label_color(&self, live: bool) -> Rgba {
+        if live && self.working_pulse % 2 == 0 {
+            theme::fg()
+        } else {
+            theme::secondary_label()
+        }
+    }
+
     fn reasoning_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
         // Reasoning stays collapsed once settled; while it streams it is shown.
         let expanded = item.streaming || self.timeline_state.expanded.contains(&item.id);
@@ -1328,39 +1583,33 @@ impl AppView {
             .or(item.body.as_deref())
             .unwrap_or_default()
             .to_string();
-        let mut col = div().flex().flex_col().child(
+        // Collapsed rows preview the reasoning text itself (the web flattens
+        // the detail into the label); expanded rows show the verb + detail.
+        let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let live = is_live(item);
+        let label_text = if expanded || preview.is_empty() {
+            if live {
+                "Thinking".to_string()
+            } else {
+                "Thought".to_string()
+            }
+        } else {
+            preview
+        };
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("reasoning"),
             div()
-                .id(("head", index))
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .py_1()
-                .cursor_pointer()
-                .opacity(0.8)
-                .hover(|s| s.opacity(1.))
-                .on_click(toggle_expanded(item.id.clone()))
-                .child(chevron(expanded))
-                .child(
-                    div()
-                        .text_xs()
-                        .italic()
-                        .text_color(theme::fg_muted())
-                        .child("Thinking"),
-                )
-                .when(item.streaming, |d| {
-                    d.child(div().text_xs().text_color(theme::primary()).child("…"))
-                }),
+                .text_color(self.live_label_color(live))
+                .child(label_text),
         );
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(work_chevron(expanded));
+        let mut col = div().flex().flex_col().child(header);
         if expanded && !text.is_empty() {
-            col = col.child(
-                div()
-                    .pl_4()
-                    .pb_1()
-                    .text_sm()
-                    .italic()
-                    .text_color(theme::fg_muted())
-                    .child(text),
-            );
+            col = col.child(detail_text("reason", index).child(div().child(text)));
         }
         col.into_any_element()
     }
@@ -1383,108 +1632,69 @@ impl AppView {
             || exit_code.is_some_and(|code| code != 0)
             || item.raw["outputIndicatesFailure"].as_bool() == Some(true);
         let expanded = self.timeline_state.expanded.contains(&item.id);
-        let title = raw_str(item, "title");
-
-        let mut header = div()
-            .id(("head", index))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::hover()))
-            .on_click(toggle_expanded(item.id.clone()))
-            .child(status_dot(status_color(item)))
-            .child(
+        let live = is_live(item);
+        // `liveWorkEntryLabel` for commands: "Running"/"Failed"/"Stopped"/
+        // "Ran" + the command text.
+        let verb = if live {
+            "Running"
+        } else if failed {
+            "Failed"
+        } else if matches!(item.status.as_str(), "cancelled" | "interrupted") {
+            "Stopped"
+        } else {
+            "Ran"
+        };
+        let can_expand = output.is_some()
+            || item.raw["outputOmitted"].as_bool() == Some(true)
+            || exit_code.is_some();
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("command_execution"),
+            div()
+                .text_color(self.live_label_color(live))
+                .child(format!("{verb} {input}")),
+        );
+        if failed {
+            header = header.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .font_family("monospace")
                     .text_xs()
-                    .truncate()
-                    .text_color(theme::fg())
+                    .text_color(theme::tool_error_icon())
+                    .flex_shrink_0()
+                    .child("✕"),
+            );
+        }
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(if can_expand {
+                work_chevron(expanded)
+            } else {
+                div().w(px(16.)).flex_shrink_0()
+            });
+        let mut col = div().flex().flex_col().child(header);
+        if expanded && can_expand {
+            let mut detail = detail_panel("cmd-out", index);
+            detail = detail.child(
+                div()
+                    .pb_1()
+                    .text_color(theme::fg_muted())
                     .child(format!("$ {input}")),
             );
-        // Provider labels like "exec" / "Ran command" trail the real command.
-        if let Some(title) = title {
-            header = header.child(
-                div()
-                    .max_w(px(200.))
-                    .text_xs()
-                    .truncate()
-                    .text_color(theme::fg_muted())
-                    .flex_shrink_0()
-                    .child(title.to_string()),
-            );
-        }
-        if is_live(item) && exit_code.is_none() {
-            header = header.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::primary())
-                    .flex_shrink_0()
-                    .child("…"),
-            );
-        }
-        if let Some(code) = exit_code {
-            header = header.child(
-                div()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_xs()
-                    .flex_shrink_0()
-                    .when(code == 0, |d| d.text_color(success()))
-                    .when(code != 0, |d| d.bg(danger_bg()).text_color(danger()))
-                    .child(format!("exit {code}")),
-            );
-        }
-        let has_output = output.is_some() || item.raw["outputOmitted"].as_bool() == Some(true);
-        if has_output {
-            header = header.child(disclosure_chip(expanded, true));
-        }
-        header = header.child(chevron(expanded));
-
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(if failed {
-                danger_border()
-            } else {
-                theme::border()
-            })
-            .bg(theme::raised())
-            .overflow_hidden()
-            .child(header);
-
-        if expanded {
-            let mut detail = detail_scroll("cmd-out", index).font_family("monospace");
-            if input != "command" {
-                detail = detail.child(
-                    div()
-                        .pb_1()
-                        .text_color(theme::fg_muted())
-                        .child(format!("$ {input}")),
-                );
-            }
             detail = match output {
-                Some(output) => detail.child(div().text_color(theme::fg()).child(output)),
+                Some(output) => detail.child(div().child(output)),
                 None if item.raw["outputOmitted"].as_bool() == Some(true) => {
-                    detail.child(div().italic().text_color(theme::fg_muted()).child(
+                    detail.child(div().italic().child(
                         "Output withheld on the wire — fetch it with orchestration.getTurnItem.",
                     ))
                 }
-                None => detail.child(
-                    div()
-                        .italic()
-                        .text_color(theme::fg_muted())
-                        .child("No output."),
-                ),
+                None => detail.child(div().italic().child("No output.")),
             };
-            card = card.child(detail);
+            if let Some(code) = exit_code {
+                detail = detail.child(div().pt_1().child(format!("exit {code}")));
+            }
+            col = col.child(detail);
         }
-        card.into_any_element()
+        col.into_any_element()
     }
 
     fn tool_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
@@ -1508,90 +1718,64 @@ impl AppView {
             .or_else(|| tool_result_text(&item.raw["result"]))
             .map(cap_detail);
         let expanded = self.timeline_state.expanded.contains(&item.id);
-
-        let header = div()
-            .id(("head", index))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::hover()))
-            .on_click(toggle_expanded(item.id.clone()))
-            .child(status_dot(status_color(item)))
-            .child(
+        let live = is_live(item);
+        let failed = item.status == "failed";
+        // The work-log label reads "name  ·  arg preview" in one muted run —
+        // the web puts the display label (often the summary alone) in the
+        // secondary-label span.
+        let label = if summary.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}  {summary}")
+        };
+        let can_expand = output.is_some()
+            || item.raw["outputOmitted"].as_bool() == Some(true)
+            || pretty_json(input_value).is_some();
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("dynamic_tool"),
+            div().text_color(self.live_label_color(live)).child(label),
+        );
+        if failed {
+            header = header.child(
                 div()
                     .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::fg())
+                    .text_color(theme::tool_error_icon())
                     .flex_shrink_0()
-                    .child(name),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .truncate()
-                    .text_color(theme::fg_muted())
-                    .child(summary),
-            )
-            .when(is_live(item), |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::primary())
-                        .flex_shrink_0()
-                        .child("…"),
-                )
-            })
-            .child(disclosure_chip(
-                expanded,
-                output.is_some() || item.raw["outputOmitted"].as_bool() == Some(true),
-            ))
-            .child(chevron(expanded));
-
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::raised())
-            .overflow_hidden()
-            .child(header);
-
+                    .child("✕"),
+            );
+        }
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(if can_expand {
+                work_chevron(expanded)
+            } else {
+                div().w(px(16.)).flex_shrink_0()
+            });
+        let mut col = div().flex().flex_col().child(header);
         if expanded {
-            let mut detail = detail_scroll("tool-out", index).font_family("monospace");
+            let mut detail = detail_panel("tool-out", index);
             let mut shown = false;
             if let Some(output) = &output {
                 shown = true;
-                detail = detail.child(div().text_color(theme::fg()).child(output.clone()));
+                detail = detail.child(div().child(output.clone()));
             } else if item.raw["outputOmitted"].as_bool() == Some(true) {
                 shown = true;
-                detail = detail.child(div().italic().text_color(theme::fg_muted()).child(
+                detail = detail.child(div().italic().child(
                     "Output withheld on the wire — fetch it with orchestration.getTurnItem.",
                 ));
             }
             if let Some(input) = pretty_json(input_value) {
                 shown = true;
-                detail = detail.child(
-                    div()
-                        .pt_2()
-                        .text_color(theme::fg_muted())
-                        .child(format!("input\n{input}")),
-                );
+                detail = detail.child(div().pt_2().child(format!("input\n{input}")));
             }
             if !shown {
-                detail = detail.child(
-                    div()
-                        .italic()
-                        .text_color(theme::fg_muted())
-                        .child("No detail."),
-                );
+                detail = detail.child(div().italic().child("No detail."));
             }
-            card = card.child(detail);
+            col = col.child(detail);
         }
-        card.into_any_element()
+        col.into_any_element()
     }
 
     fn file_change_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
@@ -1639,45 +1823,39 @@ impl AppView {
             );
         }
 
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .child(status_dot(status_color(item)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .font_family("monospace")
-                    .text_xs()
-                    .whitespace_nowrap()
-                    .overflow_x_hidden()
-                    .text_ellipsis_middle()
-                    .text_color(theme::fg())
-                    .child(file_label),
-            )
+        let live = is_live(item);
+        // Web work entries label file edits `verb path` — "Editing"/"Edited"/
+        // "Failed" — in the muted secondary-label run.
+        let verb = if live {
+            "Editing"
+        } else if item.status == "failed" {
+            "Failed"
+        } else if matches!(item.status.as_str(), "cancelled" | "interrupted") {
+            "Stopped"
+        } else {
+            "Edited"
+        };
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("file_change"),
+            div()
+                .text_color(self.live_label_color(live))
+                .child(format!("{verb} {file_label}")),
+        );
+        header = header
             .child(stats)
-            .child(chevron(expanded));
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(work_chevron(expanded));
 
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::raised())
-            .child(header);
+        let mut col = div().flex().flex_col().child(header);
 
         if expanded {
-            let mut detail = detail_scroll("diff", index).font_family("monospace");
+            let mut detail = detail_panel("diff", index);
             if !diff.is_empty() {
                 for line in diff.lines() {
                     detail = detail.child(
                         div()
-                            .whitespace_nowrap()
                             .text_color(diff_line_color(line))
                             .child(line.to_string()),
                     );
@@ -1696,26 +1874,18 @@ impl AppView {
                     );
                 } else {
                     for line in old_str.lines() {
-                        detail = detail.child(
-                            div()
-                                .whitespace_nowrap()
-                                .text_color(danger())
-                                .child(format!("- {line}")),
-                        );
+                        detail =
+                            detail.child(div().text_color(danger()).child(format!("- {line}")));
                     }
                     for line in new_str.lines() {
-                        detail = detail.child(
-                            div()
-                                .whitespace_nowrap()
-                                .text_color(success())
-                                .child(format!("+ {line}")),
-                        );
+                        detail =
+                            detail.child(div().text_color(success()).child(format!("+ {line}")));
                     }
                 }
             }
-            card = card.child(detail);
+            col = col.child(detail);
         }
-        card.into_any_element()
+        col.into_any_element()
     }
 
     fn approval_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
@@ -1751,69 +1921,58 @@ impl AppView {
                 ]
             });
 
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(if pending {
-                warning_border()
-            } else {
-                theme::border()
-            })
-            .bg(theme::raised())
-            .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_1p5()
+        // `TimelinePendingApprovalRow` — a flat WorkLogRow (wrapLabel): the
+        // `<code>` prompt is the label; kind icon sits in the 24-px slot; the
+        // `ms-7.5` detail carries appName/reason and, while pending, the
+        // "Waiting for approval" warning plus inline text-link buttons.
+        let mut col = div().flex().flex_col();
+        let mut header = work_row_line()
+            .id(("head", index))
+            .group("timeline-row")
+            .items_start()
+            .child(work_icon(approval_glyph(kind), item.status == "failed"))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_dot(status_color(item)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::fg())
-                            .child(request_kind_label(kind)),
-                    )
-                    .when(pending, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(warning())
-                                .child("waiting for approval"),
-                        )
-                    }),
-            );
-
-        if let Some(app_name) = app_name {
-            card = card.child(
-                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family(theme::FONT_MONO)
                     .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(app_name),
-            );
-        }
-        if let Some(prompt) = prompt {
-            card = card.child(
-                div()
-                    .font_family("monospace")
-                    .text_xs()
-                    .line_clamp(8)
+                    .line_height(px(20.))
                     .text_color(theme::fg())
-                    .child(prompt),
+                    .child(
+                        prompt
+                            .clone()
+                            .unwrap_or_else(|| request_kind_label(kind).to_string()),
+                    ),
             );
+        header = header.when_some(item_timestamp(item), |d, ts| d.child(ts));
+        col = col.child(header);
+
+        // `ms-7.5 flex flex-col gap-1 pb-1 text-xs`
+        let mut detail = div().flex().flex_col().gap_1().ml(px(30.)).pb_1().text_xs();
+        if let Some(app_name) = app_name {
+            detail = detail.child(div().text_color(theme::fg_muted()).child(app_name));
         }
         if let Some(reason) = reason {
-            card = card.child(div().text_xs().text_color(theme::fg_muted()).child(reason));
+            detail = detail.child(div().text_color(theme::fg_muted()).child(reason));
         }
 
         if pending {
-            let mut buttons = div().flex().flex_wrap().items_center().gap_2();
+            // "⚠ Waiting for approval · Accept Decline More…" — InlineButton
+            // text links (accept foreground/medium, everything else muted).
+            let mut actions = div().flex().flex_wrap().items_center().gap_x_2().gap_y_1();
+            actions = actions.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(warning())
+                    .child(div().flex_shrink_0().child("⚠"))
+                    .child(div().child("Waiting for approval")),
+            );
+            actions = actions.child(div().text_color(theme::fg_muted()).child("·"));
             for (option_index, (decision, label, has_warning)) in options.iter().enumerate() {
-                let declining = matches!(decision.as_str(), "decline" | "cancel");
+                let primary = decision == "accept";
                 let payload = json!({
                     "type": "runtime-request.respond",
                     "commandId": uuid::Uuid::new_v4().to_string(),
@@ -1822,30 +1981,21 @@ impl AppView {
                     "decision": decision,
                 });
                 let request_id = request_id.clone();
-                buttons = buttons.child(
+                let label = label.clone();
+                actions = actions.child(
                     div()
                         .id(("approve", index * 64 + option_index))
-                        .px_2p5()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
                         .cursor_pointer()
-                        .when(declining, |d| {
-                            d.border_1()
-                                .border_color(theme::border())
-                                .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::hover()))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if primary {
+                            theme::fg()
+                        } else {
+                            theme::fg_muted()
                         })
-                        .when(!declining && !*has_warning, |d| {
-                            d.bg(theme::primary())
-                                .text_color(gpui::white())
-                                .hover(|s| s.opacity(0.9))
-                        })
-                        .when(*has_warning, |d| {
-                            d.bg(rgb(0x7a2e2e))
-                                .text_color(gpui::white())
-                                .hover(|s| s.bg(rgb(0x9a3a3a)))
-                        })
+                        .hover(|s| s.text_color(theme::fg()))
                         .on_click(move |_event, window, cx| {
                             let payload = payload.clone();
                             let request_id = request_id.clone();
@@ -1855,10 +2005,11 @@ impl AppView {
                                 cx.notify();
                             });
                         })
-                        .child(label.clone()),
+                        .when(*has_warning, |d| d.child(div().child("⚠")))
+                        .child(div().child(label)),
                 );
             }
-            card = card.child(buttons);
+            detail = detail.child(actions);
         } else {
             // Resolved: prefer the option label matching a decision echoed on
             // the item, else map the settled status to an outcome word.
@@ -1876,14 +2027,10 @@ impl AppView {
                     _ => "Pending".to_string(),
                 },
             };
-            let outcome_color = match item.status.as_str() {
-                "completed" => success(),
-                "cancelled" | "interrupted" | "failed" => theme::fg_muted(),
-                _ => warning(),
-            };
-            card = card.child(div().text_xs().text_color(outcome_color).child(outcome));
+            detail = detail.child(div().text_color(outcome_color(item)).child(outcome));
         }
-        card.into_any_element()
+        col = col.child(detail);
+        col.into_any_element()
     }
 
     /// `user_input_request` — the agent's question card. Pending cards list
@@ -1962,14 +2109,13 @@ impl AppView {
             None
         };
 
+        // Web renders this as a `ComposerBanner` (rounded-2xl
+        // composer-attached surface); the native timeline keeps the
+        // interactive questions inline, so it stays a rounded-2xl card.
         let mut card = div()
-            .rounded_lg()
+            .rounded(theme::radius::XL2)
             .border_1()
-            .border_color(if pending {
-                warning_border()
-            } else {
-                theme::border()
-            })
+            .border_color(theme::border())
             .bg(theme::raised())
             .px_3()
             .py_2()
@@ -1980,13 +2126,13 @@ impl AppView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(status_dot(status_color(item)))
+                    .min_h(px(24.))
+                    .gap(px(6.))
+                    .child(work_icon("?", false))
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::fg())
+                            .text_sm()
+                            .text_color(theme::secondary_label())
                             .child("Question"),
                     )
                     .when(pending, |d| {
@@ -1994,7 +2140,7 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(warning())
-                                .child("waiting for your answer"),
+                                .child("Waiting for your answer"),
                         )
                     }),
             );
@@ -2288,10 +2434,12 @@ impl AppView {
                 summary.chars().take(120).collect::<String>()
             ));
         }
+        // `ContextCompactionTimelineRow`: `mx-auto … gap-3 py-1 text-xs
+        // text-muted-foreground` flanked by `h-px flex-1 bg-border/70` rules.
         let line_color = if failed {
             danger_border()
         } else {
-            theme::border()
+            theme::hairline()
         };
         div()
             .flex()
@@ -2325,67 +2473,97 @@ impl AppView {
             .into_any_element()
     }
 
-    fn todo_list_row(&self, item: &TurnItemView) -> AnyElement {
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::raised())
-            .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_1();
-        if let Some(explanation) = raw_str(item, "explanation") {
-            card = card.child(
-                div()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(explanation.to_string()),
-            );
-        }
+    /// `todo_list` — a `list-todo` work entry; the step checklist sits in the
+    /// expanded `ms-7` detail.
+    fn todo_list_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
+        let expanded = self.timeline_state.expanded.contains(&item.id);
         let steps: &[Value] = item.raw["steps"].as_array().map_or(&[], Vec::as_slice);
-        if steps.is_empty() {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(item.body.clone().unwrap_or_else(|| "Checklist".to_string())),
-            );
+        let done = steps
+            .iter()
+            .filter(|s| matches!(s["status"].as_str(), Some("completed" | "done")))
+            .count();
+        let label = raw_str(item, "title")
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if steps.is_empty() {
+                    item.body.clone().unwrap_or_else(|| "Checklist".to_string())
+                } else {
+                    format!("Todo list — {done} of {} done", steps.len())
+                }
+            });
+        let live = is_live(item);
+        let can_expand =
+            !steps.is_empty() || raw_str(item, "explanation").is_some() || item.body.is_some();
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("todo_list"),
+            div().text_color(self.live_label_color(live)).child(label),
+        );
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(if can_expand {
+                work_chevron(expanded)
+            } else {
+                div().w(px(16.)).flex_shrink_0()
+            });
+        let mut col = div().flex().flex_col().child(header);
+
+        if expanded {
+            let mut detail = detail_text("todo", index);
+            if let Some(explanation) = raw_str(item, "explanation") {
+                detail = detail.child(
+                    div()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(explanation.to_string()),
+                );
+            }
+            if steps.is_empty() {
+                detail = detail.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(item.body.clone().unwrap_or_else(|| "Checklist".to_string())),
+                );
+            }
+            for step in steps {
+                // Contract: pending | running | completed; accept provider
+                // spellings like in_progress/done too.
+                let status = step["status"].as_str().unwrap_or("pending");
+                let (glyph, color, done) = match status {
+                    "completed" | "done" => ("✓", success(), true),
+                    "running" | "in_progress" | "in-progress" => ("◐", theme::primary(), false),
+                    _ => ("○", theme::fg_muted(), false),
+                };
+                let text = step["text"]
+                    .as_str()
+                    .or_else(|| step["content"].as_str())
+                    .or_else(|| step["title"].as_str())
+                    .unwrap_or("step");
+                detail = detail.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().text_color(color).child(glyph))
+                        .child(
+                            div()
+                                .text_sm()
+                                .when(done, |d| d.text_color(theme::fg_muted()))
+                                .when(!done, |d| d.text_color(theme::secondary_label()))
+                                .child(text.to_string()),
+                        ),
+                );
+            }
+            col = col.child(detail);
         }
-        for step in steps {
-            // Contract: pending | running | completed; accept provider
-            // spellings like in_progress/done too.
-            let status = step["status"].as_str().unwrap_or("pending");
-            let (glyph, color, done) = match status {
-                "completed" | "done" => ("✓", success(), true),
-                "running" | "in_progress" | "in-progress" => ("◐", theme::primary(), false),
-                _ => ("○", theme::fg_muted(), false),
-            };
-            let text = step["text"]
-                .as_str()
-                .or_else(|| step["content"].as_str())
-                .or_else(|| step["title"].as_str())
-                .unwrap_or("step");
-            card = card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xs().text_color(color).child(glyph))
-                    .child(
-                        div()
-                            .text_sm()
-                            .when(done, |d| d.text_color(theme::fg_muted()))
-                            .when(!done, |d| d.text_color(theme::fg()))
-                            .child(text.to_string()),
-                    ),
-            );
-        }
-        card.into_any_element()
+        col.into_any_element()
     }
 
+    /// `system_notice`/`notification` — a non-interactive work-log line:
+    /// info icon + `text-secondary-label` (destructive on failure).
     fn notice_row(&self, item: &TurnItemView) -> AnyElement {
         let failed = item.status == "failed" || item.raw["outcome"].as_str() == Some("failed");
         let text = raw_str(item, "summary")
@@ -2394,22 +2572,22 @@ impl AppView {
             .map(str::to_owned)
             .or_else(|| item.body.clone())
             .unwrap_or_else(|| item.kind.clone());
-        div()
-            .flex()
-            .justify_center()
+        work_row_line()
+            .group("timeline-row")
+            .child(work_icon("ℹ", failed))
             .child(
                 div()
-                    .px_3()
-                    .py_1()
-                    .rounded_full()
-                    .bg(theme::raised())
-                    .border_1()
-                    .border_color(theme::border())
-                    .text_xs()
-                    .when(failed, |d| d.text_color(danger()))
-                    .when(!failed, |d| d.text_color(theme::fg_muted()))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(if failed {
+                        danger()
+                    } else {
+                        theme::secondary_label()
+                    })
                     .child(text),
             )
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
             .into_any_element()
     }
 
@@ -2440,16 +2618,49 @@ impl AppView {
             }
         }
         let code = failure["code"].as_str().map(str::to_owned);
-        let (border, bg, title_color) = if usage_limit {
-            (warning_border(), rgba(0xe8b45a14), warning())
-        } else {
-            (danger_border(), danger_bg(), danger())
-        };
+        if !usage_limit {
+            // Plain provider errors are work entries with the destructive
+            // row style — ⚠ icon + `text-destructive` heading, no card.
+            return work_row_line()
+                .group("timeline-row")
+                .child(work_icon("⚠", true))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(danger())
+                                .child(if message.is_empty() {
+                                    title.clone()
+                                } else {
+                                    format!("{title}: {message}")
+                                }),
+                        )
+                        .when_some(code, |d, code| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .flex_shrink_0()
+                                    .text_color(theme::fg_muted())
+                                    .child(code),
+                            )
+                        }),
+                )
+                .when_some(item_timestamp(item), |d, ts| d.child(ts))
+                .into_any_element();
+        }
+        // Usage-limit failures keep the warning-toned banner.
         div()
             .rounded_lg()
             .border_1()
-            .border_color(border)
-            .bg(bg)
+            .border_color(warning_border())
+            .bg(rgba(0xe8b45a14))
             .px_3()
             .py_2()
             .flex()
@@ -2464,7 +2675,7 @@ impl AppView {
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(title_color)
+                            .text_color(warning())
                             .child(title),
                     )
                     .when_some(code, |d, code| {
@@ -2483,32 +2694,46 @@ impl AppView {
             .state
             .selected_thread()
             .is_some_and(|thread| thread.has_actionable_proposed_plan);
+        // `ProposedPlanCard`: `rounded-2xl border border-border/80
+        // bg-card/70 p-4` — "Plan" badge + title header, markdown at mt-4.
         let mut card = div()
-            .rounded_lg()
+            .rounded(theme::radius::XL2)
             .border_1()
             .border_color(theme::border())
             .bg(theme::raised())
-            .px_3()
-            .py_2()
+            .p_4()
             .flex()
             .flex_col()
-            .gap_1()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(status_dot(status_color(item)))
                     .child(
                         div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(theme::muted())
                             .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::secondary_label())
+                            .child("Plan"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme::fg())
                             .child("Proposed plan"),
-                    )
-                    .when(item.streaming, |d| d.child(streaming_dot())),
+                    ),
             )
-            .children(crate::markdown::render_markdown(markdown));
+            .child(
+                div()
+                    .mt_4()
+                    .flex()
+                    .flex_col()
+                    .children(crate::markdown::render_markdown(markdown)),
+            );
         if actionable {
             card = card.child(
                 div()
@@ -2549,42 +2774,24 @@ impl AppView {
             _ => "",
         };
 
-        let header = div()
-            .id(("head", index))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::hover()))
-            .on_click(toggle_expanded(item.id.clone()))
-            .child(status_dot(status_color(item)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .truncate()
-                    .text_color(theme::fg())
-                    .child(format!("subagent · {title}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .flex_shrink_0()
-                    .child(status_label.to_string()),
-            )
-            .child(chevron(expanded));
+        let live = is_live(item);
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph("subagent"),
+            div()
+                .text_color(self.live_label_color(live))
+                .child(if status_label.is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title} · {status_label}")
+                }),
+        );
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(work_chevron(expanded));
 
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::raised())
-            .overflow_hidden()
-            .child(header);
+        let mut col = div().flex().flex_col().child(header);
 
         // Delegated-task approval routing: an app-owned subagent's request
         // belongs to its child thread, not the parent — the child's own shell
@@ -2600,13 +2807,13 @@ impl AppView {
         if let Some(cid) = &child_thread_id {
             if child_pending || item.status == "waiting" {
                 let cid = cid.clone();
-                card = card.child(
+                col = col.child(
                     div()
                         .id(("subagent-pending", index))
                         .flex()
                         .items_center()
                         .gap_2()
-                        .mx_3()
+                        .ml(px(28.))
                         .mb_2()
                         .px_2()
                         .py_1()
@@ -2644,11 +2851,9 @@ impl AppView {
                 .or_else(|| raw_str(item, "prompt"))
                 .unwrap_or("No detail.")
                 .to_string();
-            card = card.child(
-                detail_scroll("subagent", index).child(div().text_color(theme::fg()).child(body)),
-            );
+            col = col.child(detail_panel("subagent", index).child(div().child(body)));
         }
-        card.into_any_element()
+        col.into_any_element()
     }
 
     fn search_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
@@ -2674,46 +2879,31 @@ impl AppView {
             )
         };
 
-        let header = div()
-            .id(("head", index))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::hover()))
-            .on_click(toggle_expanded(item.id.clone()))
-            .child(status_dot(status_color(item)))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::fg())
-                    .flex_shrink_0()
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .truncate()
-                    .text_color(theme::fg_muted())
-                    .child(query),
-            )
-            .child(chevron(expanded));
+        let live = is_live(item);
+        let can_expand = item.raw["results"].as_array().is_some();
+        let text = if query.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}  {query}")
+        };
+        let mut header = work_header(
+            index,
+            item,
+            work_glyph(item.kind.as_str()),
+            div().text_color(self.live_label_color(live)).child(text),
+        );
+        header = header
+            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .child(if can_expand {
+                work_chevron(expanded)
+            } else {
+                div().w(px(16.)).flex_shrink_0()
+            });
 
-        let mut card = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::raised())
-            .overflow_hidden()
-            .child(header);
+        let mut col = div().flex().flex_col().child(header);
 
         if expanded {
-            let mut detail = detail_scroll("search", index);
+            let mut detail = detail_text("search", index);
             let results: &[Value] = item.raw["results"].as_array().map_or(&[], Vec::as_slice);
             if results.is_empty() {
                 detail = detail.child(
@@ -2754,13 +2944,14 @@ impl AppView {
                         .child(format!("…{} more", results.len() - 20)),
                 );
             }
-            card = card.child(detail);
+            col = col.child(detail);
         }
-        card.into_any_element()
+        col.into_any_element()
     }
 
-    /// Compact muted one-liner for lifecycle rows and unknown kinds — matches
-    /// the web's system-divider treatment.
+    /// Lifecycle rows and unknown kinds — `TimelineSystemDivider`: centered
+    /// `text-2xs text-muted-foreground` with `h-px flex-1` rules on each side
+    /// and `py-2` vertical spacing.
     fn fallback_row(&self, item: &TurnItemView) -> AnyElement {
         let text = match item.kind.as_str() {
             "checkpoint" => {
@@ -2800,13 +2991,13 @@ impl AppView {
         let mut row = div()
             .flex()
             .items_center()
-            .justify_center()
-            .gap_2()
-            .py_1()
+            .gap_3()
+            .py_2()
             .when(item.streaming, |d| d.opacity(0.75))
+            .child(div().flex_1().h(px(1.)).bg(theme::hairline()))
             .child(
                 div()
-                    .text_xs()
+                    .text_size(theme::text_size::XS_2)
                     .text_color(theme::fg_muted())
                     .truncate()
                     .max_w(px(720.))
@@ -2815,6 +3006,7 @@ impl AppView {
         if is_live(item) {
             row = row.child(div().text_xs().text_color(theme::primary()).child("…"));
         }
+        row = row.child(div().flex_1().h(px(1.)).bg(theme::hairline()));
         row.into_any_element()
     }
 }
