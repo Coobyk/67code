@@ -266,7 +266,8 @@ pub(crate) fn danger() -> gpui::Rgba {
 }
 
 /// A settings row: title + muted description on the left, control on the
-/// right — the compact shape `SettingsRow` gives the web.
+/// right — the web `SettingsRow` (`px-3 py-3`, `text-sm font-medium` title,
+/// `text-xs text-muted-foreground` description).
 pub(crate) fn setting_row(
     title: &'static str,
     description: &'static str,
@@ -276,7 +277,8 @@ pub(crate) fn setting_row(
         .flex()
         .items_center()
         .gap_4()
-        .py_2()
+        .px_3()
+        .py_3()
         .child(
             div()
                 .flex_1()
@@ -284,7 +286,13 @@ pub(crate) fn setting_row(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(div().text_sm().text_color(theme::fg()).child(title))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg())
+                        .child(title),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -295,23 +303,25 @@ pub(crate) fn setting_row(
         .child(control)
 }
 
-/// A simple switch (web `Switch`): pill with a knob on the on/off side.
+/// A simple switch (web `Switch`): track w-30 h-18 p-2px, thumb 14px.
+/// Checked → `bg-primary` + `bg-background` thumb; unchecked → `bg-input`
+/// track + `bg-muted-foreground` thumb (dark) / `bg-background` (light).
 pub(crate) fn switch_control(on: bool) -> gpui::Div {
     div()
-        .w(px(32.))
+        .w(px(30.))
         .h(px(18.))
         .flex_none()
         .rounded_full()
         .px(px(2.))
-        .bg(if on {
-            theme::primary()
-        } else {
-            theme::border()
-        })
+        .bg(if on { theme::primary() } else { theme::input() })
         .flex()
         .items_center()
         .when(on, |d| d.justify_end())
-        .child(div().w(px(14.)).h(px(14.)).rounded_full().bg(gpui::white()))
+        .child(div().w(px(14.)).h(px(14.)).rounded_full().bg(if on {
+            theme::switch_thumb_on()
+        } else {
+            theme::switch_thumb_off()
+        }))
 }
 
 /// A readable message out of a Failure `Exit` frame's cause (same shape
@@ -739,52 +749,7 @@ impl AppView {
             .flex_col()
             .child(setting_row(title, description, control));
         if open {
-            let mut list_div = div().flex().flex_col().pb_1();
-            for (index, (value, label, detail)) in options.iter().enumerate() {
-                let value = value.clone();
-                let selected = value == current_value;
-                list_div = list_div.child(
-                    div()
-                        .id((list.prefix(), index))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_sm()
-                        .cursor_pointer()
-                        .text_color(theme::fg())
-                        .when(selected, |s| s.bg(theme::selected()))
-                        .when(!selected, |s| s.hover(|s| s.bg(theme::hover())))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.misc_pick(list, value.clone(), cx);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .flex_none()
-                                .text_color(theme::primary())
-                                .child(if selected { "✓" } else { "" }),
-                        )
-                        .child(div().flex_none().child(label.clone()))
-                        .when_some(detail.clone(), |s, detail| {
-                            s.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme::fg_muted())
-                                    .child(detail),
-                            )
-                        }),
-                );
-            }
-            out = out.child(list_div);
+            out = out.child(self.select_options_list(list, current_value, &options, cx));
         }
         out
     }
@@ -945,7 +910,9 @@ impl AppView {
             .unwrap_or_else(|| format!("{instance}/{model}"))
     }
 
-    /// The trigger control of a select row — current value + ▾; click
+    /// The trigger control of a select row — the web `SelectTrigger`
+    /// default variant: `border-input` + `bg-input/32` surface, `rounded-lg`,
+    /// `min-h-8 px-3`, current value left + a muted ▾ chevron right. Click
     /// toggles the option list open/closed.
     pub(crate) fn select_trigger(
         &self,
@@ -955,15 +922,36 @@ impl AppView {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(list.prefix())
+            .min_w(px(160.))
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
             .px_3()
-            .py_1p5()
-            .rounded_md()
-            .text_xs()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::input())
+            .bg(theme::field_surface())
+            .text_sm()
             .cursor_pointer()
-            .bg(theme::hover())
             .text_color(theme::fg())
-            .hover(|s| s.bg(theme::selected()))
-            .child(format!("{current} ▾"))
+            .hover(|s| s.bg(theme::accent()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::fg())
+                    .child(current),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme::icon_muted())
+                    .child("▾"),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, _window, cx| {
@@ -996,54 +984,79 @@ impl AppView {
             self.select_trigger(list, current, cx),
         ));
         if open {
-            let mut list_div = div().flex().flex_col().pb_1();
-            for (index, (value, label, detail)) in options.iter().enumerate() {
-                let value = value.clone();
-                let selected = value == current_value;
-                list_div = list_div.child(
-                    div()
-                        .id((list.prefix(), index))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_sm()
-                        .cursor_pointer()
-                        .text_color(theme::fg())
-                        .when(selected, |s| s.bg(theme::selected()))
-                        .when(!selected, |s| s.hover(|s| s.bg(theme::hover())))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.misc_pick(list, value.clone(), cx);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .flex_none()
-                                .text_color(theme::primary())
-                                .child(if selected { "✓" } else { "" }),
-                        )
-                        .child(div().flex_none().child(label.clone()))
-                        .when_some(detail.clone(), |s, detail| {
-                            s.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme::fg_muted())
-                                    .child(detail),
-                            )
-                        }),
-                );
-            }
-            out = out.child(list_div);
+            out = out.child(self.select_options_list(list, current_value, &options, cx));
         }
         out
+    }
+
+    /// The option list under an open select — the web `SelectContent`
+    /// popover: `rounded-lg border` popover surface, `p-1`, items
+    /// `min-h-7 rounded-sm px-2 py-1 text-sm`, selected `bg-foreground/[0.08]`,
+    /// hovered `bg-accent`.
+    fn select_options_list(
+        &self,
+        list: OpenList,
+        current_value: &str,
+        options: &[(String, String, Option<String>)],
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut list_div = div()
+            .flex()
+            .flex_col()
+            .mt_1()
+            .mx_3()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::raised())
+            .shadow_lg();
+        for (index, (value, label, detail)) in options.iter().enumerate() {
+            let value = value.clone();
+            let selected = value == current_value;
+            list_div = list_div.child(
+                div()
+                    .id((list.prefix(), index))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .min_h(px(28.))
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg())
+                    .when(selected, |s| s.bg(theme::hover()))
+                    .when(!selected, |s| s.hover(|s| s.bg(theme::accent())))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.misc_pick(list, value.clone(), cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .text_color(theme::primary())
+                            .child(if selected { "✓" } else { "" }),
+                    )
+                    .child(div().flex_none().child(label.clone()))
+                    .when_some(detail.clone(), |s, detail| {
+                        s.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(detail),
+                        )
+                    }),
+            );
+        }
+        list_div
     }
 
     // ─── Notifications ────────────────────────────────────────────────────
@@ -2217,10 +2230,10 @@ impl AppView {
                             .min_w_0()
                             .px_2()
                             .py_1()
-                            .rounded_md()
+                            .rounded_lg()
                             .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::canvas())
+                            .border_color(theme::input())
+                            .bg(theme::field_surface())
                             .text_color(theme::fg())
                             .child(field),
                     );
@@ -2490,10 +2503,10 @@ impl AppView {
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded_md()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -2546,10 +2559,10 @@ impl AppView {
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded_md()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -3119,15 +3132,16 @@ fn script_row_button(
         .on_mouse_down(MouseButton::Left, listener)
 }
 
-/// Standard bordered field wrapper used across the settings forms.
+/// Standard bordered field wrapper used across the settings forms — the web
+/// `Input`: `rounded-lg border-input`, `bg-input/32` surface, `px-3`.
 fn field_box(field: Entity<TextField>) -> gpui::Div {
     div()
-        .px_2()
+        .px_3()
         .py_1()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
-        .border_color(theme::border())
-        .bg(theme::canvas())
+        .border_color(theme::input())
+        .bg(theme::field_surface())
         .text_color(theme::fg())
         .text_sm()
         .child(field)

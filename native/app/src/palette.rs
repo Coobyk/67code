@@ -1145,6 +1145,8 @@ impl AppView {
         self.close_palette(window, cx);
     }
 
+    /// One result row — the web `CommandItem`: `min-h-7 px-2 py-1.5 rounded-sm
+    /// gap-2 text-sm`, highlighted `bg-foreground/[0.09]`.
     fn render_palette_row(
         &self,
         row: &Row,
@@ -1155,21 +1157,19 @@ impl AppView {
         let active = enabled_index == Some(self.palette_state.selection);
         let mut el = div()
             .id(("palette-row", dom_id))
-            .mx_1()
             .flex()
             .items_center()
             .gap_2()
             .px_2()
             .py_1p5()
-            .rounded_md()
+            .min_h(px(28.))
+            .rounded_sm()
             .text_sm();
         if active {
-            el = el.bg(theme::selected());
+            el = el.bg(theme::command_highlight());
         }
         if row.enabled {
-            el = el
-                .cursor_pointer()
-                .when(!active, |el| el.hover(|s| s.bg(theme::hover())));
+            el = el.cursor_pointer();
         } else {
             el = el.opacity(0.45);
         }
@@ -1216,17 +1216,15 @@ impl AppView {
                     .child(detail),
             )
         })
+        // `CommandShortcut`: plain text-xs font-medium text-secondary-label
+        // at the row's right edge — no chip box.
         .when_some(row.hint, |el, hint| {
             el.child(
                 div()
                     .flex_none()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(theme::border())
                     .text_xs()
-                    .text_color(theme::fg_muted())
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::secondary_label())
                     .child(hint),
             )
         })
@@ -1250,6 +1248,8 @@ impl AppView {
             );
         } else {
             let rows = self.palette_rows();
+            // `CommandList`: `p-2` list; `CommandGroupLabel` is
+            // `px-2 py-1.5 font-medium text-xs text-muted-foreground`.
             let mut list = div()
                 .id("palette-results")
                 .flex()
@@ -1258,7 +1258,7 @@ impl AppView {
                 .min_h_0()
                 .overflow_y_scroll()
                 .track_scroll(&self.palette_state.scroll)
-                .py_1();
+                .p_2();
 
             let mut child_ix = 0usize;
             let mut enabled_ix = 0usize;
@@ -1269,9 +1269,8 @@ impl AppView {
                     last_section = row.section;
                     list = list.child(
                         div()
-                            .px_3()
-                            .pt_2()
-                            .pb_1()
+                            .px_2()
+                            .py_1p5()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme::fg_muted())
@@ -1308,32 +1307,45 @@ impl AppView {
             body = body.child(list);
         }
 
+        // `CommandDialogPopup`: max-w-xl (576px) max-h-105 (420px)
+        // dialog-glass rounded-2xl border — popover surface + shadow.
         let mut panel = div()
             .id("palette-panel")
-            .w(px(560.))
+            .w(px(576.))
             .mt(px(80.))
             .flex()
             .flex_col()
-            .rounded_lg()
+            .rounded_2xl()
             .bg(theme::raised())
             .border_1()
             .border_color(theme::border())
-            .max_h(px(440.))
+            .shadow_2xl()
+            .overflow_hidden()
+            .max_h(px(420.))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             });
 
+        // `CommandInput`: search icon start-addon + borderless lg input in a
+        // `px-2 py-1.5` shell (icon sits at ps-11px, input text at ps-36px).
         if let Some(field) = self.palette_state.field.clone() {
             panel = panel.child(
                 div()
                     .flex()
                     .items_center()
+                    .gap_2()
                     .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme::border())
+                    .py_1p5()
+                    .min_h(px(46.))
                     .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(16.))
+                            .text_color(theme::icon_muted())
+                            .child("⌕"),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1344,20 +1356,45 @@ impl AppView {
             );
         }
 
+        // `CommandFooter`: border-t fg/7% over fg/2.5%, px-4 py-2.5, text-sm
+        // font-medium muted — kbd chips `bg-foreground/[0.08]` + labels.
+        let footer_hint = |keys: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .h(px(20.))
+                        .min_w(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme::kbd_bg())
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg())
+                        .child(keys),
+                )
+                .child(div().text_color(theme::fg_muted()).child(label))
+        };
         panel = panel.child(body).child(
             div()
                 .flex()
                 .items_center()
                 .gap_3()
-                .px_3()
-                .py_2()
+                .px_4()
+                .py_2p5()
                 .border_t_1()
-                .border_color(theme::border())
+                .border_color(theme::command_footer_border())
+                .bg(theme::command_footer_bg())
                 .text_xs()
-                .text_color(theme::fg_muted())
-                .child("↑↓ navigate")
-                .child("↵ select")
-                .child("esc close"),
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(footer_hint("↑↓", "Navigate"))
+                .child(footer_hint("↵", "Select"))
+                .child(footer_hint("esc", "Close")),
         );
 
         // Full-window dimmed backdrop; a click outside the panel dismisses.
@@ -1365,7 +1402,7 @@ impl AppView {
             .id("palette-overlay")
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.5))
+            .bg(theme::overlay_backdrop())
             .flex()
             .justify_center()
             .items_start()

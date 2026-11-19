@@ -565,9 +565,9 @@ impl AppView {
                                     .rounded_md()
                                     .text_xs()
                                     .cursor_pointer()
-                                    .bg(theme::hover())
+                                    .bg(theme::accent())
                                     .text_color(theme::fg())
-                                    .hover(|s| s.bg(theme::selected()))
+                                    .hover(|s| s.bg(theme::hover()))
                                     .child("Probe")
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -635,9 +635,9 @@ impl AppView {
                     .rounded_md()
                     .text_xs()
                     .cursor_pointer()
-                    .bg(theme::hover())
+                    .bg(theme::accent())
                     .text_color(theme::fg())
-                    .hover(|s| s.bg(theme::selected()))
+                    .hover(|s| s.bg(theme::hover()))
                     .child("Install relay client")
                     .on_mouse_down(
                         MouseButton::Left,
@@ -678,9 +678,9 @@ impl AppView {
                                 .rounded_md()
                                 .text_xs()
                                 .cursor_pointer()
-                                .bg(theme::hover())
+                                .bg(theme::accent())
                                 .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::selected()))
+                                .hover(|s| s.bg(theme::hover()))
                                 .child("Retry")
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -713,9 +713,9 @@ impl AppView {
                                 .rounded_md()
                                 .text_xs()
                                 .cursor_pointer()
-                                .bg(theme::hover())
+                                .bg(theme::accent())
                                 .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::selected()))
+                                .hover(|s| s.bg(theme::hover()))
                                 .child("Retry")
                                 .on_mouse_down(
                                     MouseButton::Left,

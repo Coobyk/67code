@@ -628,7 +628,8 @@ impl AppView {
     }
 
     /// One search-option toggle chip (Aa / ab / .*) — the web dialog's
-    /// `SearchOptionButton`.
+    /// `SearchOptionButton`: segmented Toggle `h-6 px-2.5 rounded-md text-xs`,
+    /// pressed `bg-input` + fg, muted + `bg-input/32` hover otherwise.
     fn render_search_option(
         &self,
         option: SearchOption,
@@ -641,9 +642,11 @@ impl AppView {
         };
         let mut el = div()
             .id(id)
-            .px_1p5()
-            .py_0p5()
-            .rounded_sm()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .px_2p5()
+            .rounded_md()
             .cursor_pointer()
             .text_xs()
             .font_family("monospace")
@@ -662,15 +665,17 @@ impl AppView {
                 }),
             );
         if active {
-            el = el.bg(theme::selected()).text_color(theme::fg());
+            el = el.bg(theme::input()).text_color(theme::fg());
         } else {
             el = el
                 .text_color(theme::fg_muted())
-                .hover(|s| s.bg(theme::hover()));
+                .hover(|s| s.bg(theme::field_surface()));
         }
         el
     }
 
+    /// Contents/Files mode chip — same `segmented` Toggle look as the
+    /// option toggles it sits beside.
     fn render_search_mode_chip(
         &self,
         mode: Mode,
@@ -680,9 +685,11 @@ impl AppView {
         let active = self.search_state.mode == mode;
         let mut el = div()
             .id(format!("search-mode-{label}"))
-            .px_1p5()
-            .py_0p5()
-            .rounded_sm()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .px_2p5()
+            .rounded_md()
             .cursor_pointer()
             .text_xs()
             .child(label)
@@ -693,11 +700,11 @@ impl AppView {
                 }),
             );
         if active {
-            el = el.bg(theme::selected()).text_color(theme::fg());
+            el = el.bg(theme::input()).text_color(theme::fg());
         } else {
             el = el
                 .text_color(theme::fg_muted())
-                .hover(|s| s.bg(theme::hover()));
+                .hover(|s| s.bg(theme::field_surface()));
         }
         el
     }
@@ -711,6 +718,8 @@ impl AppView {
         dom_ix: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Web row: `h-7 w-full gap-3 px-3 font-mono text-xs` — full-width,
+        // `bg-accent` selected, `bg-accent/60` hover.
         let active = self.search_state.selection == ix;
         let mut line_row = div()
             .flex()
@@ -735,13 +744,11 @@ impl AppView {
 
         let mut el = div()
             .id(("search-row", dom_ix))
-            .mx_1()
             .flex()
             .items_center()
             .gap_3()
-            .px_2()
+            .px_3()
             .h(px(28.))
-            .rounded_md()
             .text_xs()
             .cursor_pointer()
             .on_mouse_down(
@@ -757,9 +764,9 @@ impl AppView {
                 }
             }));
         if active {
-            el = el.bg(theme::selected());
+            el = el.bg(theme::accent());
         } else {
-            el = el.hover(|s| s.bg(theme::hover()));
+            el = el.hover(|s| s.bg(theme::accent_soft()));
         }
         el.child(
             div()
@@ -791,15 +798,14 @@ impl AppView {
     ) -> impl IntoElement {
         let active = self.search_state.selection == ix;
         let (name, dir) = split_path(&hit.path);
+        // Same `h-7 w-full px-3` row as content mode; `bg-accent` selected.
         let mut el = div()
             .id(("search-row", dom_ix))
-            .mx_1()
             .flex()
             .items_center()
             .gap_2()
-            .px_2()
+            .px_3()
             .h(px(28.))
-            .rounded_md()
             .text_sm()
             .cursor_pointer()
             .on_mouse_down(
@@ -815,9 +821,9 @@ impl AppView {
                 }
             }));
         if active {
-            el = el.bg(theme::selected());
+            el = el.bg(theme::accent());
         } else {
-            el = el.hover(|s| s.bg(theme::hover()));
+            el = el.hover(|s| s.bg(theme::accent_soft()));
         }
         el.child(
             div()
@@ -950,6 +956,9 @@ impl AppView {
             };
             body = body.child(el.child(text));
         } else {
+            // Web list: `py-2` — sticky file headers are `h-8 px-3 text-xs`
+            // over `bg-popover/95`, count badge `rounded-full bg-muted
+            // px-1.5 py-0.5 text-3xs`.
             let mut list = div()
                 .id("search-results")
                 .flex()
@@ -958,7 +967,7 @@ impl AppView {
                 .min_h_0()
                 .overflow_y_scroll()
                 .track_scroll(&self.search_state.scroll)
-                .py_1();
+                .py_2();
 
             let mut child_ix = 0usize;
             let mut highlighted_child = None;
@@ -971,8 +980,8 @@ impl AppView {
                             .items_center()
                             .gap_2()
                             .px_3()
-                            .pt_2()
-                            .pb_1()
+                            .h(px(32.))
+                            .bg(theme::raised())
                             .text_xs()
                             .child(
                                 div()
@@ -995,7 +1004,8 @@ impl AppView {
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_full()
-                                    .bg(theme::hover())
+                                    .bg(theme::accent())
+                                    .text_size(px(10.))
                                     .text_color(theme::fg_muted())
                                     .child(SharedString::from(hit_ixs.len().to_string())),
                             ),
@@ -1034,25 +1044,40 @@ impl AppView {
             body = body.child(list);
         }
 
+        // `CommandDialogPopup`: max-w-xl (576px) max-h-105 (420px)
+        // dialog-glass rounded-2xl border — popover surface + shadow.
         let mut panel = div()
             .id("search-panel")
-            .w(px(620.))
+            .w(px(576.))
             .mt(px(80.))
             .flex()
             .flex_col()
-            .rounded_lg()
+            .rounded_2xl()
             .bg(theme::raised())
             .border_1()
             .border_color(theme::border())
-            .max_h(px(520.))
+            .shadow_2xl()
+            .overflow_hidden()
+            .max_h(px(420.))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             });
 
-        // Query input row: field + (mode chips | search-option toggles).
+        // Query input row: `⌕` icon + field + (mode chips | search-option
+        // toggles) — web puts the toggles in a `rounded-lg border bg-muted/30
+        // p-0.5` segmented container at the input's right edge.
         if let Some(field) = self.search_state.field.clone() {
-            let mut accessories = div().flex_none().flex().items_center().gap_1();
+            let mut accessories = div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::command_footer_bg())
+                .p_0p5();
             if contents_mode {
                 accessories = accessories
                     .child(self.render_search_option(SearchOption::Case, cx))
@@ -1073,11 +1098,17 @@ impl AppView {
                     .flex()
                     .items_center()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .gap_2()
-                    .border_b_1()
-                    .border_color(theme::border())
+                    .min_h(px(46.))
                     .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(16.))
+                            .text_color(theme::icon_muted())
+                            .child("⌕"),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1119,27 +1150,53 @@ impl AppView {
             panel = panel.child(el.child(text));
         }
 
+        // `CommandFooter`: border-t fg/7% over fg/2.5%, px-4 py-2.5,
+        // font-medium muted — kbd chips `bg-foreground/[0.08]` + labels.
+        // Web search passes `footerActionLabel="Open file"`, `escapeLabel="Back"`.
+        let footer_hint = |keys: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .h(px(20.))
+                        .min_w(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme::kbd_bg())
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg())
+                        .child(keys),
+                )
+                .child(div().text_color(theme::fg_muted()).child(label))
+        };
         panel = panel.child(body).child(
             div()
                 .flex()
                 .items_center()
                 .gap_3()
-                .px_3()
-                .py_2()
+                .px_4()
+                .py_2p5()
                 .border_t_1()
-                .border_color(theme::border())
+                .border_color(theme::command_footer_border())
+                .bg(theme::command_footer_bg())
                 .text_xs()
-                .text_color(theme::fg_muted())
-                .child("↑↓ navigate")
-                .child("↵ open file")
-                .child("esc close"),
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(footer_hint("↑↓", "Navigate"))
+                .child(footer_hint("↵", "Open file"))
+                .child(footer_hint("esc", "Back")),
         );
 
         div()
             .id("search-overlay")
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.5))
+            .bg(theme::overlay_backdrop())
             .flex()
             .justify_center()
             .items_start()

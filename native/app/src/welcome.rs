@@ -473,7 +473,7 @@ impl AppView {
                         .rounded_md()
                         .border_1()
                         .border_color(theme::border())
-                        .bg(theme::canvas())
+                        .bg(theme::kbd_bg())
                         .text_xs()
                         .font_family("monospace")
                         .text_color(theme::fg())
@@ -496,12 +496,12 @@ impl AppView {
                         .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
                         .child(
                             div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -527,9 +527,9 @@ impl AppView {
             .child("Connect");
         if reconnect.is_some() {
             connect_button = connect_button
-                .bg(theme::hover())
+                .bg(theme::accent())
                 .text_color(theme::fg())
-                .hover(|s| s.bg(theme::selected()));
+                .hover(|s| s.bg(theme::hover()));
         } else {
             connect_button = connect_button
                 .bg(theme::primary())
@@ -584,9 +584,12 @@ impl AppView {
                 ),
         );
 
-        let mut step_connect = step("3", "Connect", actions);
+        // The error/offline hints belong to step 3's content column — adding
+        // them to the `step()` row itself would lay them out beside the
+        // number/content columns and squeeze the title.
+        let mut step3_body = div().flex().flex_col().flex_1().min_w_0().child(actions);
         if let Some(error) = self.welcome_state.error.clone() {
-            step_connect = step_connect.child(
+            step3_body = step3_body.child(
                 div()
                     .pt_1()
                     .text_xs()
@@ -595,7 +598,7 @@ impl AppView {
             );
         }
         if self.commands.is_none() {
-            step_connect = step_connect.child(
+            step3_body = step3_body.child(
                 div()
                     .pt_1()
                     .text_xs()
@@ -603,6 +606,7 @@ impl AppView {
                     .child("No live connection yet — Connect saves this environment and it is used on next launch."),
             );
         }
+        let step_connect = step("3", "Connect", step3_body);
 
         div()
             .absolute()
@@ -626,10 +630,11 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .w(px(540.))
-                    .rounded_lg()
+                    .rounded_2xl()
                     .bg(theme::raised())
                     .border_1()
                     .border_color(theme::border())
+                    .shadow_2xl()
                     .occlude()
                     .px_6()
                     .py_5()

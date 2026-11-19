@@ -696,10 +696,11 @@ impl AppView {
             .iter()
             .map(|toast| self.render_toast(toast, cx))
             .collect();
+        // Web viewport: `max-w-90` (360px), sm inset `--spacing(8)` (32px).
         deferred(
             div()
                 .absolute()
-                .right_4()
+                .right(px(32.))
                 .bottom(px(140.))
                 .flex()
                 .flex_col()
@@ -710,16 +711,20 @@ impl AppView {
         .with_priority(1)
     }
 
+    /// One toast — web `Toast.Content`: `dropdown-glass rounded-lg shadow-xl`
+    /// card, `pl-3.5 py-2.5 text-sm` body, `font-medium` title, muted
+    /// description, xs-size action button.
     fn render_toast(&self, toast: &Toast, cx: &mut Context<Self>) -> AnyElement {
         let dismiss_id = toast.id;
         let mut card = div()
             .id(("toast", toast.id as usize))
-            .w(px(320.))
+            .w(px(360.))
             .flex()
-            .rounded_md()
+            .rounded_lg()
             .bg(theme::raised())
             .border_1()
             .border_color(theme::border())
+            .shadow_xl()
             .overflow_hidden()
             .occlude()
             .child(div().w(px(3.)).flex_shrink_0().bg(toast.kind.accent()))
@@ -727,15 +732,16 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .px_3()
-                    .py_2()
+                    .pl_3p5()
+                    .pr_3()
+                    .py_2p5()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0p5()
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme::fg())
                             .truncate()
                             .child(toast.title.clone()),
@@ -743,7 +749,7 @@ impl AppView {
                     .when_some(toast.detail.clone(), |d, detail| {
                         d.child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(theme::fg_muted())
                                 .truncate()
                                 .child(detail),
@@ -754,14 +760,17 @@ impl AppView {
                         d.child(
                             div()
                                 .id(("toast-action", toast.id as usize))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
                                 .px_2()
-                                .py_0p5()
-                                .mt_0p5()
+                                .mt_1()
                                 .self_start()
-                                .rounded_sm()
+                                .rounded_md()
+                                .bg(theme::kbd_bg())
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme::primary())
+                                .text_color(theme::fg())
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme::hover()))
                                 .on_mouse_down(
@@ -779,13 +788,19 @@ impl AppView {
             .child(
                 div()
                     .id(("toast-dismiss", toast.id as usize))
-                    .px_2()
-                    .py_1()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .mt_1()
+                    .mr_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .flex_shrink_0()
+                    .rounded_full()
                     .cursor_pointer()
                     .text_sm()
                     .text_color(theme::fg_muted())
-                    .hover(|s| s.text_color(theme::fg()))
+                    .hover(|s| s.text_color(theme::fg()).bg(theme::accent()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {

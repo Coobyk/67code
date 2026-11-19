@@ -943,7 +943,7 @@ impl AppView {
                             } else {
                                 theme::border()
                             })
-                            .bg(theme::canvas())
+                            .bg(theme::kbd_bg())
                             .text_xs()
                             .text_color(if conflicted {
                                 danger()
@@ -1034,10 +1034,10 @@ impl AppView {
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded_md()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -1050,10 +1050,11 @@ impl AppView {
                     .flex_col()
                     .max_h(px(220.))
                     .overflow_hidden()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(theme::border())
-                    .bg(theme::canvas());
+                    .bg(theme::raised())
+                    .shadow_lg();
                 for (index, command) in self.known_commands().iter().enumerate() {
                     let command = command.clone();
                     let picked = state.kb_command_draft.trim() == command;
@@ -1130,10 +1131,10 @@ impl AppView {
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded_md()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -1183,10 +1184,10 @@ impl AppView {
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded_md()
+                                .rounded_lg()
                                 .border_1()
-                                .border_color(theme::border())
-                                .bg(theme::canvas())
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
                                 .text_sm()
                                 .text_color(theme::fg())
                                 .child(field),
@@ -1774,10 +1775,10 @@ impl AppView {
                         .w(px(220.))
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
-                        .border_color(theme::border())
-                        .bg(theme::canvas())
+                        .border_color(theme::input())
+                        .bg(theme::field_surface())
                         .text_sm()
                         .text_color(theme::fg())
                         .child(field),
@@ -1934,10 +1935,10 @@ impl AppView {
                         .w(px(200.))
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
-                        .border_color(theme::border())
-                        .bg(theme::canvas())
+                        .border_color(theme::input())
+                        .bg(theme::field_surface())
                         .text_sm()
                         .text_color(theme::fg())
                         .child(field),
@@ -2148,10 +2149,10 @@ impl AppView {
                         .w(px(220.))
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
-                        .border_color(theme::border())
-                        .bg(theme::canvas())
+                        .border_color(theme::input())
+                        .bg(theme::field_surface())
                         .text_sm()
                         .text_color(theme::fg())
                         .child(field),

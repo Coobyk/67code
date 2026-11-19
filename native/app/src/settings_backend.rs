@@ -137,11 +137,11 @@ fn row_button(
         .py_1p5()
         .rounded_md()
         .text_xs()
-        .bg(theme::hover())
+        .bg(theme::accent())
         .when(enabled, |s| {
             s.cursor_pointer()
                 .text_color(theme::fg())
-                .hover(|s| s.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
         })
         .when(!enabled, |s| s.text_color(theme::fg_muted()).opacity(0.6))
         .child(label.into())
@@ -204,7 +204,8 @@ fn field_text_in(
         .unwrap_or_default()
 }
 
-/// A labeled text input row used by the task form and the secret answer.
+/// A labeled text input row used by the task form and the secret answer —
+/// the web `Input` shell: `rounded-lg border-input`, `bg-input/32`, `px-3`.
 fn labeled_field(caption: &'static str, field: &Entity<TextField>) -> gpui::Div {
     div()
         .flex()
@@ -213,12 +214,12 @@ fn labeled_field(caption: &'static str, field: &Entity<TextField>) -> gpui::Div 
         .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
         .child(
             div()
-                .px_2()
+                .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_lg()
                 .border_1()
-                .border_color(theme::border())
-                .bg(theme::canvas())
+                .border_color(theme::input())
+                .bg(theme::field_surface())
                 .text_sm()
                 .text_color(theme::fg())
                 .child(field.clone()),
@@ -1408,10 +1409,10 @@ impl AppView {
                             .gap_1()
                             .px_2()
                             .py_1()
-                            .rounded_md()
+                            .rounded_lg()
                             .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::canvas())
+                            .border_color(theme::input())
+                            .bg(theme::field_surface())
                             .text_xs()
                             .cursor_pointer()
                             .text_color(theme::fg())
@@ -1879,10 +1880,10 @@ impl AppView {
                         .w(px(200.))
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded_lg()
                         .border_1()
-                        .border_color(theme::border())
-                        .bg(theme::canvas())
+                        .border_color(theme::input())
+                        .bg(theme::field_surface())
                         .text_xs()
                         .text_color(theme::fg())
                         .child(field.clone()),

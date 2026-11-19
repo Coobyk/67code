@@ -6,9 +6,7 @@
 //! composer picker writes), Shortcuts is a static reference, About carries
 //! version/branding.
 
-use gpui::{
-    Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px, rgb, rgba,
-};
+use gpui::{Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px, rgb};
 
 use crate::composer::MODEL_CATALOG;
 use crate::model::ConnectionStatus;
@@ -42,28 +40,66 @@ pub enum Section {
     About,
 }
 
-const SECTIONS: &[(Section, &str)] = &[
-    (Section::Appearance, "Appearance"),
-    (Section::Connection, "Connection"),
-    (Section::Environments, "Environments"),
-    (Section::Providers, "Providers"),
-    (Section::AcpSessions, "ACP Sessions"),
-    (Section::Clients, "Authorized Clients"),
-    (Section::ArchivedThreads, "Archived Threads"),
-    (Section::Notifications, "Notifications"),
-    (Section::ChatDefaults, "Chat"),
-    (Section::Projects, "Projects"),
-    (Section::ScheduledTasks, "Scheduled Tasks"),
-    (Section::Secrets, "Secrets"),
-    (Section::Diagnostics, "Diagnostics"),
-    (Section::Usage, "Usage Limits"),
-    (Section::Shortcuts, "Keyboard Shortcuts"),
-    (Section::Keybindings, "Keybindings"),
-    (Section::SourceControl, "Source Control"),
-    (Section::Integrations, "Integrations"),
-    (Section::Threads, "Threads"),
-    (Section::About, "About"),
+/// Left-nav groups (heading, sections) mirroring `SETTINGS_NAV_GROUPS` in
+/// apps/web settingsSearch.ts: an unheaded block, Agents, Code, Connections,
+/// and a trailing unheaded block.
+const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
+    (
+        None,
+        &[
+            (Section::Appearance, "Appearance"),
+            (Section::ChatDefaults, "Chat"),
+            (Section::Keybindings, "Keybindings"),
+            (Section::Shortcuts, "Keyboard Shortcuts"),
+        ],
+    ),
+    (
+        Some("Agents"),
+        &[
+            (Section::Providers, "Providers"),
+            (Section::AcpSessions, "ACP Sessions"),
+            (Section::Threads, "Threads"),
+            (Section::ScheduledTasks, "Scheduled Tasks"),
+        ],
+    ),
+    (
+        Some("Code"),
+        &[
+            (Section::Projects, "Projects"),
+            (Section::SourceControl, "Source Control"),
+            (Section::Integrations, "Integrations"),
+        ],
+    ),
+    (
+        Some("Connections"),
+        &[
+            (Section::Connection, "Connection"),
+            (Section::Environments, "Environments"),
+            (Section::Clients, "Authorized Clients"),
+            (Section::Secrets, "Secrets"),
+            (Section::Notifications, "Notifications"),
+        ],
+    ),
+    (
+        None,
+        &[
+            (Section::Diagnostics, "Diagnostics"),
+            (Section::Usage, "Usage Limits"),
+            (Section::ArchivedThreads, "Archived Threads"),
+            (Section::About, "About"),
+        ],
+    ),
 ];
+
+/// Label for `section` — used by the content header's breadcrumb.
+fn section_label(section: Section) -> &'static str {
+    NAV_GROUPS
+        .iter()
+        .flat_map(|(_, items)| items.iter())
+        .find(|(s, _)| *s == section)
+        .map(|(_, label)| *label)
+        .unwrap_or("Settings")
+}
 
 /// (keys, description) rows for the static shortcut reference.
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -103,11 +139,13 @@ fn connection_status(
     }
 }
 
-/// Section title shown at the top of the content column.
+/// Section title shown at the top of the content column — web
+/// `SettingsSection` h2 (`text-base font-semibold`, min-h-7).
 fn section_heading(title: &'static str) -> gpui::Div {
     div()
         .pb_4()
-        .text_lg()
+        .min_h(px(28.))
+        .text_base()
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme::fg())
         .child(title)
@@ -159,54 +197,87 @@ impl AppView {
         cx.notify();
     }
 
+    /// Left nav — the web `SettingsSidebarNav`: w-60 bg-sidebar column with
+    /// `SidebarMenuButton` rows (h-8, rounded control-radius, px-2.5) grouped
+    /// under muted headings.
     fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut nav = div()
             .id("settings-nav-scroll")
             .flex()
             .flex_col()
-            .w(px(180.))
+            .w(px(240.))
             .flex_none()
             .h_full()
             .overflow_y_scroll()
             .border_r_1()
             .border_color(theme::border())
+            .bg(theme::sidebar())
             .px_2()
             .py_3()
             .gap_1()
             .child(
                 div()
-                    .px_2()
-                    .pb_3()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .px(px(10.))
                     .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::fg())
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::sidebar_fg())
                     .child("Settings"),
             );
 
-        for (index, (section, label)) in SECTIONS.iter().enumerate() {
-            let section = *section;
-            let active = self.settings_state.section == section;
+        let mut index = 0usize;
+        for (group_ix, (heading, items)) in NAV_GROUPS.iter().enumerate() {
+            let mut group = div().flex().flex_col().gap_1();
+            if let Some(heading) = heading {
+                group = group.child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::sidebar_fg_muted())
+                        .child(*heading),
+                );
+            }
+            let mut menu = div().flex().flex_col().gap_1();
+            for (section, label) in items.iter() {
+                let section = *section;
+                let active = self.settings_state.section == section;
+                menu = menu.child(
+                    div()
+                        .id(("settings-nav", index))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .px(px(10.))
+                        .rounded_lg()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .when(active, |s| {
+                            s.bg(theme::sidebar_selected())
+                                .text_color(theme::sidebar_fg())
+                        })
+                        .when(!active, |s| {
+                            s.text_color(theme::sidebar_fg_muted())
+                                .hover(|s| s.bg(theme::sidebar_hover()))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.settings_state.section = section;
+                                cx.notify();
+                            }),
+                        )
+                        .child(*label),
+                );
+                index += 1;
+            }
             nav = nav.child(
-                div()
-                    .id(("settings-nav", index))
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
-                    .when(!active, |s| {
-                        s.text_color(theme::fg_muted())
-                            .hover(|s| s.bg(theme::hover()))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            this.settings_state.section = section;
-                            cx.notify();
-                        }),
-                    )
-                    .child(*label),
+                group
+                    .child(menu)
+                    .when(group_ix + 1 < NAV_GROUPS.len(), |g| g.mb_3()),
             );
         }
         nav
@@ -267,9 +338,9 @@ impl AppView {
                                 .rounded_md()
                                 .text_xs()
                                 .cursor_pointer()
-                                .bg(theme::hover())
+                                .bg(theme::accent())
                                 .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::selected()))
+                                .hover(|s| s.bg(theme::hover()))
                                 .child(if reconnecting { "Connecting…" } else { "Reconnect now" })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -370,14 +441,19 @@ impl AppView {
                             .child(*description),
                     )
                     .child(
+                        // web `Kbd`: h-5 min-w-5 rounded bg-foreground/[0.07]
+                        // text-xs font-medium text-muted-foreground.
                         div()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme::border())
-                            .bg(theme::canvas())
+                            .h(px(20.))
+                            .min_w(px(20.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(theme::kbd_bg())
                             .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme::fg_muted())
                             .child(*keys),
                     ),
@@ -494,28 +570,71 @@ impl AppView {
             Section::About => ("About", self.render_about_section().into_any_element()),
         };
 
-        div()
-            .id("settings-content")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scroll()
-            .px_5()
-            .py_4()
+        // Web header: h-12 border-b with a "Settings / <section>" breadcrumb
+        // and the modal close button on the right (`AppRouteModalClose`).
+        let header = div()
+            .h(px(48.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pl_5()
+            .pr_2()
+            .border_b_1()
+            .border_color(theme::border())
             .child(
                 div()
                     .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .child(section_heading(heading))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child("esc to close"),
-                    ),
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .child(div().text_color(theme::fg_muted()).child("Settings"))
+                    .child(div().text_color(theme::fg_muted()).child("/"))
+                    .child(div().text_color(theme::fg()).child(heading)),
             )
-            .child(content)
+            .child(
+                div()
+                    .id("settings-close")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            this.settings_state.open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child("×"),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(header)
+            .child(
+                div()
+                    .id("settings-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .pt_6()
+                    .pb_12()
+                    .child(section_heading(heading))
+                    .child(content),
+            )
     }
 
     pub fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -529,7 +648,7 @@ impl AppView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x000000b3))
+            .bg(theme::overlay_backdrop())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _window, cx| {
@@ -540,12 +659,14 @@ impl AppView {
             .child(
                 div()
                     .flex()
-                    .w(px(720.))
-                    .h(px(500.))
-                    .rounded_lg()
-                    .bg(theme::raised())
+                    .w(px(960.))
+                    .h(px(620.))
+                    .rounded_2xl()
+                    .bg(theme::canvas())
                     .border_1()
                     .border_color(theme::border())
+                    .shadow_2xl()
+                    .overflow_hidden()
                     .occlude()
                     .on_mouse_down(
                         MouseButton::Left,
