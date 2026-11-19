@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, ObjectFit,
     RenderImage, SharedString, Subscription, Window, anchored, deferred, div, img, point,
-    prelude::*, px, rgb, rgba,
+    prelude::*, px, rgb,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -78,17 +78,21 @@ pub struct ContextMenu {
     pub position: gpui::Point<gpui::Pixels>,
 }
 
-/// Dot color for a thread's status (matches the web status pill palette).
-fn status_dot_color(thread: &Thread) -> gpui::Rgba {
-    if thread.running() {
-        theme::primary()
+/// Dot color for a thread's status — the web `resolveSidebarFolderDot`
+/// palette (attention → warning, failed → error, unread → success,
+/// working → info). `None` for a quiet, read row: web folder rows draw no
+/// status affordance for settled threads.
+fn status_dot_color(thread: &Thread, unread: bool) -> Option<gpui::Rgba> {
+    if thread.has_pending_request || thread.has_actionable_proposed_plan {
+        Some(theme::warning())
+    } else if matches!(thread.status.as_ref(), "failed" | "error") {
+        Some(theme::error())
+    } else if thread.running() {
+        Some(theme::info())
+    } else if unread {
+        Some(theme::success())
     } else {
-        match thread.status.as_ref() {
-            "completed" => rgb(0x34d399),
-            "failed" | "error" => rgb(0xf87171),
-            "interrupted" | "stopped" | "cancelled" => rgb(0xfbbf24),
-            _ => theme::fg_muted(),
-        }
+        None
     }
 }
 
@@ -423,7 +427,7 @@ fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
             Some(
                 div()
                     .flex_none()
-                    .w(px(14.))
+                    .w(px(16.))
                     .text_xs()
                     .child(emoji.to_string())
                     .into_any_element(),
@@ -450,15 +454,15 @@ fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
             Some(
                 div()
                     .flex_none()
-                    .w(px(14.))
-                    .h(px(14.))
+                    .w(px(16.))
+                    .h(px(16.))
                     .rounded_sm()
                     .bg(project_icon_color(color.unwrap_or("gray")))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(gpui::white())
-                    .child(div().text_size(px(9.)).child(label))
+                    .child(div().text_size(px(10.)).child(label))
                     .into_any_element(),
             )
         }
@@ -466,14 +470,14 @@ fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
     }
 }
 
-/// 14px image chip for a decoded project favicon — same slot as
+/// 16px image chip for a decoded project favicon — same slot as
 /// `project_icon_chip`, shown when the project record carries a
 /// `faviconPath` that fetched and decoded cleanly.
 fn favicon_chip(image: &Arc<RenderImage>) -> AnyElement {
     img(gpui::ImageSource::Render(image.clone()))
         .flex_none()
-        .w(px(14.))
-        .h(px(14.))
+        .w(px(16.))
+        .h(px(16.))
         .rounded_sm()
         .object_fit(ObjectFit::Contain)
         .into_any_element()
@@ -494,14 +498,13 @@ struct ThreadDragGhost {
 impl Render for ThreadDragGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px_2()
+            .px_2p5()
             .py_1()
             .rounded_md()
-            .bg(theme::raised())
-            .border_1()
-            .border_color(theme::border())
+            .bg(theme::sidebar_active())
+            .shadow_lg()
             .text_sm()
-            .text_color(theme::fg())
+            .text_color(theme::sidebar_fg())
             .child(self.title.clone())
     }
 }
@@ -1319,6 +1322,9 @@ impl AppView {
     }
 
     /// One context-menu row — shared so every item keeps the same styling.
+    /// Metrics mirror the web `MenuItem`: `min-h-7 gap-2 rounded-sm px-2 py-1
+    /// text-sm`, `bg-accent` + `text-accent-foreground` on highlight,
+    /// `text-destructive-foreground` for danger items.
     fn menu_item(
         &self,
         id: &'static str,
@@ -1329,11 +1335,16 @@ impl AppView {
     ) -> impl IntoElement {
         div()
             .id(id)
-            .px_3()
-            .py_1p5()
+            .min_h(px(28.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_sm()
+            .px_2()
+            .py_1()
             .cursor_pointer()
-            .when(danger, |el| el.text_color(rgb(0xf87171)))
-            .hover(|s| s.bg(theme::hover()))
+            .when(danger, |el| el.text_color(theme::error_fg()))
+            .hover(|s| s.bg(theme::accent()).text_color(theme::accent_fg()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, window, cx| {
@@ -1344,23 +1355,45 @@ impl AppView {
             .child(label)
     }
 
+    /// A sidebar thread row. `in_folder` indents the title under the project
+    /// name like the web's folder variant (`ps-9`); search results render
+    /// flush (`px-2.5`) with the project name trailing.
     fn render_thread_row(
         &self,
         thread: &Thread,
         row_id: usize,
         project_name: Option<SharedString>,
+        in_folder: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.state.selected.as_ref() == Some(&thread.id);
         let renaming = self.sidebar_state.renaming.as_ref() == Some(&thread.id);
         let unread = self.is_unread(thread);
         let snoozed = self.is_snoozed(thread);
+        // The web's `shouldRecedeSidebarThread`: working/waiting rows and
+        // settled read rows dim; active, unread and attention-seeking rows
+        // stay at medium weight.
+        let receded = !active
+            && !thread.has_pending_request
+            && !thread.has_actionable_proposed_plan
+            && (thread.running() || !unread);
+        // Web slim-row title ink: receded → secondary-label, unread →
+        // muted-foreground, quiet → secondary-label/70, else foreground.
+        let title_color = if receded {
+            theme::sidebar_secondary_label()
+        } else if active || thread.has_pending_request || thread.has_actionable_proposed_plan {
+            theme::sidebar_fg()
+        } else if unread {
+            theme::sidebar_fg_muted()
+        } else {
+            theme::sidebar_faint()
+        };
         let select_id = thread.id.clone();
         let menu_id = thread.id.clone();
 
         let mut row = div()
             .id(("thread", row_id))
-            .mx_1()
+            .relative()
             .when(thread.pinned, |row| {
                 // Pinned rows are pointer-draggable and accept drops from
                 // other pinned rows of the same project.
@@ -1382,7 +1415,7 @@ impl AppView {
                         .is_some_and(|d| d.project_id == drop_project)
                 })
                 .drag_over::<SidebarThreadDrag>(|style, _drag, _window, _cx| {
-                    style.bg(theme::selected())
+                    style.bg(theme::sidebar_selected())
                 })
                 .on_drop::<SidebarThreadDrag>(move |drag, window, cx| {
                     let Some(view) = window.root::<AppView>().flatten() else {
@@ -1397,17 +1430,25 @@ impl AppView {
             })
             .flex()
             .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
+            .h_9()
+            .gap_2p5()
+            .px_2p5()
+            .when(in_folder, |row| row.pl_9())
             .rounded_md()
             .text_sm()
             .cursor_pointer()
-            .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
-            .when(!active, |s| {
-                s.text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()))
+            .when(active, |s| {
+                s.bg(theme::sidebar_active())
+                    .text_color(theme::sidebar_fg())
             })
+            .when(!active, |s| {
+                s.text_color(theme::sidebar_fg())
+                    // Restores the receded row's opacity on hover, like
+                    // `hover:opacity-100` on the web.
+                    .hover(|s| s.bg(theme::sidebar_hover()).opacity(1.))
+            })
+            // Receded working rows render at 70% opacity on the web.
+            .when(receded && thread.running(), |s| s.opacity(0.7))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, _window, cx| {
@@ -1430,15 +1471,18 @@ impl AppView {
                     }
                     this.select_and_visit(menu_id.clone(), cx);
                 }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded_full()
-                    .bg(status_dot_color(thread)),
             );
+
+        if let Some(color) = status_dot_color(thread, unread) {
+            let dot = div().w(px(6.)).h(px(6.)).rounded_full().bg(color);
+            row = row.child(if in_folder {
+                // Folder rows have no leading icon in the web; the dot floats
+                // in the `ps-9` gutter, centered under the project favicon.
+                dot.absolute().left(px(15.)).top(px(15.))
+            } else {
+                dot.flex_none()
+            });
+        }
 
         if renaming {
             if let Some(field) = self.sidebar_state.rename_field.clone() {
@@ -1446,7 +1490,7 @@ impl AppView {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_color(theme::fg())
+                        .text_color(theme::sidebar_fg())
                         .child(field),
                 );
             }
@@ -1458,10 +1502,8 @@ impl AppView {
                     .whitespace_nowrap()
                     .overflow_x_hidden()
                     .text_ellipsis()
-                    .when(unread, |s| {
-                        s.font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::fg())
-                    })
+                    .when(!receded, |s| s.font_weight(gpui::FontWeight::MEDIUM))
+                    .text_color(title_color)
                     .child(thread.title.clone()),
             );
         }
@@ -1471,18 +1513,8 @@ impl AppView {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(theme::fg_muted())
+                    .text_color(theme::sidebar_secondary_label())
                     .child(name),
-            );
-        }
-        if unread {
-            row = row.child(
-                div()
-                    .flex_none()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded_full()
-                    .bg(theme::primary()),
             );
         }
         if snoozed {
@@ -1500,7 +1532,7 @@ impl AppView {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(theme::fg_muted())
+                    .text_color(theme::sidebar_secondary_label())
                     .child("⧉"),
             );
         }
@@ -1509,7 +1541,7 @@ impl AppView {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(rgb(0xfbbf24))
+                    .text_color(theme::warning_fg())
                     .child("⚠"),
             );
         }
@@ -1531,7 +1563,7 @@ impl AppView {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(theme::primary())
+                    .text_color(theme::sidebar_faint())
                     .child("◆"),
             );
         }
@@ -1551,15 +1583,18 @@ impl AppView {
         let confirming = self.sidebar_state.delete_confirm.as_ref() == Some(&menu.thread_id);
         let separator = || div().h(px(1.)).mx_2().my_1().bg(theme::border());
 
+        // Web `MenuPopup`/`dropdown-glass`: popover surface, rounded-lg, fg 10%
+        // border, drop shadow; items live inside a `p-1` content box.
         let mut menu_el = div()
             .flex()
             .flex_col()
             .w(px(200.))
-            .py_1()
-            .rounded_md()
+            .p_1()
+            .rounded_lg()
             .bg(theme::raised())
             .border_1()
-            .border_color(theme::border())
+            .border_color(theme::popover_border())
+            .shadow_lg()
             .text_sm()
             .text_color(theme::fg())
             .occlude()
@@ -1766,14 +1801,14 @@ impl AppView {
         let name_field = self.sidebar_state.project_name_field.clone();
         let path_field = self.sidebar_state.project_path_field.clone();
         div()
-            .mx_1()
+            .mx_2()
             .mb_1()
             .p_2()
             .flex()
             .flex_col()
             .gap_1()
-            .rounded_md()
-            .bg(theme::raised())
+            .rounded_lg()
+            .bg(theme::sidebar_control())
             .border_1()
             .border_color(theme::border())
             .when_some(name_field, |el, field| {
@@ -1885,61 +1920,84 @@ impl AppView {
             .map(|p| p.name.clone());
         let open_id = draft.thread_id.clone();
         let delete_id = draft.thread_id.clone();
+        // Web `SidebarDraftRow`: a `h-[4.875rem]` card on the warning-tinted
+        // draft surface — pen + project name on the h-5 first line, medium
+        // preview text on the second, a discard × trailing the first line.
         div()
             .id(("draft", row_id))
-            .mx_1()
             .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
+            .flex_col()
+            .h(px(78.))
+            .px_2p5()
+            .py_2()
+            .my_0p5()
             .rounded_md()
-            .text_sm()
             .cursor_pointer()
-            .text_color(theme::fg_muted())
-            .hover(|s| s.bg(theme::hover()))
+            .bg(theme::draft_surface())
+            .text_color(theme::sidebar_fg())
+            .hover(|s| s.bg(theme::draft_surface_hover()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, window, cx| {
                     this.open_draft_thread(open_id.clone(), window, cx);
                 }),
             )
-            .child(div().flex_none().text_xs().child("✎"))
             .child(
                 div()
-                    .flex_1()
+                    .h_5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::warning_fg())
+                            .child("✎"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_x_hidden()
+                            .text_ellipsis()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::sidebar_secondary_label())
+                            .child(project_name.unwrap_or_default()),
+                    )
+                    .child(
+                        div()
+                            .id(("draft-delete", row_id))
+                            .flex_none()
+                            .px_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(theme::sidebar_fg_muted())
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::sidebar_fg()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.delete_draft_thread(delete_id.clone(), cx);
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_0p5()
                     .min_w_0()
                     .whitespace_nowrap()
                     .overflow_x_hidden()
                     .text_ellipsis()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::sidebar_fg_soft())
                     .child(preview),
-            )
-            .when_some(project_name, |row, name| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(name),
-                )
-            })
-            .child(
-                div()
-                    .id(("draft-delete", row_id))
-                    .flex_none()
-                    .px_1()
-                    .rounded_sm()
-                    .text_xs()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            cx.stop_propagation();
-                            this.delete_draft_thread(delete_id.clone(), cx);
-                        }),
-                    )
-                    .child("×"),
             )
     }
 
@@ -1960,17 +2018,19 @@ impl AppView {
         let chevron = if collapsed { "▸" } else { "▾" };
         let count = drafts.len() + usize::from(live);
 
+        // Header matches the web `CollapsibleSectionHeader`: h-8, xs medium
+        // muted label, hairline rule, trailing count, size-3 chevron.
         let mut block = div().flex().flex_col().child(
             div()
                 .id("drafts-header")
                 .flex()
                 .items_center()
-                .gap_1()
+                .h_8()
+                .gap_2()
                 .px_2()
-                .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::hover()))
+                .hover(|s| s.bg(theme::sidebar_hover()))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, _window, cx| {
@@ -1980,20 +2040,33 @@ impl AppView {
                 )
                 .child(
                     div()
-                        .w(px(12.))
                         .flex_none()
                         .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(chevron),
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::sidebar_fg_muted())
+                        .child("Drafts"),
                 )
                 .child(
                     div()
+                        .h(px(1.))
+                        .min_w_2()
                         .flex_1()
-                        .min_w_0()
+                        .bg(theme::sidebar_border_soft()),
+                )
+                .child(
+                    div()
+                        .flex_none()
                         .text_xs()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme::fg_muted())
-                        .child(format!("Drafts · {count}")),
+                        .text_color(theme::sidebar_fg_muted())
+                        .child(format!("{count}")),
+                )
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::sidebar_fg_muted())
+                        .child(chevron),
                 ),
         );
 
@@ -2010,54 +2083,83 @@ impl AppView {
                         let n = self.composer_state.attachments.len();
                         format!("{n} attachment{}", if n == 1 { "" } else { "s" })
                     });
+                // Same card as a saved draft; the live draft shows the active
+                // row surface and keeps its "Save" affordance.
                 block = block.child(
                     div()
                         .id("draft-live")
-                        .mx_1()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
+                        .flex_col()
+                        .h(px(78.))
+                        .px_2p5()
+                        .py_2()
+                        .my_0p5()
                         .rounded_md()
-                        .text_sm()
                         .cursor_pointer()
-                        .bg(theme::selected())
-                        .text_color(theme::fg())
+                        .bg(theme::sidebar_active())
+                        .text_color(theme::sidebar_fg())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _ev, window, cx| {
                                 this.composer.read(cx).focus_handle(cx).focus(window, cx);
                             }),
                         )
-                        .child(div().flex_none().text_xs().child("✎"))
                         .child(
                             div()
-                                .flex_1()
+                                .h_5()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme::warning_fg())
+                                        .child("✎"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .whitespace_nowrap()
+                                        .overflow_x_hidden()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::sidebar_secondary_label())
+                                        .child("Unsaved draft"),
+                                )
+                                .child(
+                                    div()
+                                        .id("draft-save")
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(theme::primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::accent()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev, window, cx| {
+                                                cx.stop_propagation();
+                                                this.save_current_draft(window, cx);
+                                            }),
+                                        )
+                                        .child("Save"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt_0p5()
                                 .min_w_0()
                                 .whitespace_nowrap()
                                 .overflow_x_hidden()
                                 .text_ellipsis()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme::sidebar_fg_soft())
                                 .child(preview),
-                        )
-                        .child(
-                            div()
-                                .id("draft-save")
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(theme::primary())
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::hover()))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _ev, window, cx| {
-                                        cx.stop_propagation();
-                                        this.save_current_draft(window, cx);
-                                    }),
-                                )
-                                .child("Save"),
                         ),
                 );
             }
@@ -2065,6 +2167,14 @@ impl AppView {
                 block = block.child(self.render_draft_row(draft, row_id, cx));
             }
         }
+        // Web `sidebar-draft-divider`: `mx-2.5 my-1.5 h-px bg-sidebar-border/60`.
+        block = block.child(
+            div()
+                .mx_2p5()
+                .my_1p5()
+                .h(px(1.))
+                .bg(theme::sidebar_border_soft()),
+        );
         Some(block.into_any_element())
     }
 
@@ -2085,7 +2195,7 @@ impl AppView {
         };
         let status_color = match &self.state.connection {
             ConnectionStatus::Connected => theme::primary(),
-            ConnectionStatus::Failed(_) | ConnectionStatus::Disconnected(_) => rgb(0xff5a5a),
+            ConnectionStatus::Failed(_) | ConnectionStatus::Disconnected(_) => theme::error(),
             _ => theme::fg_muted(),
         };
 
@@ -2112,9 +2222,9 @@ impl AppView {
                 list = list.child(
                     div()
                         .px_2()
-                        .py_2()
+                        .py_6()
                         .text_xs()
-                        .text_color(theme::fg_muted())
+                        .text_color(theme::sidebar_dim())
                         .child("No matching threads"),
                 );
             }
@@ -2125,7 +2235,7 @@ impl AppView {
                     .iter()
                     .find(|p| p.id == thread.project_id)
                     .map(|p| p.name.clone());
-                list = list.child(self.render_thread_row(thread, row_id, project_name, cx));
+                list = list.child(self.render_thread_row(thread, row_id, project_name, false, cx));
             }
         } else {
             if let Some(block) = self.render_drafts_block(cx) {
@@ -2136,17 +2246,47 @@ impl AppView {
             for (pi, project) in projects.iter().enumerate() {
                 let toggle_id = project.id.clone();
                 let new_thread_id = project.id.clone();
+                // Web `SidebarProjectFolderHeader`: collapsed folders surface the
+                // most urgent hidden-thread state as a size-1.5 dot and show the
+                // hidden-thread count (priority attention > failed > unread >
+                // working — `resolveSidebarFolderDot`).
+                let hidden: Vec<&Thread> = self
+                    .state
+                    .threads
+                    .iter()
+                    .filter(|t| t.project_id == project.id)
+                    .collect();
+                let folder_dot = if project.expanded || hidden.is_empty() {
+                    None
+                } else if hidden
+                    .iter()
+                    .any(|t| t.has_pending_request || t.has_actionable_proposed_plan)
+                {
+                    Some(theme::warning())
+                } else if hidden
+                    .iter()
+                    .any(|t| matches!(t.status.as_ref(), "failed" | "error"))
+                {
+                    Some(theme::error())
+                } else if hidden.iter().any(|t| self.is_unread(t)) {
+                    Some(theme::success())
+                } else if hidden.iter().any(|t| t.running()) {
+                    Some(theme::info())
+                } else {
+                    None
+                };
                 let chevron = if project.expanded { "▾" } else { "▸" };
                 let header = div()
                     .id(("project", pi))
+                    .group("project-folder")
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
+                    .h_8()
+                    .gap_2p5()
+                    .px_2p5()
+                    .rounded_lg()
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
+                    .hover(|s| s.bg(theme::sidebar_hover()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
@@ -2157,14 +2297,6 @@ impl AppView {
                             }
                             cx.notify();
                         }),
-                    )
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .flex_none()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(chevron),
                     )
                     .when_some(
                         // A loaded favicon beats the icon chip; failures and
@@ -2190,18 +2322,47 @@ impl AppView {
                             .text_ellipsis()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme::fg())
+                            .text_color(theme::sidebar_fg_soft())
                             .child(project.name.clone()),
                     )
+                    .when_some(folder_dot, |row, color| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(color),
+                        )
+                    })
+                    .when(!project.expanded && !hidden.is_empty(), |row| {
+                        // Web hides the count while the folder is hovered —
+                        // the new-thread button appears in its place.
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme::sidebar_fg_muted())
+                                .group_hover("project-folder", |s| s.opacity(0.))
+                                .child(format!("{}", hidden.len())),
+                        )
+                    })
                     .child(
                         div()
                             .id(("new-thread", pi))
-                            .px_1()
-                            .rounded_sm()
+                            .flex_none()
+                            .w_6()
+                            .h_6()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
                             .text_sm()
-                            .text_color(theme::fg_muted())
+                            .text_color(theme::sidebar_icon())
+                            .opacity(0.)
+                            .group_hover("project-folder", |s| s.opacity(1.))
                             .cursor_pointer()
-                            .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
+                            .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _ev, _window, cx| {
@@ -2210,22 +2371,23 @@ impl AppView {
                                 }),
                             )
                             .child("+"),
+                    )
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::sidebar_fg_muted())
+                            .child(chevron),
                     );
 
-                let mut section = div().flex().flex_col().child(header);
+                // Web folders get `mt-2 first:mt-0` breathing room.
+                let mut section = div()
+                    .flex()
+                    .flex_col()
+                    .when(pi > 0, |s| s.mt_2())
+                    .child(header);
                 if project.expanded {
-                    section = section.child(
-                        div()
-                            .pl_6()
-                            .pr_2()
-                            .pb_1()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .whitespace_nowrap()
-                            .overflow_x_hidden()
-                            .text_ellipsis()
-                            .child(project.path.clone()),
-                    );
                     let mut threads: Vec<Thread> = self
                         .state
                         .threads
@@ -2247,16 +2409,17 @@ impl AppView {
                     if threads.is_empty() {
                         section = section.child(
                             div()
-                                .pl_6()
+                                .pl_9()
                                 .pr_2()
                                 .py_1()
                                 .text_xs()
-                                .text_color(theme::fg_muted())
+                                .text_color(theme::sidebar_dim())
                                 .child("No threads"),
                         );
                     }
                     for thread in threads.iter() {
-                        section = section.child(self.render_thread_row(thread, row_id, None, cx));
+                        section =
+                            section.child(self.render_thread_row(thread, row_id, None, true, cx));
                         row_id += 1;
                     }
                 }
@@ -2264,8 +2427,37 @@ impl AppView {
             }
         }
 
+        // Web `SidebarHeaderIconButton`: `size-7` ghost icon button on the
+        // sidebar-icon color, `bg-sidebar-row-hover` on hover.
+        let header_icon_button = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .w_7()
+                .h_7()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .text_sm()
+                .text_color(theme::sidebar_icon())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::sidebar_hover()).text_color(theme::sidebar_fg()))
+                .child(glyph)
+        };
+        // Project the header "new thread" button targets — the web writes to
+        // the current project; the closest native analogue is the selected
+        // thread's project, then the first project.
+        let header_thread_project = self
+            .state
+            .selected
+            .as_ref()
+            .and_then(|id| self.state.threads.iter().find(|t| t.id == *id))
+            .map(|t| t.project_id.clone())
+            .or_else(|| self.state.projects.first().map(|p| p.id.clone()));
+
         let mut root = div()
-            .w(px(260.))
+            .w(px(256.))
             .h_full()
             .relative()
             .flex()
@@ -2288,94 +2480,100 @@ impl AppView {
                 }
             }))
             .child(
+                // Web `SidebarChromeHeader`: the 52px workspace topbar with the
+                // h-7 brand — T3 wordmark in foreground + "Code" muted.
                 div()
-                    .h(px(44.))
-                    .px_4()
+                    .h(px(theme::TOPBAR_H))
+                    .pl_3()
+                    .pr_3()
                     .flex()
                     .items_center()
-                    .border_b_1()
-                    .border_color(theme::border())
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::fg())
-                            .child("67"),
-                    ),
-            )
-            .child(
-                div().px_2().pt_2().pb_1().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .rounded_md()
-                        .bg(theme::raised())
-                        .border_1()
-                        .border_color(theme::border())
-                        .px_2()
-                        .py_1()
-                        .text_sm()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_color(theme::fg())
-                                .child(self.search_field.clone()),
-                        ),
-                ),
-            )
-            .child(
-                div()
-                    .px_4()
-                    .pt_1()
-                    .pb_1()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child("Projects"),
-                    )
-                    .child(
-                        div()
-                            .id("new-project")
-                            .px_1()
-                            .rounded_sm()
+                            .h_7()
+                            .flex()
+                            .items_baseline()
+                            .gap_1()
                             .text_sm()
-                            .text_color(theme::fg_muted())
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, window, cx| {
-                                    cx.stop_propagation();
-                                    this.sidebar_state.new_project_open =
-                                        !this.sidebar_state.new_project_open;
-                                    if this.sidebar_state.new_project_open
-                                        && let Some(field) =
-                                            this.sidebar_state.project_name_field.clone()
-                                    {
-                                        let focus = field.read(cx).focus_handle(cx);
-                                        focus.focus(window, cx);
-                                    }
-                                    cx.notify();
-                                }),
-                            )
-                            .child("+"),
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(div().text_color(theme::sidebar_fg()).child("T3"))
+                            .child(div().text_color(theme::sidebar_fg_muted()).child("Code")),
                     ),
+            )
+            .child(
+                // First `SidebarGroup` (`p-2`) holds the `SidebarThreadHeader`
+                // row: h-8 search container + two size-7 icon buttons.
+                div()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .h_8()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .px_2()
+                            .py_1p5()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::sidebar_fg_muted())
+                            .hover(|s| s.bg(theme::sidebar_hover()))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(16.))
+                                    .text_sm()
+                                    .text_color(theme::sidebar_icon())
+                                    .child("⌕"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(theme::sidebar_fg())
+                                    .child(self.search_field.clone()),
+                            ),
+                    )
+                    .child(header_icon_button("new-project", "⊞").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_state.new_project_open =
+                                !this.sidebar_state.new_project_open;
+                            if this.sidebar_state.new_project_open
+                                && let Some(field) = this.sidebar_state.project_name_field.clone()
+                            {
+                                let focus = field.read(cx).focus_handle(cx);
+                                focus.focus(window, cx);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .when_some(header_thread_project, |el, project_id| {
+                        el.child(header_icon_button("new-thread-header", "✎").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                this.new_thread(project_id.clone(), cx);
+                            }),
+                        ))
+                    }),
             )
             .when(self.sidebar_state.new_project_open, |el| {
                 el.child(self.render_project_form(cx))
             })
             .child(list)
             .child(
+                // `SidebarFooter`: `px-2 pt-1 pb-2`, utility icon buttons.
                 div()
-                    .px_4()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(theme::border())
+                    .px_2()
+                    .pt_1()
+                    .pb_2()
                     .flex()
                     .items_center()
                     .child(
@@ -2392,12 +2590,17 @@ impl AppView {
                     .child(
                         div()
                             .id("settings-gear")
-                            .px_1()
-                            .rounded_sm()
+                            .flex_none()
+                            .w_7()
+                            .h_7()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
                             .text_sm()
-                            .text_color(theme::fg_muted())
+                            .text_color(theme::sidebar_icon())
                             .cursor_pointer()
-                            .hover(|s| s.text_color(theme::fg()).bg(theme::hover()))
+                            .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _window, cx| {
@@ -2476,11 +2679,12 @@ impl AppView {
             .flex()
             .flex_col()
             .w(px(320.))
-            .py_1()
-            .rounded_md()
+            .p_1()
+            .rounded_lg()
             .bg(theme::raised())
             .border_1()
-            .border_color(theme::border())
+            .border_color(theme::popover_border())
+            .shadow_lg()
             .text_sm()
             .text_color(theme::fg())
             .occlude()
@@ -2504,7 +2708,7 @@ impl AppView {
             }))
             .child(
                 div()
-                    .px_3()
+                    .px_2()
                     .pt_2()
                     .pb_1()
                     .flex()
@@ -2535,7 +2739,7 @@ impl AppView {
             card = card
                 .child(
                     div()
-                        .px_3()
+                        .px_2()
                         .py_1()
                         .text_xs()
                         .text_color(theme::fg_muted())
@@ -2547,11 +2751,15 @@ impl AppView {
                 .child(
                     div()
                         .id("snooze-unsnooze")
-                        .px_3()
-                        .py_1p5()
+                        .min_h(px(28.))
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .px_2()
+                        .py_1()
                         .cursor_pointer()
                         .text_color(theme::primary())
-                        .hover(|s| s.bg(theme::hover()))
+                        .hover(|s| s.bg(theme::accent()).text_color(theme::accent_fg()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, _window, cx| {
@@ -2571,14 +2779,16 @@ impl AppView {
             card = card.child(
                 div()
                     .id(("snooze-preset", index))
-                    .px_3()
-                    .py_1p5()
+                    .min_h(px(28.))
                     .flex()
                     .items_center()
+                    .rounded_sm()
+                    .px_2()
+                    .py_1()
                     .justify_between()
                     .gap_2()
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::accent_fg()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
@@ -2603,7 +2813,7 @@ impl AppView {
             .child(div().h(px(1.)).mx_2().my_1().bg(theme::border()))
             .child(
                 div()
-                    .px_3()
+                    .px_2()
                     .py_1()
                     .flex()
                     .flex_col()
@@ -2611,9 +2821,9 @@ impl AppView {
                     .child(
                         div()
                             .rounded_sm()
-                            .bg(theme::canvas())
+                            .bg(theme::field_surface())
                             .border_1()
-                            .border_color(theme::border())
+                            .border_color(theme::input())
                             .px_2()
                             .py_1()
                             .text_sm()
@@ -2629,7 +2839,7 @@ impl AppView {
                             .child("Enter to snooze until then"),
                     )
                     .when_some(self.sidebar_state.snooze_error.clone(), |el, error| {
-                        el.child(div().text_xs().text_color(rgb(0xf87171)).child(error))
+                        el.child(div().text_xs().text_color(theme::error_fg()).child(error))
                     }),
             );
 
@@ -2638,11 +2848,15 @@ impl AppView {
             .child(
                 div()
                     .id("snooze-cancel")
-                    .px_3()
-                    .py_1p5()
+                    .min_h(px(28.))
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .px_2()
+                    .py_1()
                     .cursor_pointer()
                     .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()))
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::accent_fg()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _window, cx| {
@@ -2665,7 +2879,7 @@ impl AppView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x000000b3))
+            .bg(theme::overlay_backdrop())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _window, cx| {

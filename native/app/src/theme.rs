@@ -249,3 +249,273 @@ pub fn selection() -> Rgba {
 pub fn cursor() -> Rgba {
     pick(rgb(0xf5f5f5), rgb(0x18181b))
 }
+
+// ── Sidebar extras (index.css additions used by the sidebar rewrite) ──
+/// `--sidebar-icon-color`: muted-foreground at 85% over the sidebar surface.
+/// Used for header/search/footer chrome icons.
+pub fn sidebar_icon() -> Rgba {
+    pick(rgba(0xa3a3a3d9), rgba(0x71717ad9))
+}
+/// `text-sidebar-foreground/90` — project folder names.
+pub fn sidebar_fg_soft() -> Rgba {
+    pick(rgba(0xf1f3f7e6), rgba(0x18181be6))
+}
+/// `text-muted-foreground/65` — quiet row affordances like the pin icon.
+pub fn sidebar_faint() -> Rgba {
+    pick(rgba(0xa3a3a3a6), rgba(0x71717aa6))
+}
+/// `text-muted-foreground/60` — the empty-list hint color.
+pub fn sidebar_dim() -> Rgba {
+    pick(rgba(0xa3a3a399), rgba(0x71717a99))
+}
+/// `--info` — the "working" folder/row dot. blue-500 in both themes.
+pub fn info() -> Rgba {
+    rgb(0x3b82f6)
+}
+/// Draft-row surface `bg-warning/4` and its `hover:bg-warning/8`.
+pub fn draft_surface() -> Rgba {
+    rgba(0xf59e0b0a)
+}
+pub fn draft_surface_hover() -> Rgba {
+    rgba(0xf59e0b14)
+}
+/// `--sidebar-border` at 60% — the draft-block divider (`bg-sidebar-border/60`).
+pub fn sidebar_border_soft() -> Rgba {
+    pick(rgba(0xffffff0c), rgba(0xe4e4e799))
+}
+/// `dropdown-glass` border — foreground at 10% (menu/popover outlines).
+pub fn popover_border() -> Rgba {
+    pick(rgba(0xffffff1a), rgba(0x18181b1a))
+}
+
+// ── Composer surfaces (apps/web ComposerSurface + dropdown-glass) ──
+/// `--chat-composer-glass-surface` (`--surface-raised`) at `--glass-opacity` 80%.
+pub fn composer_surface() -> Rgba {
+    pick(rgba(0x111111cc), rgba(0xffffffcc))
+}
+/// `--chat-composer-outline` — the composer card's hairline.
+/// dark white·5% · light black·8%
+pub fn composer_outline() -> Rgba {
+    pick(rgba(0xffffff0d), rgba(0x00000014))
+}
+/// `--chat-composer-highlight` — the card's top inset highlight (inset-shadow-2xs).
+/// dark white·3% · light black·4%
+pub fn composer_highlight() -> Rgba {
+    pick(rgba(0xffffff08), rgba(0x0000000a))
+}
+/// `dropdown-glass` border: `color-mix(contrast-foreground 10%, transparent)`.
+/// dark white·10% · light zinc-900·10%
+pub fn popup_border() -> Rgba {
+    pick(rgba(0xffffff1a), rgba(0x18181b1a))
+}
+/// ComposerControl label ink: `text-foreground/80`.
+/// dark neutral-100·80% · light zinc-900·80%
+pub fn control_fg() -> Rgba {
+    pick(rgba(0xf5f5f5cc), rgba(0x18181bcc))
+}
+/// `--message-action-hover`: `color-mix(primary 90%, background)`.
+/// dark #346bf1·90% over #000 ≈ #2f61d9 · light #1b4ed8·90% over #fcfcfc ≈ #325fdb
+pub fn primary_hover() -> Rgba {
+    pick(rgb(0x2f61d9), rgb(0x325fdb))
+}
+/// Disabled send/stop fill: `bg-foreground/12`.
+/// dark neutral-100·12% · light zinc-900·12%
+pub fn disabled_fill() -> Rgba {
+    pick(rgba(0xf5f5f51f), rgba(0x18181b1f))
+}
+/// `--inset-shadow-control-highlight` on send/stop: `0 1px white·16%`.
+pub fn control_highlight() -> Rgba {
+    rgba(0xffffff29)
+}
+/// `bg-destructive/90` — the stop button's fill.
+/// dark #f15757·90% · light #ef4444·90%
+pub fn destructive_90() -> Rgba {
+    pick(rgba(0xf15757e6), rgba(0xef4444e6))
+}
+/// `media-close` chip on staged images: `bg-black/65` + white glyph.
+pub fn media_close() -> Rgba {
+    rgba(0x000000a6)
+}
+/// `--context-chip-terminal` accent: oklch(0.62 0.134 163) ≈ emerald.
+pub fn ctx_terminal() -> Rgba {
+    pick(rgb(0x2fbf8f), rgb(0x0f9d70))
+}
+
+// ── Overlay / control tokens ────────────────────────────────────────
+/// `.dialog-backdrop` — `--background` at 64% (dark) / 60% (light).
+pub fn overlay_backdrop() -> Rgba {
+    pick(rgba(0x000000a3), rgba(0xfcfcfc99))
+}
+/// `bg-foreground/[0.09]` — cmdk highlighted item.
+pub fn command_highlight() -> Rgba {
+    pick(rgba(0xf5f5f517), rgba(0x18181b17))
+}
+/// `bg-accent/60` — hover under an accent-highlighted row.
+pub fn accent_soft() -> Rgba {
+    pick(rgba(0xffffff06), rgba(0x00000004))
+}
+/// `bg-foreground/[0.07]` — Kbd chip fill.
+pub fn kbd_bg() -> Rgba {
+    pick(rgba(0xf5f5f512), rgba(0x18181b12))
+}
+/// `bg-foreground/[0.025]` — cmdk footer strip.
+pub fn command_footer_bg() -> Rgba {
+    pick(rgba(0xf5f5f504), rgba(0x18181b03))
+}
+/// `border-foreground/[0.07]` — cmdk footer separator.
+pub fn command_footer_border() -> Rgba {
+    pick(rgba(0xf5f5f512), rgba(0x18181b12))
+}
+/// `--secondary-label` outside the sidebar (palette shortcut hints).
+pub fn secondary_label() -> Rgba {
+    sidebar_secondary_label()
+}
+/// Text-input surface — dark `bg-input/32`, light `bg-background`.
+pub fn field_surface() -> Rgba {
+    pick(rgba(0xffffff09), rgb(0xffffff))
+}
+/// Unchecked-switch thumb — dark `bg-muted-foreground`, light `bg-background`.
+pub fn switch_thumb_off() -> Rgba {
+    pick(rgb(0xa3a3a3), rgb(0xffffff))
+}
+/// Checked-switch thumb — `bg-background`.
+pub fn switch_thumb_on() -> Rgba {
+    canvas()
+}
+/// Command/search magnifier icon — `text-icon-muted`.
+pub fn icon_muted() -> Rgba {
+    pick(rgb(0x8f8f8f), rgb(0x71717a))
+}
+
+// ── Diff surface (pierre diffs, index.css DIFF_SURFACE_THEME) ──────
+// Line/gutter fills below are the resolved `color-mix()` results of
+// `--diff-addition` (`--success`) / `--diff-deletion` (`--destructive`)
+// blended over `--code-background`, exactly as the web's diff surface CSS
+// computes them for the default dark/light themes.
+/// `--diff-addition-foreground` — added-line text/emphasis.
+/// dark emerald-400 · light emerald-700 (same as `success_fg()`).
+pub fn diff_add_fg() -> Rgba {
+    success_fg()
+}
+/// `--diff-deletion-foreground` — removed-line text/emphasis.
+/// dark red-400 · light red-700 (same as `error_fg()`).
+pub fn diff_del_fg() -> Rgba {
+    error_fg()
+}
+/// `text-diff-addition` (`--diff-addition` = `--success`) — "+N" counters.
+pub fn diff_add_count() -> Rgba {
+    success()
+}
+/// `text-diff-deletion` (`--diff-deletion` = `--destructive`) — "−N" counters.
+pub fn diff_del_count() -> Rgba {
+    error()
+}
+/// `--diffs-bg-addition` — added-line row fill.
+/// dark code-bg·70% + emerald-500·30% ≈ #0f4231 · light 50/50 ≈ #85dabe
+pub fn diff_add_bg() -> Rgba {
+    pick(rgb(0x0f4231), rgb(0x85dabe))
+}
+/// `--diffs-bg-addition-number` — gutter fill on added lines.
+/// dark code-bg·60% + emerald-500·40% ≈ #0f533c · light code-bg·35% + emerald-500·65% ≈ #62d0ab
+pub fn diff_add_num_bg() -> Rgba {
+    pick(rgb(0x0f533c), rgb(0x62d0ab))
+}
+/// `--diffs-bg-deletion` — removed-line row fill.
+/// dark code-bg·70% + #f15757·30% ≈ #522424 · light 50/50 w/ #ef4444 ≈ #f59f9f
+pub fn diff_del_bg() -> Rgba {
+    pick(rgb(0x522424), rgb(0xf59f9f))
+}
+/// `--diffs-bg-deletion-number` — gutter fill on removed lines.
+/// dark code-bg·60% + #f15757·40% ≈ #692b2b · light code-bg·35% + #ef4444·65% ≈ #f38484
+pub fn diff_del_num_bg() -> Rgba {
+    pick(rgb(0x692b2b), rgb(0xf38484))
+}
+/// `--diffs-bg-context` — unchanged-line fill inside a diff surface.
+/// dark code-bg·97% + fg·3% ≈ #151515 · light code-bg·97% + fg·3% ≈ #f4f4f4
+pub fn diff_context_bg() -> Rgba {
+    pick(rgb(0x151515), rgb(0xf4f4f4))
+}
+/// `--diffs-bg-separator` — hunk-header (`@@`) row fill.
+/// dark code-bg·95% + fg·5% ≈ #1a1a1a · light ≈ #efefef
+pub fn diff_hunk_bg() -> Rgba {
+    pick(rgb(0x1a1a1a), rgb(0xefefef))
+}
+/// `--diffs-fg-number` — line-number gutter text (fg·65% over bg). Matches
+/// the muted-fg tone, so this delegates to `fg_muted()`.
+pub fn diff_gutter_fg() -> Rgba {
+    fg_muted()
+}
+
+// ── File tree (pierre trees, pierre-tree-theme.ts overrides) ────────
+/// `--trees-hover-bg-override` = currentColor·7% → fg·7%.
+pub fn tree_hover() -> Rgba {
+    pick(rgba(0xf5f5f512), rgba(0x18181b12))
+}
+/// `--trees-selected-bg-override` = currentColor·12% → fg·12%.
+pub fn tree_selected() -> Rgba {
+    pick(rgba(0xf5f5f51f), rgba(0x18181b1f))
+}
+
+// ── PR state tones (pullRequestPresentation.tsx) ────────────────────
+/// Open PR: `text-emerald-600 dark:text-emerald-300/90`.
+pub fn pr_open() -> Rgba {
+    pick(rgba(0x6ee7b7e6), rgb(0x059669))
+}
+/// Merged PR: `text-violet-600 dark:text-violet-300/90`.
+pub fn pr_merged() -> Rgba {
+    pick(rgba(0xc4b5fde6), rgb(0x7c3aed))
+}
+/// Closed PR: `text-red-600 dark:text-red-300/90`.
+pub fn pr_closed() -> Rgba {
+    pick(rgba(0xfca5a5e6), rgb(0xdc2626))
+}
+/// Draft PR: `text-zinc-500 dark:text-zinc-400/80`.
+pub fn pr_draft() -> Rgba {
+    pick(rgba(0xa1a1aacd), rgb(0x71717a))
+}
+/// `border-border/80` — the web terminal drawer's top hairline.
+/// dark white·6.4% ≈ rgba(0xffffff10) · light zinc-200·80%
+pub fn border_soft() -> Rgba {
+    pick(rgba(0xffffff10), rgba(0xe4e4e7cc))
+}
+
+// ── Timeline / chat-markdown extras ───────────────────────────────
+/// `--font-size-code` default (contracts `DEFAULT_CODE_FONT_SIZE` = 13).
+pub fn code_text_size() -> gpui::Pixels {
+    px(13.)
+}
+/// `ChatMarkdown` body ink: `text-foreground/[90%]` (contrast boost 0).
+/// dark neutral-100·90% · light zinc-900·90%
+pub fn chat_fg() -> Rgba {
+    pick(rgba(0xf5f5f5e6), rgba(0x18181be6))
+}
+/// Inline-code chip fill: `color-mix(contrast-foreground 10%, transparent)`.
+/// dark neutral-100·10% · light zinc-900·10%
+pub fn inline_code_bg() -> Rgba {
+    pick(rgba(0xf5f5f51a), rgba(0x18181b1a))
+}
+/// Blockquote bar: `color-mix(currentcolor 35%, transparent)`.
+/// dark neutral-100·35% · light zinc-900·35%
+pub fn quote_border() -> Rgba {
+    pick(rgba(0xf5f5f559), rgba(0x18181b59))
+}
+/// `.chat-markdown-codeblock-header` label: `--code-foreground` at 72%.
+/// dark neutral-100·72% · light zinc-900·72%
+pub fn code_header_fg() -> Rgba {
+    pick(rgba(0xf5f5f5b8), rgba(0x18181bb8))
+}
+/// `text-tool-error-icon/40` — failed tool-call icon / ✕ mark.
+/// dark red-300 #fca5a5·40% · light error #ef4444·40%
+pub fn tool_error_icon() -> Rgba {
+    pick(rgba(0xfca5a566), rgba(0xef444466))
+}
+/// `border-border/70` — hairlines on working rows and meta pills.
+/// dark white·~5.5% · light zinc-200·70%
+pub fn hairline() -> Rgba {
+    pick(rgba(0xffffff0e), rgba(0xe4e4e7b3))
+}
+/// `.chat-markdown hr` — dark `--contrast-muted-foreground`, light `--border`.
+/// dark neutral-400 #a3a3a3 · light zinc-200 #e4e4e7
+pub fn rule_color() -> Rgba {
+    pick(rgb(0xa3a3a3), rgb(0xe4e4e7))
+}
