@@ -27,8 +27,9 @@ mod vcs;
 mod welcome;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, IntoElement, KeyBinding, Render,
-    ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, AppContext, Bounds, Context, Decorations, Entity, Focusable, IntoElement, KeyBinding,
+    Render, ScrollHandle, SharedString, Window, WindowBounds, WindowControlArea, WindowDecorations,
+    WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use model::{AppState, ConnectionStatus, Role};
@@ -855,8 +856,60 @@ impl AppView {
     }
 }
 
+/// Linux/Windows client-decoration buttons mirroring Electron's
+/// `titleBarOverlay` (minimize / maximize-restore / close).
+fn window_controls() -> impl IntoElement {
+    fn btn(
+        id: &'static str,
+        glyph: &'static str,
+        area: WindowControlArea,
+        close_danger: bool,
+        handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut b = div()
+            .id(id)
+            .w_7()
+            .h_5()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(theme::fg_muted())
+            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+            .child(glyph)
+            .window_control_area(area)
+            .on_mouse_down(gpui::MouseButton::Left, handler);
+        if close_danger {
+            b = b.hover(|s| s.bg(theme::error()).text_color(gpui::white()));
+        }
+        b
+    }
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .ml_2()
+        .child(btn("win-min", "\u{2013}", WindowControlArea::Min, false, |_ev, w, _cx| {
+            w.minimize_window()
+        }))
+        .child(btn("win-max", "\u{25a1}", WindowControlArea::Max, false, |_ev, w, _cx| {
+            w.zoom_window()
+        }))
+        .child(btn("win-close", "\u{00d7}", WindowControlArea::Close, true, |_ev, w, _cx| {
+            w.remove_window()
+        }))
+}
+
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Client-decorated windows need an inset so the compositor still
+        // offers invisible resize borders.
+        let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
+        if client_decorations {
+            window.set_client_inset(px(5.0));
+        }
         let selected_thread = self.state.selected_thread();
         let title = selected_thread
             .map(|t| t.title.clone())
@@ -960,7 +1013,7 @@ impl Render for AppView {
                     .h_full()
                     .child(
                         div()
-                            .h(px(44.))
+                            .h(px(theme::TOPBAR_H))
                             .px_4()
                             .flex()
                             .items_center()
@@ -969,6 +1022,9 @@ impl Render for AppView {
                             .border_color(theme::border())
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
+                            // Drag region for client-side decorations; no-op
+                            // under server decorations.
+                            .window_control_area(WindowControlArea::Drag)
                             .child(title)
                             .child(
                                 div()
@@ -1016,7 +1072,8 @@ impl Render for AppView {
                                                     cx.notify();
                                                 }),
                                             ),
-                                    ),
+                                    )
+                                    .when(client_decorations, |el| el.child(window_controls())),
                             ),
                     )
                     .child(match self.center_view {
@@ -1112,13 +1169,19 @@ pub fn run(config: AppConfig) {
             KeyBinding::new("ctrl-[", PrevThread, Some("App")),
             KeyBinding::new("ctrl-]", NextThread, Some("App")),
         ]);
-        let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
+        // Electron MIN_MAIN_WINDOW_SIZE/DEFAULT_MAIN_WINDOW_SIZE.
+        let bounds = Bounds::centered(None, size(px(1100.0), px(780.0)), cx);
         cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("67 Code".into()),
                     ..Default::default()
                 }),
+                // Electron uses titleBarStyle "hidden" + overlay controls on
+                // Linux/Windows; client decorations give the same borderless
+                // look where the compositor supports it.
+                window_decorations: Some(WindowDecorations::Client),
+                window_min_size: Some(size(px(400.0), px(360.0))),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
