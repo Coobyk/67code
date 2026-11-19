@@ -902,6 +902,7 @@ impl Render for AppView {
             .track_focus(&self.app_focus)
             .flex()
             .size_full()
+            .font_family(theme::FONT_SANS)
             .bg(theme::canvas())
             .text_color(theme::fg())
             .on_action(cx.listener(AppView::on_toggle_palette))
@@ -1046,6 +1047,15 @@ impl Render for AppView {
 pub fn run(config: AppConfig) {
     application().run(move |cx: &mut App| {
         use text_field::*;
+        // Inter (OFL) — the web's --font-sans. Bundled TTFs so the UI doesn't
+        // depend on the host fontconfig.
+        let _ = cx.text_system().add_fonts(vec![
+            std::borrow::Cow::Borrowed(&include_bytes!("../fonts/Inter-Regular.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../fonts/Inter-Medium.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../fonts/Inter-SemiBold.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../fonts/Inter-Bold.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../fonts/Inter-Italic.ttf")[..]),
+        ]);
         cx.bind_keys([
             KeyBinding::new("backspace", Backspace, Some("TextField")),
             KeyBinding::new("delete", Delete, Some("TextField")),
