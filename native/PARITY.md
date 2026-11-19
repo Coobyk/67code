@@ -129,3 +129,39 @@ requires a new `native/server` handler matching the TS wire shape.
 | Multi-window                                                                    | ✅     | palette/context "Open thread in new window" — second AppView + own socket                                                                           |
 | Dictation/voice                                                                 | ✅     | above                                                                                                                                               |
 | Bedtime reminder, update-everything, GitHub-star prompt, legacy-migration toast | ✅     | bedtimeReminder.subscribe stream; getNpmRelease update toast; star prompt (once/session); projectSettingsFolded migration notice                    |
+
+## Visual parity (web design system → GPUI)
+
+Design tokens were extracted from `apps/web/src/index.css` (resolved
+oklch→hex) and codified in `native/app/src/theme.rs`: Inter bundled
+(OFL, registered via `add_fonts`), mono `FONT_MONO`, text sizes
+10/11/12/14/16/18, radii 4/6/8/12/16/20, scrollbar 6px, topbar 52px,
+chat lane 736px, canvas #000 / card #111 / border white-8% / primary
+#346bf1 / user-bubble #1e1e1e + full sidebar/diff/popover/overlay
+token sets, light-theme counterparts.
+
+Surfaces restyled to web metrics (class→px): sidebar (256px, folder
+headers, status dots, draft cards, MenuPopup), timeline + markdown
+(rounded-2xl user bubbles, work-log rows, approval/plan cards), composer
+(card + inset highlight shadows, chips, pickers, image attachments),
+right panel/explorer/diff/terminal drawer, settings modal, cmdk
+palette + search dialogs, toasts, welcome, window chrome
+(WindowDecorations::Client + min/max/close overlay + drag topbar,
+400×360 min, 1100×780 default).
+
+Deliberate divergences:
+
+- Right panel width kept at 380px vs web's 280px — the native panel
+  hosts the diff viewer and PR cards in a single column where 280px
+  cramps the dual line-number gutters.
+- Client decorations are enabled only where the compositor supports
+  them (Wayland/GNOME etc.); bare X11 falls back to server
+  decorations, so under Xvfb the window keeps the system frame. The
+  in-app topbar drag area and min/max/close controls render only in
+  client mode.
+- Timestamps in timeline meta rows render UTC (no timezone database
+  in the native binary).
+- Iconography uses DejaVu-covered glyphs (✎ ⚠ ▸ ✓ …) as stand-ins
+  for lucide SVG icons.
+- Toast viewport sits above the composer (`bottom 140px`) rather than
+  flush bottom-right to avoid covering the send button.
