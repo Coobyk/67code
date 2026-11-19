@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Context, Div, Entity, Focusable, FontWeight, MouseButton, Rgba, Stateful, Subscription, Window,
-    div, prelude::*, px, rgb,
+    div, prelude::*, px,
 };
 use serde_json::{Value, json};
 
@@ -35,21 +35,24 @@ use crate::{AppView, theme};
 #[path = "pr_review.rs"]
 pub(crate) mod pr_review;
 
-/// GitHub-flavored state/verdict colors (mirrors the web PR row tones).
+/// PR state/verdict tones — the exact web `pullRequestPresentation` roles
+/// live in theme.rs; these aliases keep the call sites readable.
 fn pr_open_color() -> Rgba {
-    rgb(0x3fb950)
+    theme::pr_open()
 }
 fn pr_merged_color() -> Rgba {
-    rgb(0xa371f7)
+    theme::pr_merged()
 }
 fn pr_closed_color() -> Rgba {
-    rgb(0xf85149)
+    theme::pr_closed()
 }
+/// Web pending check = `text-amber-500` (= `--warning`).
 fn check_pending_color() -> Rgba {
-    rgb(0xd29922)
+    theme::warning()
 }
+/// Web passing check / approved review = `text-emerald-500` (= `--success`).
 fn check_pass_color() -> Rgba {
-    rgb(0x34d399)
+    theme::success()
 }
 
 #[derive(Default)]
@@ -134,7 +137,7 @@ fn pr_state_glyph(state: &str, is_draft: bool) -> (&'static str, Rgba) {
     match (state, is_draft) {
         ("merged", _) => ("◆", pr_merged_color()),
         ("closed", _) => ("●", pr_closed_color()),
-        (_, true) => ("○", theme::fg_muted()),
+        (_, true) => ("○", theme::pr_draft()),
         _ => ("●", pr_open_color()),
     }
 }
@@ -152,7 +155,7 @@ fn pr_state_label(state: &str, is_draft: bool) -> &'static str {
 fn check_glyph(status: &str) -> (&'static str, Rgba) {
     match status {
         "success" => ("✓", check_pass_color()),
-        "failure" | "cancelled" => ("×", pr_closed_color()),
+        "failure" | "cancelled" => ("×", theme::error()),
         "pending" | "action-required" => ("◐", check_pending_color()),
         _ => ("○", theme::fg_muted()),
     }
@@ -162,7 +165,7 @@ fn check_glyph(status: &str) -> (&'static str, Rgba) {
 fn review_decision_chip(decision: &str) -> (String, Rgba) {
     match decision {
         "approved" => ("✓ Approved".to_string(), check_pass_color()),
-        "changes-requested" => ("× Changes requested".to_string(), pr_closed_color()),
+        "changes-requested" => ("× Changes requested".to_string(), theme::error()),
         _ => ("○ Awaiting review".to_string(), theme::fg_muted()),
     }
 }
@@ -1407,7 +1410,7 @@ impl AppView {
                     .py_2()
                     .text_xs()
                     .text_color(theme::fg_muted())
-                    .child(div().text_color(pr_closed_color()).child("⚠"))
+                    .child(div().text_color(theme::error()).child("⚠"))
                     .child(err.clone()),
             );
         }
@@ -1556,7 +1559,7 @@ impl AppView {
                                 .text_color(check_pass_color())
                                 .child(format!("+{ins}")),
                         )
-                        .child(div().text_color(pr_closed_color()).child(format!("−{del}"))),
+                        .child(div().text_color(theme::error()).child(format!("−{del}"))),
                 );
             }
         } else {
@@ -1682,7 +1685,7 @@ impl AppView {
                     .px_2()
                     .py_1p5()
                     .text_xs()
-                    .text_color(pr_closed_color())
+                    .text_color(theme::error())
                     .child(err.clone()),
             );
         }
@@ -1829,7 +1832,7 @@ impl AppView {
                     .px_2()
                     .pb_1()
                     .text_xs()
-                    .text_color(pr_closed_color())
+                    .text_color(theme::error())
                     .child(err.clone()),
             );
         }
@@ -1899,7 +1902,7 @@ impl AppView {
                         .rounded_sm()
                         .cursor_pointer()
                         .text_color(if armed {
-                            pr_closed_color()
+                            theme::error()
                         } else {
                             theme::fg_muted()
                         })
@@ -2170,7 +2173,7 @@ impl AppView {
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .text_color(pr_closed_color())
+                    .text_color(theme::error())
                     .child(err.clone()),
             );
         }
@@ -2255,7 +2258,7 @@ impl AppView {
                         )
                         .child(
                             div()
-                                .text_color(pr_closed_color())
+                                .text_color(theme::error())
                                 .child(format!("−{deletions}")),
                         ),
                 );
@@ -2283,6 +2286,8 @@ impl AppView {
             }
 
             let key_click = key.clone();
+            // Web PULL_REQUEST_ROW_CLASS: `rounded-md py-1`, hover
+            // `bg-accent/60`, selected/expanded `bg-accent`.
             let mut row = div()
                 .id(("vcs-pr", ix))
                 .flex()
@@ -2290,10 +2295,10 @@ impl AppView {
                 .gap_2()
                 .px_2()
                 .py_1()
-                .rounded_sm()
+                .rounded(theme::radius::MD)
                 .cursor_pointer()
-                .when(expanded, |d| d.bg(theme::selected()))
-                .when(!expanded, |d| d.hover(|h| h.bg(theme::hover())))
+                .when(expanded, |d| d.bg(theme::accent()))
+                .when(!expanded, |d| d.hover(|h| h.bg(theme::accent_soft())))
                 .child(
                     div()
                         .pt_0p5()
@@ -2444,7 +2449,7 @@ impl AppView {
             block = block.child(
                 div()
                     .text_xs()
-                    .text_color(pr_closed_color())
+                    .text_color(theme::error())
                     .child(err.clone()),
             );
         }
@@ -2460,7 +2465,7 @@ impl AppView {
             );
             match d["mergeability"].as_str() {
                 Some("conflicting") => {
-                    line1 = line1.child(div().text_color(pr_closed_color()).child("conflicts"))
+                    line1 = line1.child(div().text_color(theme::error()).child("conflicts"))
                 }
                 Some("mergeable") => {
                     line1 = line1.child(div().text_color(check_pass_color()).child("mergeable"))

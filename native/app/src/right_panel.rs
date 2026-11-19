@@ -114,14 +114,19 @@ impl AppView {
             .child(body)
     }
 
+    /// Web `RightPanelTabs`: the strip sits at `--workspace-topbar-height`
+    /// (52px) with compact `h-6 rounded-md` pills — active `bg-accent
+    /// text-foreground`, inactive muted + `hover:bg-accent/60`.
     fn render_panel_tab_bar(&self, cx: &mut Context<Self>) -> Div {
         let tab = |label: &'static str, target: Tab, cx: &mut Context<Self>| {
             let active = self.panel_state.tab == Some(target);
             div()
-                .px_2()
-                .h_full()
+                .h(px(24.))
                 .flex()
                 .items_center()
+                .pl_1p5()
+                .pr_2()
+                .rounded(theme::radius::MD)
                 .cursor_pointer()
                 .text_xs()
                 .text_color(if active {
@@ -129,13 +134,14 @@ impl AppView {
                 } else {
                     theme::fg_muted()
                 })
-                .border_b_2()
-                .border_color(if active {
-                    theme::primary()
-                } else {
-                    gpui::rgba(0x00000000)
+                .when(active, |s| s.bg(theme::accent()))
+                .hover(move |s| {
+                    if active {
+                        s
+                    } else {
+                        s.bg(theme::accent_soft()).text_color(theme::fg())
+                    }
                 })
-                .hover(|s| s.bg(theme::hover()))
                 .child(label)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
@@ -146,12 +152,12 @@ impl AppView {
                 )
         };
         div()
-            .h(px(36.))
-            .px_1()
-            .border_b_1()
-            .border_color(theme::border())
+            .h(px(theme::TOPBAR_H))
+            .pl_2()
             .flex()
             .flex_row()
+            .items_center()
+            .gap_1()
             .child(tab("Files", Tab::Files, cx))
             .child(tab("Terminals", Tab::Terminals, cx))
             .child(tab("Pull requests", Tab::PullRequests, cx))
@@ -259,16 +265,16 @@ impl AppView {
             .w_full()
             .text_xs();
 
-        // Header: label + refresh.
+        // Header: label + refresh — same h-9 inline subheader as the
+        // Files/Terminals panes.
         pane = pane.child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
-                .h(px(28.))
+                .h(px(36.))
                 .px_2()
-                .border_b_1()
-                .border_color(theme::border())
+                .mb_1()
                 .child(
                     div()
                         .flex_1()

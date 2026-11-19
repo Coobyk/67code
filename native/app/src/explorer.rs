@@ -1106,15 +1106,17 @@ impl AppView {
                     .map(|p| p.name.to_string())
             })
             .unwrap_or_else(|| "Files".to_string());
+        // Header: project name + refresh. Matches the web
+        // FILE_SURFACE_SUBHEADER inline variant: h-9 (36px), px-2, no
+        // bottom border, 4px gap before the content.
         pane = pane.child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
-                .h(px(28.))
+                .h(px(36.))
                 .px_2()
-                .border_b_1()
-                .border_color(theme::border())
+                .mb_1()
                 .child(
                     div()
                         .flex_1()
@@ -1224,18 +1226,20 @@ impl AppView {
         };
         let path = row.path.clone();
         let is_dir = row.is_dir;
+        // Pierre trees: 30px rows (--trees-item-height), 8px level gap,
+        // 8px item padding-x, radius-md, fg·7% hover / fg·12% selected.
         let mut el = div()
             .id(("xpl-row", ix))
             .flex()
             .items_center()
-            .pl(px(4. + row.depth as f32 * 12.))
+            .h(px(30.))
+            .pl(px(8. + row.depth as f32 * 8.))
             .pr_2()
-            .py(px(2.5))
-            .rounded_sm()
+            .rounded(theme::radius::MD)
             .cursor_pointer()
             .whitespace_nowrap()
-            .when(is_selected, |s| s.bg(theme::selected()))
-            .when(!is_selected, |s| s.hover(|s| s.bg(theme::hover())))
+            .when(is_selected, |s| s.bg(theme::tree_selected()))
+            .when(!is_selected, |s| s.hover(|s| s.bg(theme::tree_hover())))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _ev, _w, cx| {
@@ -1246,9 +1250,11 @@ impl AppView {
                     }
                 }),
             )
+            // 16px caret/icon lane (--trees-icon-width) + 6px row gap.
             .child(
                 div()
-                    .w(px(14.))
+                    .w(px(16.))
+                    .pr(px(6.))
                     .flex_none()
                     .text_color(theme::fg_muted())
                     .child(chevron),
@@ -1259,11 +1265,13 @@ impl AppView {
                     .min_w_0()
                     .overflow_x_hidden()
                     .text_ellipsis()
-                    .when(row.ignored || row.is_dir, |s| {
-                        s.text_color(theme::fg_muted())
+                    // Web tree: git-ignored names dim to muted-fg;
+                    // directories keep the normal foreground.
+                    .text_color(if row.ignored {
+                        theme::fg_muted()
+                    } else {
+                        theme::fg()
                     })
-                    .when(!row.ignored && !row.is_dir, |s| s.text_color(theme::fg()))
-                    .when(is_selected, |s| s.text_color(theme::fg()))
                     .child(row.name.clone()),
             );
         if row.loading {
@@ -1281,7 +1289,7 @@ impl AppView {
                 div()
                     .flex_none()
                     .pl_1()
-                    .text_color(gpui::rgb(0xf87171))
+                    .text_color(theme::error_fg())
                     .child(if err.chars().count() > 40 {
                         format!("{short}…")
                     } else {
@@ -1327,15 +1335,14 @@ impl AppView {
             .border_color(theme::border())
             .flex()
             .flex_col()
+            // Inline preview subheader: web h-7 (28px), no bottom border.
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(26.))
+                    .h(px(28.))
                     .px_2()
-                    .border_b_1()
-                    .border_color(theme::border())
                     .child(
                         div()
                             .flex_1()
@@ -1343,7 +1350,7 @@ impl AppView {
                             .whitespace_nowrap()
                             .overflow_x_hidden()
                             .text_ellipsis()
-                            .font_family("monospace")
+                            .font_family(theme::FONT_MONO)
                             .child(SharedString::from(preview.path.clone())),
                     )
                     .when(byte_length > 0, |el| {
@@ -1490,10 +1497,13 @@ impl AppView {
                     ),
             );
         }
+        // Web file previews sit on `--code-background` at the 13px code
+        // font (--diffs-font-size = DEFAULT_CODE_FONT_SIZE).
         let body = div()
             .id("explorer-preview-body")
             .flex_1()
             .min_h_0()
+            .bg(theme::code_bg())
             .overflow_y_scroll()
             .track_scroll(&self.explorer_state.preview_scroll);
         if let Some(ed) = editing {
@@ -1518,7 +1528,7 @@ impl AppView {
                     .child(div().text_xl().child(kind.emoji()))
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(theme::FONT_MONO)
                             .text_color(theme::fg())
                             .child(file_name(&preview.path).to_string()),
                     )
@@ -1572,7 +1582,8 @@ impl AppView {
                 } else {
                     body.p_2().child(
                         div()
-                            .font_family("monospace")
+                            .font_family(theme::FONT_MONO)
+                            .text_size(theme::code_text_size())
                             .text_color(theme::fg())
                             .child(SharedString::from(contents.clone())),
                     )
@@ -1605,8 +1616,8 @@ impl AppView {
             .track_scroll(&ed.scroll)
             .px_2()
             .py_1()
-            .font_family("monospace")
-            .text_xs()
+            .font_family(theme::FONT_MONO)
+            .text_size(theme::code_text_size())
             .text_color(theme::fg());
         for (row, line) in ed.content.split('\n').enumerate() {
             let mut line_row = div()

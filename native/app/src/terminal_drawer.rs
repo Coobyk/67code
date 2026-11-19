@@ -39,22 +39,23 @@ use crate::model::ConnectionStatus;
 use crate::notifications::ToastKind;
 use crate::{AppView, theme};
 
-/// Fixed drawer height; the web drawer is drag-resizable (~260 default).
-const DRAWER_HEIGHT: f32 = 260.;
+/// Fixed drawer height; the web drawer is drag-resizable and defaults to
+/// `DEFAULT_THREAD_TERMINAL_HEIGHT` = 280px (apps/web/src/types.ts).
+const DRAWER_HEIGHT: f32 = 280.;
 /// PTY grid requested at open/attach until the first layout reports the
 /// real body size — live resize then keeps it current.
 const TERM_COLS: u16 = 96;
 const TERM_ROWS: u16 = 24;
-/// Approximate monospace cell advance at `text_xs` — the PTY grid only
-/// needs whole cells, so a slightly-off estimate costs one column.
-const TERM_CHAR_WIDTH: f32 = 7.2;
+/// Approximate monospace cell advance at the 13px code font — the PTY grid
+/// only needs whole cells, so a slightly-off estimate costs one column.
+const TERM_CHAR_WIDTH: f32 = 7.8;
 /// Horizontal padding inside the terminal body (`px_2` both sides).
 const TERM_BODY_PAD_X: f32 = 16.;
 /// Layout → `terminal.resize` settle time.
 const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 /// Approximate byte cap for scrollback text kept per terminal.
 const SCROLLBACK_CAP: usize = 200 * 1024;
-/// Uniform row height for the monospaced scrollback list.
+/// Uniform row height for the monospaced scrollback list (~13px × 1.3).
 const LINE_HEIGHT: f32 = 17.;
 
 const DEFAULT_TERMINAL_ID: &str = "t1";
@@ -1041,12 +1042,10 @@ const LIGHT16: [u32; 16] = [
     0xcd3131, 0x14ce14, 0xb5ba00, 0x0451a5, 0xbc05bc, 0x0598bc, 0xa5a5a5,
 ];
 
+/// `--terminal-background: var(--background)` — the web terminal surface is
+/// plain background, not a dedicated terminal color.
 fn term_bg() -> gpui::Rgba {
-    if theme::effective_dark() {
-        rgb(0x0b0d10)
-    } else {
-        rgb(0xffffff)
-    }
+    theme::canvas()
 }
 
 fn idx_to_rgb(i: u8) -> u32 {
@@ -1154,12 +1153,13 @@ fn status_label(session: &Session) -> String {
     }
 }
 
+/// Status-dot tone — same semantic roles as the row dot below.
 fn status_color(session: &Session) -> gpui::Hsla {
     match &session.status {
-        TermStatus::Running => rgb(0x23d18b).into(),
-        TermStatus::Connecting => rgb(0xe5c07b).into(),
+        TermStatus::Running => theme::success().into(),
+        TermStatus::Connecting => theme::warning().into(),
         TermStatus::Exited(_) | TermStatus::Closed => theme::fg_muted().into(),
-        TermStatus::Dead => rgb(0xf14c4c).into(),
+        TermStatus::Dead => theme::error().into(),
     }
 }
 
@@ -2117,12 +2117,13 @@ impl AppView {
 
         let focus = self.terminal_state.focus.clone();
         let focus2 = focus.clone();
+        // Web drawer: `border-t border-border/80` over `--background`.
         div()
             .flex()
             .flex_col()
             .h(px(DRAWER_HEIGHT))
             .border_t_1()
-            .border_color(theme::border())
+            .border_color(theme::border_soft())
             .bg(term_bg())
             .key_context("Terminal")
             .when_some(focus, |el, h| el.track_focus(&h))
@@ -2191,6 +2192,9 @@ impl AppView {
                         ),
                 );
         }
+        // VT cursor (row index into `lines`, column) → block overlay drawn
+        // inside that row below.
+        let cursor = (session.screen.cr, session.screen.cc);
         let rows = session.screen.render_rows();
         let count = rows.len();
         if count == 0 {
@@ -2208,8 +2212,8 @@ impl AppView {
             .relative()
             .px_2()
             .py_1()
-            .font_family("monospace")
-            .text_xs()
+            .font_family(theme::FONT_MONO)
+            .text_size(theme::code_text_size())
             .line_height(px(LINE_HEIGHT))
             .child(
                 // Zero-visual canvas that measures the body's laid-out size
@@ -2242,16 +2246,34 @@ impl AppView {
             )
             .child(
                 uniform_list("terminal-scrollback", count, move |range, _window, _cx| {
+                    // render_rows drops trailing blank lines; the cursor can
+                    // sit on one, so it lands on the last rendered row.
+                    let cursor_row = cursor.0.min(count.saturating_sub(1));
                     range
                         .map(|i| {
                             let row = &rows[i];
                             let styled = StyledText::new(row.text.clone())
                                 .with_highlights(row.runs.iter().cloned().collect::<Vec<_>>());
-                            div()
+                            let mut el = div()
                                 .h(px(LINE_HEIGHT))
+                                .relative()
                                 .whitespace_nowrap()
                                 .overflow_hidden()
-                                .child(styled)
+                                .child(styled);
+                            // Block cursor at the VT cursor cell, colored
+                            // with --terminal-cursor (theme::terminal_cursor).
+                            if i == cursor_row {
+                                el = el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(cursor.1.min(200) as f32 * TERM_CHAR_WIDTH))
+                                        .top(px(0.))
+                                        .w(px(TERM_CHAR_WIDTH))
+                                        .h(px(LINE_HEIGHT))
+                                        .bg(theme::terminal_cursor()),
+                                );
+                            }
+                            el
                         })
                         .collect()
                 })
@@ -2285,7 +2307,7 @@ fn drawer_button(label: &str, id: &'static str) -> gpui::Stateful<Div> {
         .child(label.to_string())
 }
 
-// (kept small on purpose — the drawer is a fixed 260px, not drag-resizable)
+// (kept small on purpose — the drawer is a fixed 280px, not drag-resizable)
 
 // ---------------------------------------------------------------------------
 // Right-panel Terminals tab
@@ -2314,16 +2336,16 @@ impl AppView {
 
         let st = &self.terminal_state;
         let selected = self.state.selected.clone();
+        // Pane subheader — matches the Files pane (web h-9 inline subheader).
         let mut header = div()
-            .h(px(32.))
-            .px_3()
+            .h(px(36.))
+            .px_2()
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
-            .border_color(theme::border())
             .text_xs()
             .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme::fg_muted())
             .child("Terminals")
             .child(div().flex_1());
         header = header.child(
@@ -2464,11 +2486,11 @@ impl AppView {
         let close_term = terminal_id.clone();
         let is_active = self.terminal_state.active.get(&thread_id) == Some(&terminal_id);
         let dot = if status == "running" {
-            rgb(0x23d18b)
+            theme::success()
         } else if status.starts_with("exited") || status == "closed" || status == "disconnected" {
             theme::fg_muted()
         } else {
-            rgb(0xe5c07b)
+            theme::warning()
         };
         let mut sub = format!("{status}");
         if let Some(pid) = pid {
@@ -2477,13 +2499,16 @@ impl AppView {
         if let Some(title) = thread_title {
             sub.push_str(&format!(" · {title}"));
         }
+        // Web sidebar terminal row: rounded-md pl-1.5 pr-2 text-xs, active
+        // `bg-accent text-foreground`, hover `bg-accent/60`.
         div()
-            .px_2()
+            .pl_1p5()
+            .pr_2()
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .when(is_active, |el| el.bg(theme::selected()))
-            .hover(|s| s.bg(theme::hover()))
+            .when(is_active, |el| el.bg(theme::accent()))
+            .hover(|s| s.bg(theme::accent_soft()))
             .flex()
             .items_center()
             .gap_2()
@@ -2534,7 +2559,7 @@ impl AppView {
                     .cursor_pointer()
                     .text_xs()
                     .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::selected()).text_color(theme::fg()))
+                    .hover(|s| s.bg(theme::accent_soft()).text_color(theme::fg()))
                     .child("×")
                     .on_mouse_down(
                         MouseButton::Left,

@@ -14,12 +14,8 @@
 //! — honest when the checked-out branch is the PR head, labeled otherwise.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 
-use gpui::{
-    Context, Div, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, div,
-    prelude::*, px, rgb,
-};
+use gpui::{Context, Div, FontWeight, MouseButton, SharedString, div, prelude::*, px};
 use serde_json::{Value, json};
 
 use crate::right_panel::Tab;
@@ -28,35 +24,47 @@ use crate::{AppView, theme};
 /// Cap the parsed patch so a huge diff cannot stall the renderer.
 const MAX_FILES: usize = 500;
 const MAX_LINES: usize = 60_000;
+/// Per-file render cap — each line is a small div tree now, so very long
+/// files render their head plus a truncation notice.
+const RENDER_LINE_CAP: usize = 4_000;
+/// Uniform diff row height (13px mono on a ~1.45 line-height, like the web
+/// pierre surface).
+const DIFF_ROW_H: f32 = 19.;
+/// Monospace cell advance at the 13px code font (gutter + content widths).
+const DIFF_CHAR_W: f32 = 7.8;
 
-fn add_color() -> gpui::Rgba {
-    rgb(0x3fb950)
+/// `text-diff-addition` — "+N" counters (`--success`).
+fn add_count() -> gpui::Rgba {
+    theme::diff_add_count()
 }
-fn del_color() -> gpui::Rgba {
-    rgb(0xf85149)
+/// `text-diff-deletion` — "−N" counters (`--destructive`).
+fn del_count() -> gpui::Rgba {
+    theme::diff_del_count()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineKind {
+    /// File-header/meta lines (`index`, `---`, `+++`, `similarity`, `\`).
     Meta,
+    /// `@@ …` hunk separator.
     Hunk,
     Add,
     Del,
+    /// Unchanged line inside a hunk.
+    Context,
 }
 
-impl LineKind {
-    fn color(self) -> gpui::Rgba {
-        match self {
-            LineKind::Meta => theme::fg_muted(),
-            LineKind::Hunk => theme::primary(),
-            LineKind::Add => add_color(),
-            LineKind::Del => del_color(),
-        }
-    }
+/// One rendered row inside a `diff --git` section: the patch line without
+/// its trailing '\n', plus old/new gutter numbers for hunk lines.
+struct DiffLine {
+    kind: LineKind,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    text: String,
 }
 
-/// One `diff --git` section of a patch: rendered mono text + byte-range
-/// highlight classes (resolved to colors at render so theme swaps repaint).
+/// One `diff --git` section of a patch: parsed display rows colored with
+/// the web's `--diffs-*` tokens at render time.
 pub(crate) struct DiffFile {
     /// Display path — the new path, or the old path for deletions.
     path: String,
@@ -65,17 +73,141 @@ pub(crate) struct DiffFile {
     adds: usize,
     dels: usize,
     binary: bool,
-    /// Patch body text (everything after the `diff --git` line).
-    text: String,
-    spans: Vec<(Range<usize>, LineKind)>,
+    lines: Vec<DiffLine>,
+    /// Largest gutter number seen — sizes the number columns.
+    max_lineno: u32,
 }
 
-/// Split a unified patch into per-file sections.
+/// `@@ -a[,b] +c[,d] @@` → `(a, c)` — seeds the gutter counters.
+fn hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let body = line.strip_prefix("@@")?;
+    let scan_num = |s: &str, sigil: char| -> Option<u32> {
+        let tail = s.split(sigil).nth(1)?;
+        tail.split([',', ' '])
+            .next()?
+            .trim_start_matches('@')
+            .parse()
+            .ok()
+    };
+    let old = scan_num(body, '-')?;
+    let new = scan_num(body, '+')?;
+    Some((old, new))
+}
+
+/// One numbered gutter cell (old or new side).
+fn gutter_cell(no: Option<u32>, width: f32, bg: gpui::Rgba, fg: gpui::Rgba) -> Div {
+    div()
+        .w(px(width))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_end()
+        .pr_2()
+        .bg(bg)
+        .text_color(fg)
+        .child(match no {
+            Some(n) => n.to_string(),
+            None => String::new(),
+        })
+}
+
+/// One rendered diff line: hunk/meta rows span the row width; hunk content
+/// lines get old+new number lanes plus the tinted content cell — mirroring
+/// the web pierre rows (`--diffs-bg-*` fills, `--diffs-fg-number` digits).
+fn diff_row(line: &DiffLine, gutter_w: f32, row_w: f32) -> Div {
+    match line.kind {
+        LineKind::Meta => div()
+            .h(px(DIFF_ROW_H))
+            .w(px(row_w))
+            .flex()
+            .items_center()
+            .px_2()
+            .text_color(theme::fg_muted())
+            .child(SharedString::from(line.text.clone())),
+        LineKind::Hunk => div()
+            .h(px(DIFF_ROW_H))
+            .w(px(row_w))
+            .flex()
+            .items_center()
+            .px_2()
+            .bg(theme::diff_hunk_bg())
+            .text_color(theme::fg_muted())
+            .child(SharedString::from(line.text.clone())),
+        LineKind::Context | LineKind::Add | LineKind::Del => {
+            let (line_bg, num_bg, num_fg, line_fg) = match line.kind {
+                LineKind::Add => (
+                    theme::diff_add_bg(),
+                    theme::diff_add_num_bg(),
+                    add_count(),
+                    theme::diff_add_fg(),
+                ),
+                LineKind::Del => (
+                    theme::diff_del_bg(),
+                    theme::diff_del_num_bg(),
+                    del_count(),
+                    theme::diff_del_fg(),
+                ),
+                _ => (
+                    theme::diff_context_bg(),
+                    theme::diff_context_bg(),
+                    theme::diff_gutter_fg(),
+                    theme::fg(),
+                ),
+            };
+            div()
+                .h(px(DIFF_ROW_H))
+                .w(px(row_w))
+                .flex()
+                .whitespace_nowrap()
+                .child(gutter_cell(line.old_no, gutter_w, num_bg, num_fg))
+                .child(gutter_cell(line.new_no, gutter_w, num_bg, num_fg))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .pl_2()
+                        .flex()
+                        .items_center()
+                        .bg(line_bg)
+                        .text_color(line_fg)
+                        .child(SharedString::from(line.text.clone())),
+                )
+        }
+    }
+}
+
+/// Append a row, keeping `max_lineno` current for gutter sizing.
+fn push_line(
+    f: &mut DiffFile,
+    kind: LineKind,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    text: &str,
+) {
+    let hi = old_no.unwrap_or(0).max(new_no.unwrap_or(0));
+    f.max_lineno = f.max_lineno.max(hi);
+    f.lines.push(DiffLine {
+        kind,
+        old_no,
+        new_no,
+        text: text.to_string(),
+    });
+}
+
+/// Split a unified patch into per-file sections, tracking `@@` counters so
+/// each hunk line carries old/new gutter numbers like the web diff.
 fn parse_patch(patch: &str) -> (Vec<DiffFile>, bool) {
     let mut files: Vec<DiffFile> = Vec::new();
     let mut cur: Option<DiffFile> = None;
     let mut old_path: Option<String> = None;
     let mut truncated = false;
+    // Line counters inside the current hunk region of `cur`.
+    let mut in_hunk = false;
+    let mut old_ln = 0u32;
+    let mut new_ln = 0u32;
+    let mut total_lines = 0usize;
 
     let strip = |p: &str| -> String {
         let p = p.trim_end_matches('\t');
@@ -106,31 +238,34 @@ fn parse_patch(patch: &str) -> (Vec<DiffFile>, bool) {
                 adds: 0,
                 dels: 0,
                 binary: false,
-                text: String::new(),
-                spans: Vec::new(),
+                lines: Vec::new(),
+                max_lineno: 0,
             });
             old_path = None;
+            in_hunk = false;
             continue;
         }
         let Some(f) = cur.as_mut() else {
             continue; // preamble before the first file header
         };
-        if f.spans.len() + files.iter().map(|g| g.spans.len()).sum::<usize>() >= MAX_LINES {
+        if total_lines >= MAX_LINES {
             truncated = true;
             break;
         }
+        total_lines += 1;
 
-        let start = f.text.len();
-        f.text.push_str(line);
-        f.text.push('\n');
-        let range = start..f.text.len();
-
-        let kind = if line.starts_with("@@") {
-            LineKind::Hunk
-        } else if let Some(rest) = line.strip_prefix("--- ") {
+        if let Some(starts) = hunk_starts(line) {
+            (old_ln, new_ln) = starts;
+            in_hunk = true;
+            push_line(f, LineKind::Hunk, None, None, line);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
             old_path = (rest != "/dev/null").then(|| strip(rest));
-            LineKind::Meta
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            push_line(f, LineKind::Meta, None, None, line);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
             if rest == "/dev/null" {
                 if let Some(old) = old_path.clone() {
                     f.path = old;
@@ -138,17 +273,15 @@ fn parse_patch(patch: &str) -> (Vec<DiffFile>, bool) {
             } else {
                 f.path = strip(rest);
             }
-            LineKind::Meta
-        } else if line.starts_with('+') {
-            f.adds += 1;
-            LineKind::Add
-        } else if line.starts_with('-') {
-            f.dels += 1;
-            LineKind::Del
-        } else if line.starts_with("Binary files") || line.starts_with("GIT binary patch") {
+            push_line(f, LineKind::Meta, None, None, line);
+            continue;
+        }
+        if line.starts_with("Binary files") || line.starts_with("GIT binary patch") {
             f.binary = true;
-            LineKind::Meta
-        } else if line.starts_with("index ")
+            push_line(f, LineKind::Meta, None, None, line);
+            continue;
+        }
+        if line.starts_with("index ")
             || line.ends_with(" mode")
             || line.starts_with("similarity index")
             || line.starts_with("dissimilarity index")
@@ -158,21 +291,38 @@ fn parse_patch(patch: &str) -> (Vec<DiffFile>, bool) {
             || line.starts_with("copy to")
             || line.starts_with('\\')
         {
-            LineKind::Meta
-        } else {
-            // Context lines (` ` prefix); the span covers the whole line so
-            // colors for add/del apply to content only? Keep whole-line
-            // ranges — context gets no span at all.
+            push_line(f, LineKind::Meta, None, None, line);
             continue;
-        };
-        // Merge with the previous span when the kind repeats (fewer ranges).
-        if let Some(last) = f.spans.last_mut() {
-            if last.1 == kind && last.0.end == range.start {
-                last.0.end = range.end;
-                continue;
-            }
         }
-        f.spans.push((range, kind));
+        if !in_hunk {
+            // Stray header text (e.g. `new file mode` variants not matched
+            // above) — keep it as muted meta rather than dropping it.
+            push_line(f, LineKind::Meta, None, None, line);
+            continue;
+        }
+        let (kind, old_no, new_no) = match line.as_bytes().first() {
+            Some(b'+') => {
+                f.adds += 1;
+                let n = new_ln;
+                new_ln += 1;
+                (LineKind::Add, None, Some(n))
+            }
+            Some(b'-') => {
+                f.dels += 1;
+                let n = old_ln;
+                old_ln += 1;
+                (LineKind::Del, Some(n), None)
+            }
+            _ => {
+                let (o, n) = (old_ln, new_ln);
+                old_ln += 1;
+                new_ln += 1;
+                (LineKind::Context, Some(o), Some(n))
+            }
+        };
+        // The web shows no `+`/`-`/` ` sign column — the row tint and the
+        // number lanes carry that information instead.
+        push_line(f, kind, old_no, new_no, &line[1.min(line.len())..]);
     }
     if let Some(f) = cur.take() {
         files.push(f);
@@ -339,7 +489,14 @@ impl AppView {
     /// Right-panel `Tab::Diff` body.
     pub(crate) fn render_diff_pane(&self, cx: &mut Context<Self>) -> Div {
         let s = &self.vcs_state.diff;
-        let mut pane = div().flex().flex_col().flex_1().min_h_0();
+        // The web diff surface is `--code-background` + `--code-foreground`
+        // mono text, not the plain canvas.
+        let mut pane = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .bg(theme::code_bg());
 
         // Header: back to PRs + title + refresh.
         let mut head = div()
@@ -410,7 +567,7 @@ impl AppView {
                     .px_3()
                     .py_1p5()
                     .text_xs()
-                    .text_color(rgb(0xd29922))
+                    .text_color(theme::warning_fg())
                     .border_b_1()
                     .border_color(theme::border())
                     .child(format!("⚠ {note}")),
@@ -426,7 +583,7 @@ impl AppView {
                     .px_3()
                     .py_2()
                     .text_xs()
-                    .text_color(del_color())
+                    .text_color(theme::error())
                     .child(err.clone()),
             );
         }
@@ -464,11 +621,11 @@ impl AppView {
                             theme::fg_muted()
                         })
                         .bg(if active {
-                            theme::selected()
+                            theme::accent()
                         } else {
                             gpui::rgba(0x00000000)
                         })
-                        .hover(|h| h.bg(theme::hover()))
+                        .hover(|h| h.bg(theme::accent_soft()))
                         .child(src.title.clone())
                         .on_mouse_down(
                             MouseButton::Left,
@@ -525,11 +682,11 @@ impl AppView {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .font_family("monospace")
+                                .font_family(theme::FONT_MONO)
                                 .child(path.clone()),
                         )
-                        .child(div().text_color(add_color()).child(format!("+{adds}")))
-                        .child(div().text_color(del_color()).child(format!("−{dels}"))),
+                        .child(div().text_color(add_count()).child(format!("+{adds}")))
+                        .child(div().text_color(del_count()).child(format!("−{dels}"))),
                 );
             }
         }
@@ -540,16 +697,19 @@ impl AppView {
                 Some(old) if old != &file.path => format!("{old} → {}", file.path),
                 _ => file.path.clone(),
             };
+            // Web pierre file header: 32px sticky bar on `--code-background`
+            // with a bottom hairline, mono path, semantic +/- counts.
             let mut header = div()
                 .id(("diff-file", ix))
                 .flex()
                 .items_center()
                 .gap_1p5()
+                .h(px(32.))
                 .px_2()
-                .py_1()
                 .cursor_pointer()
-                .bg(theme::canvas())
-                .hover(|h| h.bg(theme::hover()))
+                .border_b_1()
+                .border_color(theme::border())
+                .hover(|h| h.bg(theme::accent_soft()))
                 .child(
                     div()
                         .w(px(12.))
@@ -562,7 +722,7 @@ impl AppView {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .font_family("monospace")
+                        .font_family(theme::FONT_MONO)
                         .text_xs()
                         .child(path_label),
                 );
@@ -578,13 +738,13 @@ impl AppView {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(add_color())
+                        .text_color(add_count())
                         .child(format!("+{}", file.adds)),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(del_color())
+                        .text_color(del_count())
                         .child(format!("−{}", file.dels)),
                 )
                 .on_mouse_down(
@@ -610,38 +770,51 @@ impl AppView {
             if collapsed {
                 continue;
             }
-            if file.text.is_empty() {
+            if file.lines.is_empty() {
                 continue;
             }
-            let highlights: Vec<(Range<usize>, HighlightStyle)> = file
-                .spans
+            // Old/new number columns sized to the widest line number
+            // (like pierre's `--diffs-column-number-width`); rows are all
+            // the same width so the per-line tints read as full-width bars.
+            let digits = file.max_lineno.max(1).to_string().len().max(2) as f32;
+            let gutter_w = digits * DIFF_CHAR_W + 16.;
+            let max_chars = file
+                .lines
                 .iter()
-                .map(|(range, kind)| {
-                    (
-                        range.clone(),
-                        HighlightStyle {
-                            color: Some(kind.color().into()),
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect();
-            let mut text = StyledText::new(file.text.clone());
-            if !highlights.is_empty() {
-                text = text.with_highlights(highlights);
+                .map(|l| l.text.chars().count())
+                .max()
+                .unwrap_or(0) as f32;
+            let row_w = 2. * gutter_w + 8. + max_chars * DIFF_CHAR_W;
+            let mut rows = div()
+                .flex()
+                .flex_col()
+                .w(px(row_w))
+                .font_family(theme::FONT_MONO)
+                .text_size(theme::code_text_size())
+                .whitespace_nowrap();
+            let total = file.lines.len();
+            for line in file.lines.iter().take(RENDER_LINE_CAP) {
+                rows = rows.child(diff_row(line, gutter_w, row_w));
+            }
+            if total > RENDER_LINE_CAP {
+                rows = rows.child(
+                    div()
+                        .h(px(DIFF_ROW_H))
+                        .w(px(row_w))
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .text_color(theme::fg_muted())
+                        .child(format!("… {} more lines", total - RENDER_LINE_CAP)),
+                );
             }
             list = list.child(
                 div()
                     .id(("diff-body", ix))
                     .w_full()
                     .overflow_x_scroll()
-                    .px_2()
                     .pb_1()
-                    .font_family("monospace")
-                    .text_xs()
-                    .whitespace_nowrap()
-                    .text_color(theme::fg_muted())
-                    .child(text),
+                    .child(rows),
             );
         }
         if src.truncated {
