@@ -891,15 +891,27 @@ fn window_controls() -> impl IntoElement {
         .items_center()
         .gap_1()
         .ml_2()
-        .child(btn("win-min", "\u{2013}", WindowControlArea::Min, false, |_ev, w, _cx| {
-            w.minimize_window()
-        }))
-        .child(btn("win-max", "\u{25a1}", WindowControlArea::Max, false, |_ev, w, _cx| {
-            w.zoom_window()
-        }))
-        .child(btn("win-close", "\u{00d7}", WindowControlArea::Close, true, |_ev, w, _cx| {
-            w.remove_window()
-        }))
+        .child(btn(
+            "win-min",
+            "\u{2013}",
+            WindowControlArea::Min,
+            false,
+            |_ev, w, _cx| w.minimize_window(),
+        ))
+        .child(btn(
+            "win-max",
+            "\u{25a1}",
+            WindowControlArea::Max,
+            false,
+            |_ev, w, _cx| w.zoom_window(),
+        ))
+        .child(btn(
+            "win-close",
+            "\u{00d7}",
+            WindowControlArea::Close,
+            true,
+            |_ev, w, _cx| w.remove_window(),
+        ))
 }
 
 impl Render for AppView {
