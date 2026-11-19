@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths, Focusable,
-    KeystrokeEvent, MouseButton, ObjectFit, RenderImage, SharedString, Subscription, Window, div,
-    img, prelude::*, px, rgb, rgba,
+    BoxShadow, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths,
+    Focusable, FontWeight, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, SharedString,
+    Subscription, Window, div, img, prelude::*, px, rgb, rgba,
 };
 use serde_json::json;
 
@@ -440,6 +440,31 @@ fn decode_thumbnail(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new([image::Frame::new(data)])))
 }
 
+/// Best-effort 64px preview for a staged file path — image files render as
+/// square previews like the web client. Only the preview is decoded; the
+/// attachment stays `AttachmentKind::File`, so the dispatch payload is
+/// unchanged. Size-capped so a pathological path cannot stall the composer.
+fn file_thumbnail(path: &str) -> Option<Arc<RenderImage>> {
+    let looks_like_image = path
+        .rsplit('.')
+        .next()
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif"
+            )
+        })
+        .unwrap_or(false);
+    if !looks_like_image {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    decode_thumbnail(&std::fs::read(path).ok()?)
+}
+
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
@@ -542,10 +567,6 @@ fn compact_tokens(n: u64) -> String {
 
 fn danger() -> gpui::Rgba {
     rgb(0xff5a5a)
-}
-
-fn warning() -> gpui::Rgba {
-    rgb(0xe8b45a)
 }
 
 /// `(total tokens, total costUsd, distinct sessions)` — bucket `sessions`
@@ -947,7 +968,35 @@ fn runtime_mode_label(mode: &str) -> &'static str {
         .unwrap_or("Full access")
 }
 
-/// Shared styling for the floating menus above the composer.
+/// The composer card's drop shadow in dark mode
+/// (`--shadow-composer-dark: 0 14px 32px -18px black·75%`).
+fn composer_shadow() -> BoxShadow {
+    BoxShadow::new(px(0.), px(14.), rgba(0x000000bf).into())
+        .blur_radius(px(32.))
+        .spread_radius(px(-18.))
+}
+
+/// The card's inset top-edge highlight
+/// (`inset 0 1px 0 var(--composer-highlight)`).
+fn composer_highlight_shadow() -> BoxShadow {
+    BoxShadow::new(px(0.), px(1.), theme::composer_highlight().into()).inset()
+}
+
+/// The send/stop buttons' inset top-edge highlight
+/// (`inset 0 1px 0 var(--inset-shadow-control-highlight)`).
+fn control_highlight_shadow() -> BoxShadow {
+    BoxShadow::new(px(0.), px(1.), theme::control_highlight().into()).inset()
+}
+
+/// The dropdown popup's shadow (`0 18px 44px -18px black·80%`).
+fn popup_shadow() -> BoxShadow {
+    BoxShadow::new(px(0.), px(18.), rgba(0x000000cc).into())
+        .blur_radius(px(44.))
+        .spread_radius(px(-18.))
+}
+
+/// Picker popups above the composer — web `dropdown-glass`: popover fill,
+/// contrast-fg·10% outline, rounded-lg, deep drop shadow, p-1 item gutter.
 fn menu_panel() -> gpui::Div {
     div()
         .absolute()
@@ -960,13 +1009,39 @@ fn menu_panel() -> gpui::Div {
         .rounded_lg()
         .bg(theme::raised())
         .border_1()
-        .border_color(theme::border())
-        .py_1()
+        .border_color(theme::popup_border())
+        .shadow(vec![popup_shadow()])
+        .p_1()
         .max_h(px(280.))
         .overflow_y_hidden()
         .occlude()
 }
 
+/// The slash/mention suggestion drawer — an attached `ComposerBanner.Surface`
+/// in the web client: the composer glass fill, the 5% composer outline,
+/// rounded-2xl, the composer drop shadow, p-2 item gutter.
+fn drawer_panel() -> gpui::Div {
+    div()
+        .absolute()
+        .bottom_full()
+        .left_0()
+        .right_0()
+        .mb_2()
+        .flex()
+        .flex_col()
+        .rounded_2xl()
+        .bg(theme::composer_surface())
+        .border_1()
+        .border_color(theme::composer_outline())
+        .shadow(vec![composer_shadow()])
+        .p_2()
+        .max_h(px(288.))
+        .overflow_y_hidden()
+        .occlude()
+}
+
+/// A picker row — web `Menu` item: min-h-7, px-2 py-1, rounded-sm, text-sm;
+/// the checked option sits on `bg-foreground/[0.08]` like a menu radio item.
 fn menu_row(
     id: impl Into<gpui::ElementId>,
     title: impl Into<SharedString>,
@@ -978,13 +1053,17 @@ fn menu_row(
         .flex()
         .items_center()
         .gap_2()
-        .px_3()
-        .py_1p5()
-        .text_xs()
+        .min_h(px(28.))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_sm()
         .cursor(gpui::CursorStyle::PointingHand)
-        .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
+        .when(active, |s| {
+            s.bg(theme::command_highlight()).text_color(theme::fg())
+        })
         .when(!active, |s| {
-            s.text_color(theme::fg()).hover(|s| s.bg(theme::hover()))
+            s.text_color(theme::fg()).hover(|s| s.bg(theme::accent()))
         })
         .child(
             div()
@@ -997,6 +1076,7 @@ fn menu_row(
             div()
                 .flex_1()
                 .truncate()
+                .text_xs()
                 .text_color(theme::fg_muted())
                 .child(detail),
         );
@@ -1004,31 +1084,95 @@ fn menu_row(
     row
 }
 
-/// Small footer control button (pill) that opens a picker.
+/// A suggestion row in the slash/mention drawer — web `CommandItem` in the
+/// composer menu: min-h-7, px-2 py-1.5, rounded-lg; the label column is
+/// medium xs, the description is xs secondary-label.
+fn drawer_row(
+    id: impl Into<gpui::ElementId>,
+    title: impl Into<SharedString>,
+    detail: Option<SharedString>,
+    active: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let mut row = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_h(px(28.))
+        .px_2()
+        .py_1p5()
+        .rounded_lg()
+        .cursor(gpui::CursorStyle::PointingHand)
+        .when(active, |s| {
+            s.bg(theme::accent()).text_color(theme::accent_fg())
+        })
+        .when(!active, |s| s.text_color(theme::fg()))
+        .child(
+            div()
+                .w(px(160.))
+                .flex_none()
+                .truncate()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title.into()),
+        );
+    if let Some(detail) = detail {
+        row = row.child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .child(detail),
+        );
+    }
+    row
+}
+
+/// Empty-state line inside the slash/mention drawer (web `px-5 pt-3.5 pb-7`
+/// `text-xs text-secondary-label`).
+fn drawer_empty(label: &'static str) -> gpui::Div {
+    div()
+        .px_5()
+        .pt_3p5()
+        .pb_7()
+        .text_xs()
+        .text_color(theme::fg_muted())
+        .child(label)
+}
+
+/// ComposerControl base (apps/web): h-7, px-2, gap-1.5, borderless, rounded
+/// control radius, text-sm medium — the footer chip look.
+fn control_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1p5()
+        .h(px(28.))
+        .px_2()
+        .rounded(px(theme::CONTROL_RADIUS))
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .whitespace_nowrap()
+        .cursor(gpui::CursorStyle::PointingHand)
+}
+
+/// Small footer control button that opens a picker.
 fn footer_chip(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
     kind: PickerKind,
     open: Option<PickerKind>,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(theme::border())
-        .text_xs()
-        .cursor(gpui::CursorStyle::PointingHand)
+    control_chip(id)
         .when(open == Some(kind), |s| {
-            s.bg(theme::selected()).text_color(theme::fg())
+            s.bg(theme::accent()).text_color(theme::accent_fg())
         })
         .when(open != Some(kind), |s| {
-            s.text_color(theme::fg_muted())
-                .hover(|s| s.bg(theme::hover()))
+            s.text_color(theme::control_fg())
+                .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
         })
         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
             ensure_composer_hooks(window, cx);
@@ -1039,6 +1183,37 @@ fn footer_chip(
         })
         .child(label.into())
         .child(div().text_color(theme::fg_muted()).child("▾"))
+}
+
+/// The xs control used under the card (context strip) — `ComposerControl
+/// size="xs"`: h-6, px-1.75, gap-1, text-xs, muted ink.
+fn context_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_1()
+        .h(px(24.))
+        .px(px(7.))
+        .rounded(px(theme::CONTROL_RADIUS))
+        .text_xs()
+        .whitespace_nowrap()
+        .cursor(gpui::CursorStyle::PointingHand)
+        .text_color(theme::fg_muted())
+}
+
+/// A 28px ghost icon button — `Button size="icon-sm" variant="ghost"`.
+fn ghost_icon_button(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.))
+        .h(px(28.))
+        .rounded(px(theme::CONTROL_RADIUS))
+        .text_color(theme::fg_muted())
+        .cursor(gpui::CursorStyle::PointingHand)
 }
 
 impl AppView {
@@ -1251,10 +1426,11 @@ impl AppView {
         self.set_composer_text(&entry.prompt, window, cx);
         self.composer_state.draft = entry.prompt;
         for file in entry.files {
+            let thumbnail = file_thumbnail(&file.path);
             self.composer_state.attachments.push(Attachment {
                 name: file.name,
                 kind: AttachmentKind::File { path: file.path },
-                thumbnail: None,
+                thumbnail,
             });
         }
         cx.notify();
@@ -1639,10 +1815,11 @@ impl AppView {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| display.clone());
+            let thumbnail = file_thumbnail(&display);
             self.composer_state.attachments.push(Attachment {
                 name,
                 kind: AttachmentKind::File { path: display },
-                thumbnail: None,
+                thumbnail,
             });
         }
         cx.notify();
@@ -1735,10 +1912,11 @@ impl AppView {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| display.clone());
+                        let thumbnail = file_thumbnail(&display);
                         self.composer_state.attachments.push(Attachment {
                             name,
                             kind: AttachmentKind::File { path: display },
-                            thumbnail: None,
+                            thumbnail,
                         });
                     }
                 }
@@ -1765,10 +1943,11 @@ impl AppView {
                             .next()
                             .unwrap_or(path.as_str())
                             .to_string();
+                        let thumbnail = file_thumbnail(&path);
                         this.composer_state.attachments.push(Attachment {
                             name,
                             kind: AttachmentKind::File { path },
-                            thumbnail: None,
+                            thumbnail,
                         });
                     }
                     this.composer_state.attach_field = None;
@@ -1904,20 +2083,13 @@ impl AppView {
     fn render_mention_menu(&self) -> impl IntoElement {
         let candidates = self.mention_candidates();
         let selection = self.composer_state.mention_selection;
-        let mut panel = menu_panel();
+        let mut panel = drawer_panel();
         if candidates.is_empty() {
-            panel = panel.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No matches"),
-            );
+            panel = panel.child(drawer_empty("No matching files or folders."));
         } else {
             for (index, (_insert, title, kind)) in candidates.iter().enumerate() {
                 panel = panel.child(
-                    menu_row(
+                    drawer_row(
                         ("mention", index),
                         title.clone(),
                         Some((*kind).into()),
@@ -2145,35 +2317,56 @@ impl AppView {
                 if sessions == 1 { "" } else { "s" },
             ));
         }
+        // Attached `ComposerBanner` drawer — inset 1.375rem from the card's
+        // edges, top corners rounded, bottom tucked under the card's edge.
         banner = banner
+            .mx(px(22.))
             .flex()
             .items_center()
             .gap_2()
-            .rounded_md()
+            .rounded_tl_2xl()
+            .rounded_tr_2xl()
             .px_3()
-            .py_1p5()
+            .py_1()
             .border_1()
+            .border_b_0()
             .text_xs()
             .when(heavy, |s| {
-                s.border_color(warning())
-                    .bg(rgba(0xe8b45a14))
-                    .text_color(warning())
+                // warning variant: warning·28% outline + warning·8% tint.
+                s.border_color(rgba(0xf59e0b47))
+                    .bg(rgba(0xf59e0b14))
+                    .text_color(theme::fg())
             })
             .when(!heavy, |s| {
-                s.border_color(theme::border())
-                    .bg(theme::raised())
+                s.border_color(theme::composer_outline())
+                    .bg(theme::composer_surface())
                     .text_color(theme::fg_muted())
             })
-            .child("◔")
+            .child(
+                div()
+                    .w(px(24.))
+                    .flex_none()
+                    .text_center()
+                    .text_color(if heavy {
+                        theme::warning_fg()
+                    } else {
+                        theme::fg_muted()
+                    })
+                    .child(if heavy { "⚠" } else { "◔" }),
+            )
             .child(div().flex_1().child(text))
             .child(
                 div()
                     .id("usage-dismiss")
-                    .px_1()
-                    .rounded_sm()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(theme::CONTROL_RADIUS))
                     .cursor(gpui::CursorStyle::PointingHand)
                     .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
                     .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                         let Some(view) = app_view(window) else {
                             return;
@@ -2759,21 +2952,14 @@ impl AppView {
     fn render_slash_menu(&self) -> impl IntoElement {
         let commands = slash_commands_for(&self.composer_state.draft);
         let selection = self.composer_state.slash_selection;
-        let mut panel = menu_panel();
+        let mut panel = drawer_panel();
         if commands.is_empty() {
-            panel = panel.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No matching command"),
-            );
+            panel = panel.child(drawer_empty("No matching command."));
         } else {
             for (index, command) in commands.iter().enumerate() {
                 let name = command.name;
                 panel = panel.child(
-                    menu_row(
+                    drawer_row(
                         ("slash", index),
                         format!("/{name}"),
                         Some(command.description.into()),
@@ -3280,34 +3466,66 @@ impl AppView {
         panel
     }
 
+    /// Small "×" affordance used on staged chips — an 18px muted hit target
+    /// that brightens on hover like the web file-row remove button.
+    fn chip_remove(
+        id: impl Into<gpui::ElementId>,
+        index: usize,
+        ctx_chip: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .w(px(18.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .rounded_sm()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .text_color(theme::fg_muted())
+            .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    if ctx_chip {
+                        if index < this.composer_state.terminal_contexts.len() {
+                            this.composer_state.terminal_contexts.remove(index);
+                        }
+                    } else if index < this.composer_state.attachments.len() {
+                        this.composer_state.attachments.remove(index);
+                    }
+                    cx.notify();
+                });
+            })
+            .child("×")
+    }
+
     fn render_attachment_strip(&self) -> impl IntoElement {
-        let mut strip = div().flex().flex_wrap().gap_1().pb_2();
+        // Web `composerAttachmentMediaRow`: mb-3, gap-2, 64px rounded-lg
+        // thumbs; files render as `gap-2 py-1 text-sm` rows.
+        let mut strip = div().flex().flex_wrap().gap_2().pb_3();
         for (index, attachment) in self.composer_state.attachments.iter().enumerate() {
-            let mut chip = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl_2()
-                .pr_1()
-                .py_0p5()
-                .rounded_md()
-                .bg(theme::user_bubble())
-                .border_1()
-                .border_color(theme::border())
-                .text_xs();
             match (&attachment.kind, &attachment.thumbnail) {
-                (AttachmentKind::Image { .. }, Some(thumbnail)) => {
+                // Any attachment with a decoded preview — pasted images and
+                // image-looking file paths alike — renders as a 64px thumb.
+                (_, Some(thumbnail)) => {
                     let thumbnail = thumbnail.clone();
                     let for_overlay = thumbnail.clone();
                     let name = attachment.name.clone();
-                    chip = chip.child(
+                    strip = strip.child(
                         div()
                             .id(("attach-thumb", index))
-                            .w(px(28.))
-                            .h(px(28.))
+                            .w(px(64.))
+                            .h(px(64.))
                             .flex_none()
-                            .rounded_sm()
+                            .relative()
+                            .rounded_lg()
                             .overflow_hidden()
+                            .border_1()
+                            .border_color(theme::border())
                             .cursor(gpui::CursorStyle::PointingHand)
                             // Click expands into the image overlay.
                             .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
@@ -3326,54 +3544,104 @@ impl AppView {
                                 img(gpui::ImageSource::Render(thumbnail))
                                     .size_full()
                                     .object_fit(ObjectFit::Cover),
+                            )
+                            // Name strip pinned to the thumb's bottom edge —
+                            // web `bg-background/85 text-3xs`.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .bg(rgba(0x000000d9))
+                                    .px_1()
+                                    .text_center()
+                                    .text_size(px(10.))
+                                    .text_color(theme::fg())
+                                    .truncate()
+                                    .child(attachment.name.clone()),
+                            )
+                            // Remove control — web `media-close`: black·65%
+                            // rounded chip in the top corner.
+                            .child(
+                                div()
+                                    .id(("attach-remove", index))
+                                    .absolute()
+                                    .top(px(4.))
+                                    .right(px(4.))
+                                    .w(px(18.))
+                                    .h(px(18.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .bg(theme::media_close())
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .text_xs()
+                                    .text_color(gpui::white())
+                                    .hover(|s| s.bg(rgba(0x000000cc)))
+                                    .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                        let Some(view) = app_view(window) else {
+                                            return;
+                                        };
+                                        view.update(cx, |this, cx| {
+                                            if index < this.composer_state.attachments.len() {
+                                                this.composer_state.attachments.remove(index);
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child("×"),
                             ),
                     );
                 }
                 (AttachmentKind::Image { .. }, None) => {
-                    // Decode failed — neutral block, no expand target.
-                    chip = chip.child(
+                    // Decode failed — neutral 64px block, no expand target.
+                    strip = strip.child(
                         div()
-                            .w(px(28.))
-                            .h(px(28.))
+                            .w(px(64.))
+                            .h(px(64.))
                             .flex_none()
-                            .rounded_sm()
-                            .bg(theme::selected())
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::muted())
                             .flex()
                             .items_center()
                             .justify_center()
+                            .text_xs()
                             .text_color(theme::fg_muted())
                             .child("img"),
                     );
                 }
-                _ => {}
+                _ => {
+                    // Staged file — web file row: rounded-lg muted fill,
+                    // border/80, text-sm name + a small remove affordance.
+                    strip = strip.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .h(px(28.))
+                            .pl_2()
+                            .pr_1()
+                            .rounded_lg()
+                            .bg(theme::muted())
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_sm()
+                            .text_color(theme::fg())
+                            .child(div().text_color(theme::fg_muted()).child("▤"))
+                            .child(div().truncate().child(attachment.name.clone()))
+                            .child(Self::chip_remove(("attach-remove", index), index, false)),
+                    );
+                }
             }
-            strip = strip.child(
-                chip.child(attachment.name.clone()).child(
-                    div()
-                        .id(("attach-remove", index))
-                        .px_1()
-                        .rounded_sm()
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .text_color(theme::fg_muted())
-                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                            let Some(view) = app_view(window) else {
-                                return;
-                            };
-                            view.update(cx, |this, cx| {
-                                if index < this.composer_state.attachments.len() {
-                                    this.composer_state.attachments.remove(index);
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .child("×"),
-                ),
-            );
         }
         // Staged terminal-context records — the "ctx" footer picker stages
         // them; they ship in `message.dispatch.context.records`. Chips are
-        // scoped to their owning thread (records are too, on submit).
+        // scoped to their owning thread (records are too, on submit). Web
+        // context records render as muted chips with a terminal glyph.
         let selected_thread_id = self
             .state
             .selected_thread()
@@ -3390,38 +3658,24 @@ impl AppView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_1p5()
+                    .h(px(28.))
                     .pl_2()
                     .pr_1()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(theme::selected())
+                    .rounded_lg()
+                    .bg(theme::muted())
                     .border_1()
                     .border_color(theme::border())
-                    .text_xs()
-                    .child("❯_")
-                    .child(ctx.label.clone())
+                    .text_sm()
+                    .text_color(theme::fg())
                     .child(
                         div()
-                            .id(("ctx-remove", index))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .text_color(theme::fg_muted())
-                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                                let Some(view) = app_view(window) else {
-                                    return;
-                                };
-                                view.update(cx, |this, cx| {
-                                    if index < this.composer_state.terminal_contexts.len() {
-                                        this.composer_state.terminal_contexts.remove(index);
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .child("×"),
-                    ),
+                            .text_xs()
+                            .text_color(theme::ctx_terminal())
+                            .child(">_"),
+                    )
+                    .child(div().truncate().child(ctx.label.clone()))
+                    .child(Self::chip_remove(("ctx-remove", index), index, true)),
             );
         }
         strip
@@ -3439,7 +3693,6 @@ impl AppView {
             .p_4()
             .flex()
             .flex_col()
-            .gap_2()
             .relative()
             .key_context("Composer")
             // External file drops stage as File attachments; gpui translates
@@ -3469,24 +3722,30 @@ impl AppView {
             root = root.child(self.render_picker(kind));
         }
 
-        // Usage-summary notice (tokens/cost today) when the server has data.
+        // Attached `ComposerBanner` dock — the usage notice sits flush on the
+        // card's top edge (its bottom corners tuck under the card outline).
         root = root.child(self.render_usage_banner());
 
+        // `ComposerSurface.Main`: rounded-2xl glass card, 5%-white outline,
+        // the composer drop shadow plus the inset top-edge highlight.
+        // The footer lives inside the card.
         let mut card = div()
             .flex()
             .flex_col()
-            .rounded_lg()
-            .bg(theme::raised())
+            .rounded_2xl()
+            .bg(theme::composer_surface())
             .border_1()
-            .border_color(theme::border())
-            .px_3()
-            .py_2();
+            .border_color(theme::composer_outline())
+            .shadow(vec![composer_highlight_shadow(), composer_shadow()]);
+
+        // `data-chat-composer-body`: px-4 pt-4 pb-2 around the prompt editor.
+        let mut body = div().flex().flex_col().px_4().pt_4().pb_2();
 
         if !state.attachments.is_empty() || self.staged_ctx_count() > 0 {
-            card = card.child(self.render_attachment_strip());
+            body = body.child(self.render_attachment_strip());
         }
         if let Some(field) = &state.attach_field {
-            card = card.child(
+            body = body.child(
                 div()
                     .flex()
                     .items_center()
@@ -3500,67 +3759,233 @@ impl AppView {
             );
         }
 
-        card = card.child(
+        // `composer-tiptap`: text-sm foreground, leading-relaxed (22.75px at
+        // 14px), min-h of two lines + p-1, max-h-52 scroll.
+        body = body.child(
+            div()
+                .min_h(px(54.))
+                .max_h(px(208.))
+                .text_sm()
+                .line_height(px(22.75))
+                .text_color(theme::fg())
+                .child(composer.clone()),
+        );
+
+        card = card.child(body);
+
+        // `data-chat-composer-footer`: px-2 pb-2; attach button on the left,
+        // the control chips right-aligned before the primary actions.
+        let mut card_footer = div().flex().items_center().px_2().pb_2().child(
+            div().mr_2().child(
+                ghost_icon_button("composer-attach")
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.toggle_composer_picker(PickerKind::Attach, cx);
+                        });
+                    })
+                    .child("+"),
+            ),
+        );
+
+        card_footer = card_footer.child(
             div()
                 .flex()
+                .flex_1()
+                .min_w_0()
                 .items_center()
-                .gap_2()
+                .justify_end()
+                .gap_0p5()
+                .child(footer_chip(
+                    "composer-model",
+                    format!("{}/{}", self.provider, self.model),
+                    PickerKind::Model,
+                    state.picker,
+                ))
+                .child(footer_chip(
+                    "composer-interaction",
+                    interaction_mode_label(&state.interaction_mode),
+                    PickerKind::InteractionMode,
+                    state.picker,
+                ))
+                .child(footer_chip(
+                    "composer-runtime",
+                    runtime_mode_label(&state.runtime_mode),
+                    PickerKind::RuntimeMode,
+                    state.picker,
+                ))
+                // Reasoning-effort cycle: Default → low → medium → high, sent as
+                // modelSelection.options[{id:"effort"}] when not Default.
                 .child(
-                    div()
-                        .id("composer-attach")
-                        .px_1()
-                        .rounded_md()
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .text_sm()
-                        .text_color(theme::fg_muted())
-                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    control_chip("composer-effort")
+                        .text_color(theme::control_fg())
+                        .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
                         .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                            ensure_composer_hooks(window, cx);
                             let Some(view) = app_view(window) else {
                                 return;
                             };
                             view.update(cx, |this, cx| {
-                                this.toggle_composer_picker(PickerKind::Attach, cx);
+                                let current = EFFORT_LEVELS
+                                    .iter()
+                                    .position(|level| *level == this.composer_state.effort)
+                                    .unwrap_or(0);
+                                this.composer_state.effort =
+                                    EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
+                                cx.notify();
                             });
                         })
-                        .child("+"),
+                        .child(format!("{} effort", effort_label(&state.effort))),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .text_color(theme::fg())
-                        .child(composer.clone()),
+                // ctx chip — attach running terminals' scrollback as message
+                // context (`context.records`, kind "terminal").
+                .when(
+                    self.state.selected_thread().is_some()
+                        && self.state.connection == ConnectionStatus::Connected,
+                    |s| {
+                        let ctx_count = self.staged_ctx_count();
+                        s.child(footer_chip(
+                            "composer-ctx",
+                            if ctx_count == 0 {
+                                "ctx".to_string()
+                            } else {
+                                format!("ctx ({ctx_count})")
+                            },
+                            PickerKind::Terminals,
+                            state.picker,
+                        ))
+                    },
                 )
-                .child(if running {
-                    div()
-                        .id("stop")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(0x7a2e2e))
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .text_xs()
+                // Share chip — guest link for the selected thread plus a
+                // hosted prompt link for the current draft.
+                .when(self.state.connection == ConnectionStatus::Connected, |s| {
+                    s.child(footer_chip(
+                        "composer-share",
+                        "Share",
+                        PickerKind::Share,
+                        state.picker,
+                    ))
+                }),
+        );
+
+        // Primary actions — web `ComposerFooterPrimaryActions`: gap-2 between
+        // the controls and the mic/send cluster.
+        let mut actions = div().flex().items_center().gap_2();
+
+        // Dictation toggle — `ComposerSpeechButton` is a 28px ghost icon;
+        // while recording it pulses destructive, matching the recording pill.
+        {
+            let recording = state.dictation.is_some();
+            let transcribing = state.dictation_transcribing;
+            let pulse = state.dictation_pulse % 2 == 0;
+            let label = if let Some(dictation) = &state.dictation {
+                let elapsed = dictation.started.elapsed().as_secs();
+                format!("● {}:{:02}", elapsed / 60, elapsed % 60)
+            } else if transcribing {
+                "…".to_string()
+            } else {
+                "◉".to_string()
+            };
+            actions = actions.child(if recording {
+                control_chip("composer-dictation")
+                    .text_color(danger())
+                    .bg(if pulse {
+                        rgba(0xff5a5a14)
+                    } else {
+                        rgba(0xff5a5a2e)
+                    })
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| this.toggle_dictation(window, cx));
+                    })
+                    .child(label)
+            } else {
+                ghost_icon_button("composer-dictation")
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| this.toggle_dictation(window, cx));
+                    })
+                    .child(label)
+            });
+        }
+
+        // Busy-thread follow-up pill → `dispatch_override` (Queue default),
+        // the `aria-pressed` accent control beside the primary button.
+        if running {
+            let run_label = match state.dispatch_override {
+                Some("steer_active") => "Steer",
+                Some("restart_active") => "Restart",
+                _ => "Queue",
+            };
+            actions = actions.child(
+                control_chip("composer-runopt")
+                    .bg(theme::accent_soft())
+                    .text_color(theme::fg())
+                    .hover(|s| s.bg(theme::accent()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.toggle_composer_picker(PickerKind::RunOptions, cx);
+                        });
+                    })
+                    .child(format!("{run_label} ▾")),
+            );
+        }
+
+        // `message-action` primary button: 32px circle, primary fill, white
+        // glyph; disabled state is fg·12% fill + muted glyph.
+        let sendable = !state.draft.is_empty() || !state.attachments.is_empty();
+        actions = actions.child(if running {
+            div()
+                .id("stop")
+                .w(px(32.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme::destructive_90())
+                .shadow(vec![control_highlight_shadow()])
+                .cursor(gpui::CursorStyle::PointingHand)
+                .text_sm()
+                .text_color(gpui::white())
+                .hover(|s| s.bg(theme::error()))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| this.stop_thread(cx));
+                })
+                .child("■")
+        } else {
+            div()
+                .id("send")
+                .w(px(32.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .shadow(vec![control_highlight_shadow()])
+                .cursor(gpui::CursorStyle::PointingHand)
+                .text_sm()
+                .when(sendable, |s| {
+                    s.bg(theme::primary())
                         .text_color(gpui::white())
-                        .hover(|s| s.bg(rgb(0x9a3a3a)))
-                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                            let Some(view) = app_view(window) else {
-                                return;
-                            };
-                            view.update(cx, |this, cx| this.stop_thread(cx));
-                        })
-                        .child("Stop")
-                } else {
-                    div()
-                        .id("send")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::primary())
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .text_xs()
-                        .text_color(gpui::white())
-                        .hover(|s| s.bg(gpui::rgb(0x6d8cff)))
+                        .hover(|s| s.bg(theme::primary_hover()))
                         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                             ensure_composer_hooks(window, cx);
                             let Some(view) = app_view(window) else {
@@ -3578,252 +4003,125 @@ impl AppView {
                                 view.update(cx, |this, cx| this.sync_composer_draft(window, cx));
                             });
                         })
-                        .child("Send")
-                }),
-        );
+                })
+                .when(!sendable, |s| {
+                    s.bg(theme::disabled_fill())
+                        .text_color(theme::fg_muted())
+                        .cursor(gpui::CursorStyle::Arrow)
+                })
+                .child("↑")
+        });
+
+        card_footer = card_footer.child(actions);
+        card = card.child(card_footer);
 
         root = root.child(card);
 
-        // Footer control row: model pill + mode chips + empty-thread hint.
-        let mut footer = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_1()
-            .child(footer_chip(
-                "composer-model",
-                format!("{}/{}", self.provider, self.model),
-                PickerKind::Model,
-                state.picker,
-            ))
-            .child(footer_chip(
-                "composer-interaction",
-                interaction_mode_label(&state.interaction_mode),
-                PickerKind::InteractionMode,
-                state.picker,
-            ))
-            .child(footer_chip(
-                "composer-runtime",
-                runtime_mode_label(&state.runtime_mode),
-                PickerKind::RuntimeMode,
-                state.picker,
-            ))
-            // Reasoning-effort cycle: Default → low → medium → high, sent as
-            // modelSelection.options[{id:"effort"}] when not Default.
-            .child(
-                div()
-                    .id("composer-effort")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .text_xs()
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()))
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| {
-                            let current = EFFORT_LEVELS
-                                .iter()
-                                .position(|level| *level == this.composer_state.effort)
-                                .unwrap_or(0);
-                            this.composer_state.effort =
-                                EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
-                            cx.notify();
-                        });
-                    })
-                    .child(format!("{} effort", effort_label(&state.effort))),
-            )
-            // Dictation toggle — spawn a recorder, then send the PCM to
-            // `environment.transcribePcm`. Red pulsing chip + elapsed while
-            // recording, "…" while the transcript is in flight.
-            .child({
-                let recording = state.dictation.is_some();
-                let transcribing = state.dictation_transcribing;
-                let pulse = state.dictation_pulse % 2 == 0;
-                let label = if let Some(dictation) = &state.dictation {
-                    let elapsed = dictation.started.elapsed().as_secs();
-                    format!("● {}:{:02}", elapsed / 60, elapsed % 60)
-                } else if transcribing {
-                    "Mic …".to_string()
-                } else {
-                    "Mic".to_string()
-                };
-                div()
-                    .id("composer-dictation")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if recording { danger() } else { theme::border() })
-                    .text_xs()
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .when(recording, |s| {
-                        s.text_color(danger()).bg(if pulse {
-                            rgba(0xff5a5a14)
-                        } else {
-                            rgba(0xff5a5a2e)
-                        })
-                    })
-                    .when(!recording, |s| {
-                        s.text_color(theme::fg_muted())
-                            .hover(|s| s.bg(theme::hover()))
-                    })
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        ensure_composer_hooks(window, cx);
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| this.toggle_dictation(window, cx));
-                    })
-                    .child(label)
-            });
-
-        // Branch chip — selected thread's project; opens the ref picker.
-        // Hidden until `vcs.refreshStatus` confirms the root is a git repo.
-        if self.composer_project().is_some() {
-            let is_repo = state
+        // `ComposerSurface.ContextStrip`: a bare px-2 pt-2 row under the card
+        // — the branch selector (right-aligned), the draft-stash affordance,
+        // and the muted hints; xs controls, no surface of its own.
+        let show_branch = self.composer_project().is_some()
+            && state
                 .branch_status
                 .as_ref()
                 .and_then(|v| v["isRepo"].as_bool())
                 == Some(true);
-            if is_repo {
+        let can_stash = !state.draft.is_empty() || !state.attachments.is_empty();
+        let no_thread = self.state.selected.is_none();
+        if show_branch || can_stash || stashed > 0 || running || no_thread {
+            let mut strip = div()
+                .flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .pt_2()
+                .text_xs()
+                .text_color(theme::fg_muted());
+
+            if running {
+                strip = strip.child(div().text_color(theme::fg_muted()).child(
+                    match state.dispatch_override {
+                        Some("steer_active") => "⏎ steers the running turn",
+                        Some("restart_active") => "⏎ restarts the run",
+                        _ => "⏎ queues behind the current run",
+                    },
+                ));
+            } else if no_thread {
+                strip = strip.child(
+                    div()
+                        .text_color(theme::fg_muted())
+                        .child("No thread selected — this will start a new thread"),
+                );
+            }
+
+            // Right-aligned cluster, web `@xl/composer-surface:ml-auto`.
+            strip = strip.child(div().flex_1());
+
+            // Draft stash affordance: "Stash" while there's content,
+            // `ComposerStashBadge` (bookmark + count) once entries wait.
+            if can_stash {
+                strip = strip.child(
+                    context_chip("composer-stash")
+                        .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                        .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                            ensure_composer_hooks(window, cx);
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| this.stash_draft(window, cx));
+                        })
+                        .child("Stash"),
+                );
+            }
+            if stashed > 0 {
+                strip = strip.child(
+                    context_chip("composer-stashed")
+                        .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                        .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                            ensure_composer_hooks(window, cx);
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| this.restore_stash(window, cx));
+                        })
+                        .child(format!("Stashed ({stashed})")),
+                );
+            }
+
+            // Branch chip — selected thread's project; opens the ref picker.
+            if show_branch {
                 let branch_label = state
                     .branch
                     .clone()
                     .filter(|b| !b.is_empty())
                     .unwrap_or_else(|| "(detached)".to_string());
-                footer = footer.child(footer_chip(
-                    "composer-branch",
-                    format!("⎇ {branch_label}"),
-                    PickerKind::Branch,
-                    state.picker,
-                ));
+                let open = state.picker == Some(PickerKind::Branch);
+                strip = strip.child(
+                    context_chip("composer-branch")
+                        .when(open, |s| {
+                            s.bg(theme::accent()).text_color(theme::accent_fg())
+                        })
+                        .when(!open, |s| {
+                            s.hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                        })
+                        .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                            ensure_composer_hooks(window, cx);
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| {
+                                this.toggle_composer_picker(PickerKind::Branch, cx);
+                            });
+                        })
+                        .child(format!("⎇ {branch_label} ▾")),
+                );
             }
+
+            root = root.child(strip);
         }
 
-        // ctx chip — attach running terminals' scrollback as message
-        // context (`context.records`, kind "terminal").
-        if self.state.selected_thread().is_some()
-            && self.state.connection == ConnectionStatus::Connected
-        {
-            let ctx_count = self.staged_ctx_count();
-            footer = footer.child(footer_chip(
-                "composer-ctx",
-                if ctx_count == 0 {
-                    "ctx".to_string()
-                } else {
-                    format!("ctx ({ctx_count})")
-                },
-                PickerKind::Terminals,
-                state.picker,
-            ));
-        }
-
-        // Share chip — guest link for the selected thread plus a hosted
-        // prompt link for the current draft.
-        if self.state.connection == ConnectionStatus::Connected {
-            footer = footer.child(footer_chip(
-                "composer-share",
-                "Share",
-                PickerKind::Share,
-                state.picker,
-            ));
-        }
-
-        // Busy-thread run options → `dispatch_override` (Queue default).
-        if running {
-            let run_label = match state.dispatch_override {
-                Some("steer_active") => "Steer",
-                Some("restart_active") => "Restart",
-                _ => "Queue",
-            };
-            footer = footer.child(footer_chip(
-                "composer-runopt",
-                format!("⏵ {run_label}"),
-                PickerKind::RunOptions,
-                state.picker,
-            ));
-        }
-
-        footer = footer.child(div().flex_1());
-
-        // Draft stash chips: Stash while there's content, Stashed (n) while
-        // entries wait to be restored.
-        if !state.draft.is_empty() || !state.attachments.is_empty() {
-            footer = footer.child(
-                div()
-                    .id("composer-stash")
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        ensure_composer_hooks(window, cx);
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| this.stash_draft(window, cx));
-                    })
-                    .child("Stash"),
-            );
-        }
-        if stashed > 0 {
-            footer = footer.child(
-                div()
-                    .id("composer-stashed")
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .text_xs()
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        ensure_composer_hooks(window, cx);
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| this.restore_stash(window, cx));
-                    })
-                    .child(format!("Stashed ({stashed})")),
-            );
-        }
-
-        if running {
-            footer = footer.child(div().text_xs().text_color(theme::fg_muted()).child(
-                match state.dispatch_override {
-                    Some("steer_active") => "⏎ steers the running turn",
-                    Some("restart_active") => "⏎ restarts the run",
-                    _ => "⏎ queues behind the current run",
-                },
-            ));
-        }
-        if self.state.selected.is_none() {
-            footer = footer.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No thread selected — this will start a new thread"),
-            );
-        }
-
-        root.child(footer)
+        root
     }
 }
 
