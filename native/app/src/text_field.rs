@@ -67,6 +67,20 @@ impl TextField {
         }
     }
 
+    /// Swap the ghost text — the composer mirrors the web's state-specific
+    /// placeholders, which live outside the field itself.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.content.trim().to_owned();
         if text.is_empty() {

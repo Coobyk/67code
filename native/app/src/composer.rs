@@ -23,6 +23,7 @@ use serde_json::json;
 
 use crate::AppView;
 use crate::config;
+use crate::icons::{Icon, icon};
 use crate::model::{ConnectionStatus, Message, Role};
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, Submit, TextField};
@@ -1086,10 +1087,12 @@ fn menu_row(
 }
 
 /// A suggestion row in the slash/mention drawer — web `CommandItem` in the
-/// composer menu: min-h-7, px-2 py-1.5, rounded-lg; the label column is
-/// medium xs, the description is xs secondary-label.
+/// composer menu: min-h-7, px-2 py-1.5, rounded-lg; an optional leading icon
+/// (16px secondary-label ink), the label column is medium xs, the description
+/// is xs secondary-label.
 fn drawer_row(
     id: impl Into<gpui::ElementId>,
+    leading: Option<Icon>,
     title: impl Into<SharedString>,
     detail: Option<SharedString>,
     active: bool,
@@ -1107,16 +1110,27 @@ fn drawer_row(
         .when(active, |s| {
             s.bg(theme::accent()).text_color(theme::accent_fg())
         })
-        .when(!active, |s| s.text_color(theme::fg()))
-        .child(
+        .when(!active, |s| s.text_color(theme::fg()));
+    if let Some(glyph) = leading {
+        row = row.child(
             div()
-                .w(px(160.))
                 .flex_none()
-                .truncate()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .child(title.into()),
+                .w(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph, 16.).text_color(theme::secondary_label())),
         );
+    }
+    row = row.child(
+        div()
+            .w(px(160.))
+            .flex_none()
+            .truncate()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .child(title.into()),
+    );
     if let Some(detail) = detail {
         row = row.child(
             div()
@@ -1160,14 +1174,18 @@ fn control_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
         .cursor(gpui::CursorStyle::PointingHand)
 }
 
-/// Small footer control button that opens a picker.
+/// Small footer control button that opens a picker. `leading` is an optional
+/// muted icon before the label (web chips show a provider/context glyph);
+/// the trailing caret is a 12px muted chevron like the web's picker footer
+/// permission trigger.
 fn footer_chip(
     id: impl Into<gpui::ElementId>,
+    leading: Option<Icon>,
     label: impl Into<SharedString>,
     kind: PickerKind,
     open: Option<PickerKind>,
 ) -> gpui::Stateful<gpui::Div> {
-    control_chip(id)
+    let mut chip = control_chip(id)
         .when(open == Some(kind), |s| {
             s.bg(theme::accent()).text_color(theme::accent_fg())
         })
@@ -1181,9 +1199,21 @@ fn footer_chip(
                 return;
             };
             view.update(cx, |this, cx| this.toggle_composer_picker(kind, cx));
-        })
-        .child(label.into())
-        .child(div().text_color(theme::fg_muted()).child("▾"))
+        });
+    if let Some(glyph) = leading {
+        chip = chip.child(
+            div()
+                .flex()
+                .items_center()
+                .child(icon(glyph, 14.).text_color(theme::fg_muted())),
+        );
+    }
+    chip.child(label.into()).child(
+        div()
+            .flex()
+            .items_center()
+            .child(icon(Icon::ChevronDown, 12.).text_color(theme::fg_muted())),
+    )
 }
 
 /// The xs control used under the card (context strip) — `ComposerControl
@@ -2045,10 +2075,12 @@ impl AppView {
     }
 
     /// `(insert_text, title, kind)` rows for the mention popup — matching
-    /// thread titles first, then server file hits.
-    fn mention_candidates(&self) -> Vec<(String, String, &'static str)> {
+    /// thread titles first, then server file hits. `kind` selects the row's
+    /// leading icon (web: MessagesSquare for threads, the file-type icon for
+    /// paths).
+    fn mention_candidates(&self) -> Vec<(String, String, Icon)> {
         let query = self.composer_state.mention_query.to_lowercase();
-        let mut out: Vec<(String, String, &'static str)> = Vec::new();
+        let mut out: Vec<(String, String, Icon)> = Vec::new();
         for thread in &self.state.threads {
             if out.len() >= 3 {
                 break;
@@ -2057,10 +2089,14 @@ impl AppView {
             if !query.is_empty() && !title.to_lowercase().contains(&query) {
                 continue;
             }
-            out.push((format!("@{title}"), format!("@{title}"), "thread"));
+            out.push((
+                format!("@{title}"),
+                format!("@{title}"),
+                Icon::MessageSquare,
+            ));
         }
         for path in &self.composer_state.mention_files {
-            out.push((path.clone(), path.clone(), "file"));
+            out.push((path.clone(), path.clone(), Icon::File));
         }
         out
     }
@@ -2092,8 +2128,9 @@ impl AppView {
                 panel = panel.child(
                     drawer_row(
                         ("mention", index),
+                        Some(*kind),
                         title.clone(),
-                        Some((*kind).into()),
+                        None,
                         index == selection,
                     )
                     .on_mouse_down(
@@ -2136,11 +2173,32 @@ impl AppView {
         cx.notify();
     }
 
+    /// Web placeholder ladder (ChatComposer.tsx): provider-unavailable →
+    /// project-required → the default call-to-action. The web also swaps in
+    /// approval/question prompts; native has no pending-question composer
+    /// state yet, so those variants fall through to the default.
+    fn composer_placeholder(&self) -> &'static str {
+        if self.composer_state.config_fetched_at.is_some()
+            && !self.composer_state.config_providers.is_empty()
+            && self.provider_driver(&self.provider).is_none()
+        {
+            "Enable a provider in Settings to send a message"
+        } else if self.state.selected.is_none() && self.state.projects.is_empty() {
+            "Choose a project above to start a thread"
+        } else {
+            "Ask anything. @ files, $ skills, / commands"
+        }
+    }
+
     /// Slow background refresh driven by the composer tick: branch status
     /// (~20 s), usage summary (~5 min), the server-config stream behind the
     /// usage banner, and a stray terminal-meta stream if the ctx picker
     /// closed without its own teardown.
     fn composer_periodic(&mut self, cx: &mut Context<Self>) {
+        let placeholder = self.composer_placeholder();
+        self.composer.update(cx, |field, cx| {
+            field.set_placeholder(placeholder, cx);
+        });
         if self.state.connection != ConnectionStatus::Connected {
             return;
         }
@@ -2347,13 +2405,22 @@ impl AppView {
                 div()
                     .w(px(24.))
                     .flex_none()
-                    .text_center()
-                    .text_color(if heavy {
-                        theme::warning_fg()
-                    } else {
-                        theme::fg_muted()
-                    })
-                    .child(if heavy { "⚠" } else { "◔" }),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // Banner icon column stays muted-foreground in every
+                    // variant (web `composer-banner-icon`), size-3.
+                    .child(
+                        icon(
+                            if heavy {
+                                Icon::TriangleAlert
+                            } else {
+                                Icon::Activity
+                            },
+                            12.,
+                        )
+                        .text_color(theme::fg_muted()),
+                    ),
             )
             .child(div().flex_1().child(text))
             .child(
@@ -2377,7 +2444,7 @@ impl AppView {
                             cx.notify();
                         });
                     })
-                    .child("×"),
+                    .child(icon(Icon::X, 14.).text_color(theme::fg_muted())),
             );
         banner
     }
@@ -2962,6 +3029,7 @@ impl AppView {
                 panel = panel.child(
                     drawer_row(
                         ("slash", index),
+                        None,
                         format!("/{name}"),
                         Some(command.description.into()),
                         index == selection,
@@ -3150,7 +3218,17 @@ impl AppView {
                             .text_color(theme::fg_muted())
                             .child("Name:")
                             .child(div().flex_1().text_color(theme::fg()).child(field.clone()))
-                            .child("↵ to create"),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        icon(Icon::CornerDownLeft, 11.)
+                                            .text_color(theme::fg_muted()),
+                                    )
+                                    .child("to create"),
+                            ),
                     );
                 }
                 if s.branch_refs_loading && s.branch_refs.is_empty() {
@@ -3242,7 +3320,14 @@ impl AppView {
                             };
                             view.update(cx, |this, cx| this.open_branch_field(window, cx));
                         })
-                        .child("+ New branch…"),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon(Icon::Plus, 12.).text_color(theme::fg_muted()))
+                                .child("New branch…"),
+                        ),
                 );
             }
             PickerKind::Terminals => {
@@ -3467,8 +3552,9 @@ impl AppView {
         panel
     }
 
-    /// Small "×" affordance used on staged chips — an 18px muted hit target
-    /// that brightens on hover like the web file-row remove button.
+    /// Small remove affordance used on staged chips — an 18px muted hit
+    /// target with an X glyph that brightens on hover like the web file-row
+    /// remove button.
     fn chip_remove(
         id: impl Into<gpui::ElementId>,
         index: usize,
@@ -3501,7 +3587,7 @@ impl AppView {
                     cx.notify();
                 });
             })
-            .child("×")
+            .child(icon(Icon::X, 12.).text_color(theme::fg_muted()))
     }
 
     fn render_attachment_strip(&self) -> impl IntoElement {
@@ -3557,7 +3643,7 @@ impl AppView {
                                     .bg(rgba(0x000000d9))
                                     .px_1()
                                     .text_center()
-                                    .text_size(px(10.))
+                                    .text_size(gpui::px(10.))
                                     .text_color(theme::fg())
                                     .truncate()
                                     .child(attachment.name.clone()),
@@ -3592,7 +3678,7 @@ impl AppView {
                                             cx.notify();
                                         });
                                     })
-                                    .child("×"),
+                                    .child(icon(Icon::X, 12.).text_color(gpui::white())),
                             ),
                     );
                 }
@@ -3610,9 +3696,8 @@ impl AppView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_xs()
                             .text_color(theme::fg_muted())
-                            .child("img"),
+                            .child(icon(Icon::Image, 20.).text_color(theme::fg_muted())),
                     );
                 }
                 _ => {
@@ -3632,7 +3717,12 @@ impl AppView {
                             .border_color(theme::border())
                             .text_sm()
                             .text_color(theme::fg())
-                            .child(div().text_color(theme::fg_muted()).child("▤"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child(icon(Icon::File, 14.).text_color(theme::fg_muted())),
+                            )
                             .child(div().truncate().child(attachment.name.clone()))
                             .child(Self::chip_remove(("attach-remove", index), index, false)),
                     );
@@ -3671,9 +3761,9 @@ impl AppView {
                     .text_color(theme::fg())
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme::ctx_terminal())
-                            .child(">_"),
+                            .flex()
+                            .items_center()
+                            .child(icon(Icon::Terminal, 14.).text_color(theme::ctx_terminal())),
                     )
                     .child(div().truncate().child(ctx.label.clone()))
                     .child(Self::chip_remove(("ctx-remove", index), index, true)),
@@ -3756,7 +3846,14 @@ impl AppView {
                     .text_color(theme::fg_muted())
                     .child("Path:")
                     .child(div().flex_1().text_color(theme::fg()).child(field.clone()))
-                    .child("↵ to attach · esc to cancel"),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(icon(Icon::CornerDownLeft, 11.).text_color(theme::fg_muted()))
+                            .child("to attach · esc to cancel"),
+                    ),
             );
         }
 
@@ -3789,7 +3886,7 @@ impl AppView {
                             this.toggle_composer_picker(PickerKind::Attach, cx);
                         });
                     })
-                    .child("+"),
+                    .child(icon(Icon::Plus, 16.).text_color(theme::fg_muted())),
             ),
         );
 
@@ -3803,18 +3900,21 @@ impl AppView {
                 .gap_0p5()
                 .child(footer_chip(
                     "composer-model",
+                    None,
                     format!("{}/{}", self.provider, self.model),
                     PickerKind::Model,
                     state.picker,
                 ))
                 .child(footer_chip(
                     "composer-interaction",
+                    None,
                     interaction_mode_label(&state.interaction_mode),
                     PickerKind::InteractionMode,
                     state.picker,
                 ))
                 .child(footer_chip(
                     "composer-runtime",
+                    None,
                     runtime_mode_label(&state.runtime_mode),
                     PickerKind::RuntimeMode,
                     state.picker,
@@ -3850,6 +3950,7 @@ impl AppView {
                         let ctx_count = self.staged_ctx_count();
                         s.child(footer_chip(
                             "composer-ctx",
+                            Some(Icon::Terminal),
                             if ctx_count == 0 {
                                 "ctx".to_string()
                             } else {
@@ -3865,6 +3966,7 @@ impl AppView {
                 .when(self.state.connection == ConnectionStatus::Connected, |s| {
                     s.child(footer_chip(
                         "composer-share",
+                        Some(Icon::Globe),
                         "Share",
                         PickerKind::Share,
                         state.picker,
@@ -3882,15 +3984,12 @@ impl AppView {
             let recording = state.dictation.is_some();
             let transcribing = state.dictation_transcribing;
             let pulse = state.dictation_pulse % 2 == 0;
-            let label = if let Some(dictation) = &state.dictation {
-                let elapsed = dictation.started.elapsed().as_secs();
-                format!("● {}:{:02}", elapsed / 60, elapsed % 60)
-            } else if transcribing {
-                "…".to_string()
-            } else {
-                "◉".to_string()
-            };
             actions = actions.child(if recording {
+                let elapsed = state
+                    .dictation
+                    .as_ref()
+                    .map(|d| d.started.elapsed().as_secs())
+                    .unwrap_or(0);
                 control_chip("composer-dictation")
                     .text_color(danger())
                     .bg(if pulse {
@@ -3905,7 +4004,8 @@ impl AppView {
                         };
                         view.update(cx, |this, cx| this.toggle_dictation(window, cx));
                     })
-                    .child(label)
+                    .child(icon(Icon::CircleDot, 12.).text_color(danger()))
+                    .child(format!("{}:{:02}", elapsed / 60, elapsed % 60))
             } else {
                 ghost_icon_button("composer-dictation")
                     .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
@@ -3916,7 +4016,17 @@ impl AppView {
                         };
                         view.update(cx, |this, cx| this.toggle_dictation(window, cx));
                     })
-                    .child(label)
+                    .child(
+                        icon(
+                            if transcribing {
+                                Icon::LoaderCircle
+                            } else {
+                                Icon::Mic
+                            },
+                            16.,
+                        )
+                        .text_color(theme::fg_muted()),
+                    )
             });
         }
 
@@ -3942,7 +4052,13 @@ impl AppView {
                             this.toggle_composer_picker(PickerKind::RunOptions, cx);
                         });
                     })
-                    .child(format!("{run_label} ▾")),
+                    .child(run_label)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(icon(Icon::ChevronDown, 12.).text_color(theme::fg_muted())),
+                    ),
             );
         }
 
@@ -3970,7 +4086,7 @@ impl AppView {
                     };
                     view.update(cx, |this, cx| this.stop_thread(cx));
                 })
-                .child("■")
+                .child(icon(Icon::Square, 12.).text_color(gpui::white()))
         } else {
             div()
                 .id("send")
@@ -4010,7 +4126,11 @@ impl AppView {
                         .text_color(theme::fg_muted())
                         .cursor(gpui::CursorStyle::Arrow)
                 })
-                .child("↑")
+                .child(icon(Icon::ArrowUp, 14.).text_color(if sendable {
+                    gpui::white()
+                } else {
+                    theme::fg_muted().into()
+                }))
         });
 
         card_footer = card_footer.child(actions);
@@ -4041,13 +4161,19 @@ impl AppView {
                 .text_color(theme::fg_muted());
 
             if running {
-                strip = strip.child(div().text_color(theme::fg_muted()).child(
-                    match state.dispatch_override {
-                        Some("steer_active") => "⏎ steers the running turn",
-                        Some("restart_active") => "⏎ restarts the run",
-                        _ => "⏎ queues behind the current run",
-                    },
-                ));
+                strip = strip.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(theme::fg_muted())
+                        .child(icon(Icon::CornerDownLeft, 11.).text_color(theme::fg_muted()))
+                        .child(match state.dispatch_override {
+                            Some("steer_active") => "steers the running turn",
+                            Some("restart_active") => "restarts the run",
+                            _ => "queues behind the current run",
+                        }),
+                );
             } else if no_thread {
                 strip = strip.child(
                     div()
@@ -4115,7 +4241,15 @@ impl AppView {
                                 this.toggle_composer_picker(PickerKind::Branch, cx);
                             });
                         })
-                        .child(format!("⎇ {branch_label} ▾")),
+                        // Web branch chip: `GitBranchIcon` size-3 muted + the
+                        // branch name, no caret.
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(icon(Icon::GitBranch, 12.).text_color(theme::fg_muted())),
+                        )
+                        .child(branch_label),
                 );
             }
 
