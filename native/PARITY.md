@@ -149,6 +149,15 @@ palette + search dialogs, toasts, welcome, window chrome
 (WindowDecorations::Client + min/max/close overlay + drag topbar,
 400×360 min, 1100×780 default).
 
+Refinement pass 2: all icon surfaces now render bundled lucide SVGs
+(lucide-static v1.77.0, ISC — assets inlined in `icons.rs` via GPUI's
+`svg().data()` element; each call site sets `text_color` because GPUI
+does not cascade parent text color into `Svg::paint`). Timestamps
+render in local time via `chrono::Local` with the web's day-aware
+format. Toasts sit at the web-computed offset (top 84px, right 32px).
+Right panel confirmed at 380px — the web panel is resizable 360–540px
+and 380 fits the five tab labels + diff gutters.
+
 Deliberate divergences:
 
 - Right panel width kept at 380px vs web's 280px — the native panel
@@ -159,9 +168,11 @@ Deliberate divergences:
   decorations, so under Xvfb the window keeps the system frame. The
   in-app topbar drag area and min/max/close controls render only in
   client mode.
-- Timestamps in timeline meta rows render UTC (no timezone database
-  in the native binary).
-- Iconography uses DejaVu-covered glyphs (✎ ⚠ ▸ ✓ …) as stand-ins
-  for lucide SVG icons.
-- Toast viewport sits above the composer (`bottom 140px`) rather than
-  flush bottom-right to avoid covering the send button.
+- Icon hover-brighten (`hover:[&>svg]:text-sidebar-foreground`) is a
+  no-op: GPUI `Svg` has no hover state styling; icons hold resting ink
+  while the button background still highlights.
+- GPUI has no native tooltip or context-menu-popup primitive; composer
+  chips/buttons carry a custom tooltip layer (`show_tooltip`), and all
+  menus are custom popovers.
+- Sidebar "Searching thread messages…" pending state is unreachable —
+  native search is synchronous local filtering.
