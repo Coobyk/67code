@@ -279,6 +279,10 @@ pub enum PickerKind {
     Terminals,
     /// Guest-share link + hosted prompt link.
     Share,
+    /// The `…` overflow menu — web `CompactComposerControlsMenu`: footer
+    /// controls with no resting slot (interaction mode, permissions, effort,
+    /// terminal context, share).
+    Overflow,
 }
 
 /// A staged terminal context — serialized as a `TerminalContextRecord` inside
@@ -1174,48 +1178,6 @@ fn control_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
         .cursor(gpui::CursorStyle::PointingHand)
 }
 
-/// Small footer control button that opens a picker. `leading` is an optional
-/// muted icon before the label (web chips show a provider/context glyph);
-/// the trailing caret is a 12px muted chevron like the web's picker footer
-/// permission trigger.
-fn footer_chip(
-    id: impl Into<gpui::ElementId>,
-    leading: Option<Icon>,
-    label: impl Into<SharedString>,
-    kind: PickerKind,
-    open: Option<PickerKind>,
-) -> gpui::Stateful<gpui::Div> {
-    let mut chip = control_chip(id)
-        .when(open == Some(kind), |s| {
-            s.bg(theme::accent()).text_color(theme::accent_fg())
-        })
-        .when(open != Some(kind), |s| {
-            s.text_color(theme::control_fg())
-                .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
-        })
-        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-            ensure_composer_hooks(window, cx);
-            let Some(view) = app_view(window) else {
-                return;
-            };
-            view.update(cx, |this, cx| this.toggle_composer_picker(kind, cx));
-        });
-    if let Some(glyph) = leading {
-        chip = chip.child(
-            div()
-                .flex()
-                .items_center()
-                .child(icon(glyph, 14.).text_color(theme::fg_muted())),
-        );
-    }
-    chip.child(label.into()).child(
-        div()
-            .flex()
-            .items_center()
-            .child(icon(Icon::ChevronDown, 12.).text_color(theme::fg_muted())),
-    )
-}
-
 /// The xs control used under the card (context strip) — `ComposerControl
 /// size="xs"`: h-6, px-1.75, gap-1, text-xs, muted ink.
 fn context_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
@@ -1713,6 +1675,93 @@ impl AppView {
             .map(str::to_string)
     }
 
+    /// `showProviderUnavailable` (`ComposerControlsBar`): the config stream
+    /// delivered providers and the selected instance has no driver → the
+    /// footer swaps the model chip for a settings shortcut and the editor and
+    /// send button read disabled.
+    fn provider_unavailable(&self) -> bool {
+        self.composer_state.config_fetched_at.is_some()
+            && !self.composer_state.config_providers.is_empty()
+            && self.provider_driver(&self.provider).is_none()
+    }
+
+    /// The 16px provider glyph on the model chip — web `ProviderInstanceIcon`:
+    /// bundled brand marks where the registry has one, otherwise `None` and
+    /// the chip falls back to the instance's initials.
+    fn provider_icon(&self) -> Option<Icon> {
+        let driver = self
+            .provider_driver(&self.provider)
+            .unwrap_or_else(|| self.provider.clone());
+        match driver.as_str() {
+            "codex" | "openai" | "openaiCompatible" => Some(Icon::ProviderOpenAi),
+            "claudeAgent" | "anthropic" => Some(Icon::ProviderClaude),
+            _ => None,
+        }
+    }
+
+    /// `providerInstanceInitials` — the instance's one- or two-letter mark
+    /// when no bundled brand icon exists ("Replay (dev)" → "RD").
+    fn provider_initials(&self) -> String {
+        let name = self
+            .composer_state
+            .config_providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == Some(self.provider.as_str()))
+            .and_then(|p| p["name"].as_str().or_else(|| p["displayName"].as_str()))
+            .unwrap_or(self.provider.as_str());
+        let mut words = name
+            .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+            .filter(|w| {
+                !w.trim_matches(|c: char| c == '\'' || c == '\u{2019}')
+                    .is_empty()
+            });
+        match (words.next(), words.next()) {
+            (Some(only), None) => only.chars().take(2).collect::<String>().to_uppercase(),
+            (first, second) => [first, second]
+                .into_iter()
+                .flatten()
+                .filter_map(|word| word.chars().next())
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        }
+    }
+
+    /// The model chip's label — web `getTriggerDisplayModelName`: the server
+    /// model row's `shortName`/`name`, the static catalog's display half, then
+    /// the raw model id.
+    fn model_display_name(&self) -> String {
+        if let Some(row) = self
+            .composer_state
+            .config_providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == Some(self.provider.as_str()))
+            .and_then(|p| p["models"].as_array())
+            .and_then(|models| {
+                models.iter().find(|m| {
+                    m["slug"].as_str() == Some(self.model.as_str())
+                        || m["id"].as_str() == Some(self.model.as_str())
+                })
+            })
+        {
+            if let Some(name) = row["shortName"].as_str().or_else(|| row["name"].as_str()) {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+        MODEL_CATALOG
+            .iter()
+            .find(|(instance, model, _)| *instance == self.provider && *model == self.model)
+            .and_then(|(_, _, label)| {
+                label
+                    .split('\u{00b7}')
+                    .nth(1)
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| self.model.clone())
+    }
+
     // ------------------------------------------------------------------
     // Share menu (guest link + hosted prompt link)
     // ------------------------------------------------------------------
@@ -2178,10 +2227,7 @@ impl AppView {
     /// approval/question prompts; native has no pending-question composer
     /// state yet, so those variants fall through to the default.
     fn composer_placeholder(&self) -> &'static str {
-        if self.composer_state.config_fetched_at.is_some()
-            && !self.composer_state.config_providers.is_empty()
-            && self.provider_driver(&self.provider).is_none()
-        {
+        if self.provider_unavailable() {
             "Enable a provider in Settings to send a message"
         } else if self.state.selected.is_none() && self.state.projects.is_empty() {
             "Choose a project above to start a thread"
@@ -3548,6 +3594,114 @@ impl AppView {
                     ),
                 );
             }
+            PickerKind::Overflow => {
+                // Web `CompactComposerControlsMenu`: the controls that don't
+                // fit the resting footer live behind the ellipsis — here the
+                // interaction mode, permissions, effort cycle, terminal
+                // context, and share rows.
+                let s = &self.composer_state;
+                panel = panel.child(
+                    menu_row(
+                        "ov-mode",
+                        "Interaction mode",
+                        Some(interaction_mode_label(&s.interaction_mode).into()),
+                        false,
+                    )
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.toggle_composer_picker(PickerKind::InteractionMode, cx)
+                        });
+                    }),
+                );
+                panel = panel.child(
+                    menu_row(
+                        "ov-permissions",
+                        "Permissions",
+                        Some(runtime_mode_label(&s.runtime_mode).into()),
+                        false,
+                    )
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
+                        });
+                    }),
+                );
+                // Same Default → low → medium → high cycle as the model
+                // picker's effort column; the row's detail shows the pick.
+                panel = panel.child(
+                    menu_row(
+                        "ov-effort",
+                        "Effort",
+                        Some(effort_label(&s.effort).into()),
+                        false,
+                    )
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            let current = EFFORT_LEVELS
+                                .iter()
+                                .position(|level| *level == this.composer_state.effort)
+                                .unwrap_or(0);
+                            this.composer_state.effort =
+                                EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
+                            this.composer_state.picker = None;
+                            cx.notify();
+                        });
+                    }),
+                );
+                if self.state.selected_thread().is_some()
+                    && self.state.connection == ConnectionStatus::Connected
+                {
+                    panel = panel.child(
+                        menu_row(
+                            "ov-ctx",
+                            "Attach terminal context",
+                            Some("Running terminals on this thread".into()),
+                            false,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_event, window, cx| {
+                                let Some(view) = app_view(window) else {
+                                    return;
+                                };
+                                view.update(cx, |this, cx| {
+                                    this.toggle_composer_picker(PickerKind::Terminals, cx)
+                                });
+                            },
+                        ),
+                    );
+                }
+                if self.state.connection == ConnectionStatus::Connected {
+                    panel = panel.child(
+                        menu_row(
+                            "ov-share",
+                            "Share…",
+                            Some("Guest link or hosted prompt link".into()),
+                            false,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_event, window, cx| {
+                                let Some(view) = app_view(window) else {
+                                    return;
+                                };
+                                view.update(cx, |this, cx| {
+                                    this.toggle_composer_picker(PickerKind::Share, cx)
+                                });
+                            },
+                        ),
+                    );
+                }
+            }
         }
         panel
     }
@@ -3780,16 +3934,20 @@ impl AppView {
         let project_key = self.composer_project_key();
         let stashed = self.client_config.stash_count(&project_key);
 
-        let mut root = div()
-            .p_4()
+        // `.chat-composer-lane` — 3rem side gutters on desktop, the composer
+        // overlay's `pt-1.5 sm:pt-2`, and the fixed 20px safe-area spacer
+        // (`h-[calc(env(safe-area-inset-bottom)+1.25rem)]`) under the card.
+        let root = div()
+            .w_full()
+            .px(px(48.))
+            .pt_2()
+            .pb(px(20.))
             .flex()
             .flex_col()
-            .relative()
             .key_context("Composer")
             // External file drops stage as File attachments; gpui translates
             // the platform drop into a MouseUp carrying `ExternalPaths`.
             .can_drop(|value, _window, _cx| value.is::<ExternalPaths>())
-            .drag_over::<ExternalPaths>(|style, _paths, _window, _cx| style.bg(theme::hover()))
             .on_drop::<ExternalPaths>(|paths, window, cx| {
                 let Some(view) = app_view(window) else {
                     return;
@@ -3803,23 +3961,35 @@ impl AppView {
                 ensure_composer_hooks(window, cx);
             });
 
+        // `.chat-content-lane` — the card and its menus center on
+        // `--chat-content-max-width` (46rem). Absolute menus anchor here so
+        // they track the card, not the padded gutter.
+        let mut lane = div()
+            .mx_auto()
+            .w_full()
+            .max_w(px(theme::CHAT_MAX_W))
+            .flex()
+            .flex_col()
+            .relative();
+
         // Floating menus above the composer.
         if state.mention_open {
-            root = root.child(self.render_mention_menu());
+            lane = lane.child(self.render_mention_menu());
         } else if state.slash_open {
-            root = root.child(self.render_slash_menu());
+            lane = lane.child(self.render_slash_menu());
         }
         if let Some(kind) = state.picker {
-            root = root.child(self.render_picker(kind));
+            lane = lane.child(self.render_picker(kind));
         }
 
         // Attached `ComposerBanner` dock — the usage notice sits flush on the
         // card's top edge (its bottom corners tuck under the card outline).
-        root = root.child(self.render_usage_banner());
+        lane = lane.child(self.render_usage_banner());
 
         // `ComposerSurface.Main`: rounded-2xl glass card, 5%-white outline,
         // the composer drop shadow plus the inset top-edge highlight.
-        // The footer lives inside the card.
+        // The footer lives inside the card. File drops tint the surface,
+        // matching the web drop target's `bg-accent/45` ring.
         let mut card = div()
             .flex()
             .flex_col()
@@ -3827,10 +3997,30 @@ impl AppView {
             .bg(theme::composer_surface())
             .border_1()
             .border_color(theme::composer_outline())
-            .shadow(vec![composer_highlight_shadow(), composer_shadow()]);
+            .shadow(vec![composer_highlight_shadow(), composer_shadow()])
+            .drag_over::<ExternalPaths>(|style, _paths, _window, _cx| style.bg(theme::accent()));
 
         // `data-chat-composer-body`: px-4 pt-4 pb-2 around the prompt editor.
         let mut body = div().flex().flex_col().px_4().pt_4().pb_2();
+
+        // The periodic tick only refreshes the placeholder after the first
+        // composer interaction, so the field's constructor string would
+        // linger. A zero-size canvas writes the current ladder rung in during
+        // every prepaint instead.
+        {
+            let placeholder = self.composer_placeholder();
+            let field = composer.clone();
+            body = body.child(
+                gpui::canvas(
+                    move |_bounds, _window, cx| {
+                        field.update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .w_0()
+                .h_0(),
+            );
+        }
 
         if !state.attachments.is_empty() || self.staged_ctx_count() > 0 {
             body = body.child(self.render_attachment_strip());
@@ -3871,10 +4061,7 @@ impl AppView {
                 .on_mouse_down(MouseButton::Left, {
                     let composer = composer.clone();
                     move |_event, window, cx| {
-                        composer
-                            .read(cx)
-                            .focus_handle(cx)
-                            .focus(window, cx);
+                        composer.read(cx).focus_handle(cx).focus(window, cx);
                     }
                 })
                 .child(composer.clone()),
@@ -3884,6 +4071,7 @@ impl AppView {
 
         // `data-chat-composer-footer`: px-2 pb-2; attach button on the left,
         // the control chips right-aligned before the primary actions.
+        let provider_unavailable = self.provider_unavailable();
         let mut card_footer = div().flex().items_center().px_2().pb_2().child(
             div().mr_2().child(
                 ghost_icon_button("composer-attach")
@@ -3897,93 +4085,161 @@ impl AppView {
                             this.toggle_composer_picker(PickerKind::Attach, cx);
                         });
                     })
-                    .child(icon(Icon::Plus, 16.).text_color(theme::fg_muted())),
+                    .child(icon(Icon::Paperclip, 16.).text_color(theme::fg_muted())),
             ),
         );
 
-        card_footer = card_footer.child(
-            div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .justify_end()
-                .gap_0p5()
-                .child(footer_chip(
-                    "composer-model",
-                    None,
-                    format!("{}/{}", self.provider, self.model),
-                    PickerKind::Model,
-                    state.picker,
-                ))
-                .child(footer_chip(
-                    "composer-interaction",
-                    None,
-                    interaction_mode_label(&state.interaction_mode),
-                    PickerKind::InteractionMode,
-                    state.picker,
-                ))
-                .child(footer_chip(
-                    "composer-runtime",
-                    None,
-                    runtime_mode_label(&state.runtime_mode),
-                    PickerKind::RuntimeMode,
-                    state.picker,
-                ))
-                // Reasoning-effort cycle: Default → low → medium → high, sent as
-                // modelSelection.options[{id:"effort"}] when not Default.
-                .child(
-                    control_chip("composer-effort")
-                        .text_color(theme::control_fg())
+        // `data-chat-composer-actions=right` — `flex-1 justify-end gap-2`:
+        // the footer controls (`gap-0.5`) then the mic/send cluster.
+        let mut right = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .justify_end()
+            .gap_2();
+
+        // `data-chat-composer-controls=footer` — `flex-1 justify-end gap-0.5`.
+        let mut controls = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .justify_end()
+            .gap_0p5();
+
+        if provider_unavailable {
+            // `showProviderUnavailable` — a ComposerControl with the alert
+            // glyph; when a setup target exists it reads "Open provider
+            // settings" and jumps to Settings → Providers.
+            controls = controls.child(
+                control_chip("composer-provider-settings")
+                    .text_color(theme::control_fg())
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.settings_state.open = true;
+                            this.settings_state.section = crate::settings::Section::Providers;
+                            cx.notify();
+                        });
+                    })
+                    .child(icon(Icon::CircleAlert, 16.).text_color(theme::fg_muted()))
+                    .child("Open provider settings"),
+            );
+        } else {
+            // `ComposerModelPicker` trigger — ComposerControl chrome (h-7,
+            // px-2, gap-1.5): a 16px provider glyph (brand mark or instance
+            // initials), the model's display name, and the muted effort
+            // suffix when it isn't the provider default. No caret.
+            let model_open = state.picker == Some(PickerKind::Model);
+            let mut model_chip = control_chip("composer-model")
+                .when(model_open, |s| {
+                    s.bg(theme::accent()).text_color(theme::accent_fg())
+                })
+                .when(!model_open, |s| {
+                    s.text_color(theme::control_fg())
                         .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                })
+                .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    ensure_composer_hooks(window, cx);
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.toggle_composer_picker(PickerKind::Model, cx)
+                    });
+                });
+            if let Some(glyph) = self.provider_icon() {
+                let color = match glyph {
+                    // Claude's mark keeps its brand orange (web `fill-[#d97757]`);
+                    // the OpenAI knot is white/black like web's text token.
+                    Icon::ProviderClaude => rgb(0xd97757),
+                    _ => theme::fg(),
+                };
+                model_chip = model_chip.child(icon(glyph, 16.).text_color(color));
+            } else {
+                let initials = self.provider_initials();
+                if !initials.is_empty() {
+                    model_chip = model_chip.child(
+                        div()
+                            .text_size(theme::text_size::XS_3)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::fg_muted())
+                            .child(initials),
+                    );
+                }
+            }
+            model_chip = model_chip.child(self.model_display_name());
+            if !state.effort.is_empty() {
+                model_chip = model_chip.child(
+                    div()
+                        .text_color(theme::fg_muted())
+                        .child(effort_label(&state.effort)),
+                );
+            }
+            controls = controls.child(model_chip);
+
+            // `ComposerFooterModeControls` — the permissions chip only rests
+            // when the mode differs from the default (native has no
+            // `defaultRuntimeMode` setting yet; "full-access" seeds it).
+            if state.runtime_mode != "full-access" {
+                let mode_glyph = match state.runtime_mode.as_str() {
+                    "approval-required" => Icon::Lock,
+                    "auto-accept-edits" => Icon::PenLine,
+                    "auto" => Icon::ShieldCheck,
+                    _ => Icon::ShieldOff,
+                };
+                let permissions_open = state.picker == Some(PickerKind::RuntimeMode);
+                controls = controls.child(
+                    control_chip("composer-permissions")
+                        .when(permissions_open, |s| {
+                            s.bg(theme::accent()).text_color(theme::accent_fg())
+                        })
+                        .when(!permissions_open, |s| {
+                            s.text_color(theme::control_fg())
+                                .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                        })
                         .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                            ensure_composer_hooks(window, cx);
                             let Some(view) = app_view(window) else {
                                 return;
                             };
                             view.update(cx, |this, cx| {
-                                let current = EFFORT_LEVELS
-                                    .iter()
-                                    .position(|level| *level == this.composer_state.effort)
-                                    .unwrap_or(0);
-                                this.composer_state.effort =
-                                    EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
-                                cx.notify();
+                                this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
                             });
                         })
-                        .child(format!("{} effort", effort_label(&state.effort))),
-                )
-                // ctx chip — attach running terminals' scrollback as message
-                // context (`context.records`, kind "terminal").
-                .when(
-                    self.state.selected_thread().is_some()
-                        && self.state.connection == ConnectionStatus::Connected,
-                    |s| {
-                        let ctx_count = self.staged_ctx_count();
-                        s.child(footer_chip(
-                            "composer-ctx",
-                            Some(Icon::Terminal),
-                            if ctx_count == 0 {
-                                "ctx".to_string()
-                            } else {
-                                format!("ctx ({ctx_count})")
-                            },
-                            PickerKind::Terminals,
-                            state.picker,
-                        ))
-                    },
-                )
-                // Share chip — guest link for the selected thread plus a
-                // hosted prompt link for the current draft.
-                .when(self.state.connection == ConnectionStatus::Connected, |s| {
-                    s.child(footer_chip(
-                        "composer-share",
-                        Some(Icon::Globe),
-                        "Share",
-                        PickerKind::Share,
-                        state.picker,
-                    ))
-                }),
-        );
+                        .child(icon(mode_glyph, 16.).text_color(theme::fg_muted()))
+                        .child(runtime_mode_label(&state.runtime_mode)),
+                );
+            }
+
+            // `CompactComposerControlsMenu` — the icon-only ellipsis control
+            // behind which the controls with no resting slot live.
+            let overflow_open = state.picker == Some(PickerKind::Overflow);
+            controls = controls.child(
+                ghost_icon_button("composer-overflow")
+                    .when(overflow_open, |s| {
+                        s.bg(theme::accent()).text_color(theme::accent_fg())
+                    })
+                    .when(!overflow_open, |s| {
+                        s.hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    })
+                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                        ensure_composer_hooks(window, cx);
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            this.toggle_composer_picker(PickerKind::Overflow, cx)
+                        });
+                    })
+                    .child(icon(Icon::Ellipsis, 16.).text_color(theme::fg_muted())),
+            );
+        }
+        right = right.child(controls);
 
         // Primary actions — web `ComposerFooterPrimaryActions`: gap-2 between
         // the controls and the mic/send cluster.
@@ -4074,8 +4330,10 @@ impl AppView {
         }
 
         // `message-action` primary button: 32px circle, primary fill, white
-        // glyph; disabled state is fg·12% fill + muted glyph.
-        let sendable = !state.draft.is_empty() || !state.attachments.is_empty();
+        // glyph; disabled state keeps the blue circle dimmed (the reference's
+        // `disabled:opacity-64` stage-backdrop button), not the fg·12% fill.
+        let sendable =
+            (!state.draft.is_empty() || !state.attachments.is_empty()) && !provider_unavailable;
         actions = actions.child(if running {
             div()
                 .id("stop")
@@ -4133,21 +4391,22 @@ impl AppView {
                         })
                 })
                 .when(!sendable, |s| {
-                    s.bg(theme::disabled_fill())
-                        .text_color(theme::fg_muted())
+                    s.bg(theme::primary_dim())
+                        .text_color(theme::primary_fg_dim())
                         .cursor(gpui::CursorStyle::Arrow)
                 })
                 .child(icon(Icon::ArrowUp, 14.).text_color(if sendable {
                     gpui::white()
                 } else {
-                    theme::fg_muted().into()
+                    theme::primary_fg_dim().into()
                 }))
         });
 
-        card_footer = card_footer.child(actions);
+        right = right.child(actions);
+        card_footer = card_footer.child(right);
         card = card.child(card_footer);
 
-        root = root.child(card);
+        lane = lane.child(card);
 
         // `ComposerSurface.ContextStrip`: a bare px-2 pt-2 row under the card
         // — the branch selector (right-aligned), the draft-stash affordance,
@@ -4264,10 +4523,10 @@ impl AppView {
                 );
             }
 
-            root = root.child(strip);
+            lane = lane.child(strip);
         }
 
-        root
+        root.child(lane)
     }
 }
 
