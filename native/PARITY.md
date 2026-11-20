@@ -41,7 +41,7 @@ requires a new `native/server` handler matching the TS wire shape.
 | Citations on assistant messages                   | ✅     | `t3-citation://` links parsed into AssistantCitation chips → jump to cited thread (no provider emits citation items — union checked)              |
 | Message feedback / copy                           | ✅     | copy chips + 👍/👎 on assistant rows → `provider.uploadFeedback` (comment on thumbs-down)                                                         |
 | Expanded image viewer dialog                      | ✅     | click thumbnail → full overlay                                                                                                                    |
-| Canvas/right-panel layout                         | ✅     | right panel Files/Terminals/PRs/Diff tabs at fixed 380px                                                                                          |
+| Canvas/right-panel layout                         | ✅     | right panel Files/Terminals/PRs/Diff tabs at 280px matching web                                                                                   |
 
 ## Sidebar
 
@@ -155,14 +155,29 @@ Refinement pass 2: all icon surfaces now render bundled lucide SVGs
 does not cascade parent text color into `Svg::paint`). Timestamps
 render in local time via `chrono::Local` with the web's day-aware
 format. Toasts sit at the web-computed offset (top 84px, right 32px).
-Right panel confirmed at 380px — the web panel is resizable 360–540px
-and 380 fits the five tab labels + diff gutters.
+
+Pixel-diff pass 3 (live web reference at 1280×800): sidebar brand
+aurora, project monogram/favicon chips with relative timestamps,
+thread status glyphs + day labels + branch lines + hover Settle pill,
+collapsible Settled shelf, topbar breadcrumb + panel icon cluster,
+single-card composer (paperclip, provider model chip, overflow, mic,
+32px send circle, provider-unavailable state), timeline turn-fold
+rows, checkpoint changed-files card, Pierre-dark code blocks with
+wrap/copy, centered empty state, right panel resized to the web's
+280px with tab scroll controls, palette row fixes, explorer search.
 
 Deliberate divergences:
 
-- Right panel width kept at 380px vs web's 280px — the native panel
-  hosts the diff viewer and PR cards in a single column where 280px
-  cramps the dual line-number gutters.
+- The brand aurora approximates the web's backdrop with layered
+  linear gradients — GPUI has no radial gradients or blur.
+- "Load earlier turns" is not rendered: the Rust server always
+  reports `hasMoreHistory: false` and the client never paginates.
+- Turn diffs show an inline error — the Rust server does not
+  implement `orchestration.getTurnDiff`.
+- Palette two-line rows render ~44px vs the web's ~56px (GPUI text
+  metrics); readable and consistent.
+- The web splits scratch "No project" threads into per-family
+  header groups; native keeps one group per project.
 - Client decorations are enabled only where the compositor supports
   them (Wayland/GNOME etc.); bare X11 falls back to server
   decorations, so under Xvfb the window keeps the system frame. The
