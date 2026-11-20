@@ -14,7 +14,7 @@
 
 use gpui::{
     Context, Div, Entity, EntityInputHandler, Focusable, MouseButton, SharedString, Subscription,
-    Window, div, prelude::*, px, rgb, rgba,
+    Window, div, prelude::*, px,
 };
 
 use crate::AppView;
@@ -593,7 +593,7 @@ impl AppView {
                 div()
                     .pt_1()
                     .text_xs()
-                    .text_color(rgb(0xf87171))
+                    .text_color(theme::error_fg())
                     .child(error),
             );
         }
@@ -614,7 +614,7 @@ impl AppView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x000000b3))
+            .bg(theme::overlay_backdrop())
             .on_mouse_down(
                 MouseButton::Left,
                 // Only an explicit open can be dismissed on the backdrop;
