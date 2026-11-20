@@ -6,6 +6,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+chrono = "0.4.45"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
   "font-kit",

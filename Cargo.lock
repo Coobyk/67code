@@ -735,6 +735,7 @@ dependencies = [
 name = "c67-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui",
  "gpui_platform",
  "image",
