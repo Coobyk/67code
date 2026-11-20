@@ -8,7 +8,7 @@
 //!
 //! ## Config discovery
 //!
-//! T3 does not define its own MCP config (`packages/contracts/src/settings.ts`
+//! Upstream does not define its own MCP config (`packages/contracts/src/settings.ts`
 //! has no `mcpServers` key); providers register servers in their own files.
 //! `discover_server_configs` merges every place a `t3McpApp.server` name can
 //! come from, in ascending precedence (later wins):
@@ -18,13 +18,13 @@
 //! 2. `$CLAUDE_CONFIG_DIR/.claude.json` (default `~/.claude.json`) —
 //!    top-level `mcpServers`, then `projects[project_dir].mcpServers`.
 //! 3. `<project_dir>/.mcp.json` — the shared project-scope `mcpServers` file.
-//! 4. `<t3 home>/settings.json` — `mcpServers`, a native extension with no
+//! 4. `<67 home>/settings.json` — `mcpServers`, a native extension with no
 //!    contract counterpart; kept so a user can point the native bridge at a
 //!    server no provider config knows about.
 //!
 //! Only stdio specs (`{command, args?, env?, cwd?}`) are spawnable; HTTP/SSE
 //! `url` entries are skipped — a name found only there is indistinguishable
-//! from a provider-builtin server (T3's own `t3-code` HTTP MCP), which needs
+//! from a provider-builtin server (upstream's own `t3-code` HTTP MCP), which needs
 //! the provider's session-scoped endpoint and stays `session-stopped`.
 //!
 //! ## Framing
@@ -196,7 +196,7 @@ fn merge_codex_config(out: &mut HashMap<String, McpServerConfig>) {
 /// and precedence. `project_dir` selects Claude's per-project `mcpServers`
 /// scope and the workspace `.mcp.json`.
 pub fn discover_server_configs(
-    t3_home: &Path,
+    home: &Path,
     project_dir: &Path,
 ) -> HashMap<String, McpServerConfig> {
     let mut out = HashMap::new();
@@ -235,9 +235,9 @@ pub fn discover_server_configs(
         merge_specs(&mut out, dot_mcp.get("mcpServers"));
     }
 
-    // Native extension: T3's own settings.json — highest precedence so a
+    // Native extension: 67's own settings.json — highest precedence so a
     // hand-configured entry always wins.
-    if let Some(settings) = read_json_file(&t3_home.join("settings.json")) {
+    if let Some(settings) = read_json_file(&home.join("settings.json")) {
         merge_specs(&mut out, settings.get("mcpServers"));
     }
 
@@ -386,7 +386,7 @@ impl LiveChild {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": { "name": "t3-code", "version": env!("CARGO_PKG_VERSION") },
+                "clientInfo": { "name": "67-code", "version": env!("CARGO_PKG_VERSION") },
             }),
         )
         .await
@@ -812,9 +812,9 @@ mod tests {
     #[test]
     fn discover_merges_sources_in_precedence_order() {
         let base = std::env::temp_dir().join(format!("mcp-cfg-{}", uuid::Uuid::new_v4()));
-        let t3_home = base.join("t3");
+        let home_dir = base.join("c67");
         let project = base.join("proj");
-        std::fs::create_dir_all(&t3_home).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
         std::fs::create_dir_all(&project).unwrap();
 
         // Project .mcp.json defines `alpha`; settings.json overrides `alpha`
@@ -831,7 +831,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            t3_home.join("settings.json"),
+            home_dir.join("settings.json"),
             json!({
                 "mcpServers": {
                     "alpha": { "command": "from-settings", "args": ["2"] },
@@ -843,7 +843,7 @@ mod tests {
         )
         .unwrap();
 
-        let configs = discover_server_configs(&t3_home, &project);
+        let configs = discover_server_configs(&home_dir, &project);
         assert_eq!(configs["alpha"].command, "from-settings");
         assert_eq!(configs["beta"].command, "b");
         assert!(!configs.contains_key("gone"));

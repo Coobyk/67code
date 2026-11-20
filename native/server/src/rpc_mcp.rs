@@ -17,7 +17,7 @@
 //!   looked up in the discovered stdio server configs (claude.json,
 //!   `.mcp.json`, codex `config.toml`, t3 `settings.json`) and served by a
 //!   persistent child process. Names with no spawnable config — including
-//!   provider-builtin HTTP servers like T3's `t3-code` — keep the
+//!   provider-builtin HTTP servers like upstream's `t3-code` — keep the
 //!   `session-stopped` answer, and a present `providerSessionId` keeps
 //!   `provider-unsupported` (no Rust adapter MCP bridge exists).
 //! - `updateModelContext` is implemented end-to-end: app resolution, the
@@ -491,7 +491,7 @@ fn mcp_fail(thread_id: &str, err: crate::mcp_manager::McpError) -> RpcResult {
     use crate::mcp_manager::McpError::*;
     match err {
         // No spawnable stdio config: either the name belongs to a provider
-        // builtin (T3's `t3-code` HTTP server needs the live session) or the
+        // builtin (upstream's `t3-code` HTTP server needs the live session) or the
         // server simply isn't configured anywhere we can see — in TS both
         // cases surface as session-stopped because only the provider session
         // could reach the server.

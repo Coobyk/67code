@@ -891,7 +891,7 @@ async fn list_acp_sessions(state: Arc<AppState>, payload: Value) -> RpcResult {
     }))
 }
 
-/// `server.importAcpRegistrySession`: create a T3 thread for the native
+/// `server.importAcpRegistrySession`: create a 67 thread for the native
 /// session (deterministic thread id) and record the mapping.
 async fn import_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
     let driver = match acp_driver(&payload) {
@@ -959,14 +959,14 @@ async fn import_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
             }
             RpcResult::err(acp_op_error(
                 "session_import_failed",
-                format!("Could not create a T3 thread for the ACP session: {e}"),
+                format!("Could not create a 67 thread for the ACP session: {e}"),
             ))
         }
     }
 }
 
 /// `server.deleteAcpRegistrySession`: `devin rm --force <sessionId>` in the
-/// project workspace. Refuses while an imported T3 thread still references it.
+/// project workspace. Refuses while an imported 67 thread still references it.
 async fn delete_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
     if let Err(e) = acp_driver(&payload) {
         return RpcResult::err(e);
@@ -986,7 +986,7 @@ async fn delete_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
     {
         return RpcResult::err(acp_op_error(
             "session_delete_failed",
-            "Delete the imported T3 thread before deleting its native ACP session.",
+            "Delete the imported 67 thread before deleting its native ACP session.",
         ));
     }
     let removed = tokio::process::Command::new("devin")

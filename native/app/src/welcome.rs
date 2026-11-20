@@ -464,7 +464,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme::fg_muted())
-                        .child("Start one on this machine, or point at a remote T3 environment."),
+                        .child("Start one on this machine, or point at a remote 67 environment."),
                 )
                 .child(
                     div()
@@ -654,7 +654,7 @@ impl AppView {
                             .pt_1()
                             .text_sm()
                             .text_color(theme::fg_muted())
-                            .child("A native client for T3 Code environments. Point it at a server to get started."),
+                            .child("A native client for 67 Code environments. Point it at a server to get started."),
                     )
                     .child(step_run)
                     .child(step_endpoint)

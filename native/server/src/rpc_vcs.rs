@@ -1613,7 +1613,7 @@ async fn create_worktree(state: &AppState, payload: &Value) -> Result<Value, Val
     let worktree_path = match str_field(payload, "path") {
         Some(p) => resolve_under(&cwd, p).to_string_lossy().to_string(),
         None => {
-            // Managed folder: <T3 home>/worktrees/<repo>/<branch>-<hash16>.
+            // Managed folder: <67 home>/worktrees/<repo>/<branch>-<hash16>.
             let repo_name = real_path(&cwd)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())

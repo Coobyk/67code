@@ -2738,10 +2738,10 @@ async fn ensure_scratch(state: Arc<AppState>) -> RpcResult {
             let repo = String::from_utf8_lossy(&res.stdout).trim().to_string();
             let base = path_str(&state.home_dir);
             return dispatch_error(format!(
-                "Threads without a project are off because the T3 home {base} is inside the \
+                "Threads without a project are off because the 67 home {base} is inside the \
                  Git repository {repo}. If that repository was created by mistake, move \
-                 {repo}/.git out of the way; otherwise point T3CODE_HOME (or --base-dir) at a \
-                 folder outside it. Then restart T3 Code."
+                 {repo}/.git out of the way; otherwise point C67_HOME (or --base-dir) at a \
+                 folder outside it. Then restart 67 Code."
             ));
         }
     }
@@ -2868,7 +2868,7 @@ fn named_project_icon_svg(name: &str) -> String {
 
 fn named_project_readme(name: &str) -> String {
     format!(
-        "<img src=\"assets/icon.svg\" width=\"64\" height=\"64\" alt=\"\">\n\n# {name}\n\nCreated in [T3 Code](https://t3.codes).\n"
+        "<img src=\"assets/icon.svg\" width=\"64\" height=\"64\" alt=\"\">\n\n# {name}\n\nCreated in [67 Code](https://67.codes).\n"
     )
 }
 

@@ -697,11 +697,11 @@ impl AppView {
         self.notifications_state.star_prompt_done = true;
         self.push_sticky_toast_with_action(
             ToastKind::Info,
-            "Enjoying T3 Code?",
+            "Enjoying 67 Code?",
             Some("It helps a lot if you star the repo.".to_string()),
             None,
             Some(ToastAction::OpenUrl {
-                url: "https://github.com/pingdotgg/t3code".into(),
+                url: "https://github.com/Coobyk/67code".into(),
                 label: "Star on GitHub".into(),
             }),
             cx,

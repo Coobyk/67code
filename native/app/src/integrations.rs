@@ -603,7 +603,7 @@ impl AppView {
         // ── 67 Connect relay ─────────────────────────────────────────
         section = section.child(group_label("67 Connect relay"));
         section = section.child(div().pb_2().text_xs().text_color(theme::fg_muted()).child(
-            "T3 Connect tunnels reach this server through the managed relay client \
+            "67 Connect tunnels reach this server through the managed relay client \
                  binary. The wire exposes only its status and installer — sign-in/pairing \
                  happens inside the relay itself (the pair URL it prints), and pointing \
                  this app at another server is the Environments settings section.",

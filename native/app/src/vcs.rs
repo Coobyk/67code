@@ -717,7 +717,7 @@ impl AppView {
 
     /// `vcs.createWorktree` `{refName: <current>, newRefName: <name>}` —
     /// creates the branch at the current ref and checks it out in a managed
-    /// worktree directory under the server's T3 home.
+    /// worktree directory under the server's 67 home.
     fn vcs_create_worktree(&mut self, name: String, cx: &mut Context<Self>) {
         if self.vcs_state.worktree_pending.is_some() {
             return;

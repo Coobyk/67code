@@ -64,7 +64,7 @@ pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     /// Dev auth token; `None` accepts any bearer token.
     pub auth_token: Option<String>,
-    /// T3 home; the SQLite DB lives at `<home>/userdata/statev2.sqlite`.
+    /// 67 home; the SQLite DB lives at `<home>/userdata/statev2.sqlite`.
     pub home_dir: PathBuf,
     /// Fixture dir containing `showcase_transcript.ndjson`; `None` discovers
     /// `apps/server/scripts/dev-replay` by walking cwd ancestors.

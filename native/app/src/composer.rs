@@ -375,7 +375,7 @@ const DICTATION_MAX_BYTES: usize = 32_000_000;
 
 /// Hosted app origin for generated prompt links (`DEFAULT_HOSTED_APP_URL`
 /// in packages/shared/src/connectAuth.ts); `C67_HOSTED_APP_URL` overrides.
-const DEFAULT_HOSTED_APP_URL: &str = "https://app.t3.codes";
+const DEFAULT_HOSTED_APP_URL: &str = "https://app.67.codes";
 
 /// `PROMPT_LINK_MAX_PROMPT_LENGTH` in packages/shared/src/promptLinks.ts.
 const PROMPT_LINK_MAX_PROMPT_LENGTH: usize = 8_000;
@@ -1789,7 +1789,7 @@ impl AppView {
         .detach();
     }
 
-    /// Build the hosted `app.t3.codes/new?prompt=…` link for the current
+    /// Build the hosted `app.67.codes/new?prompt=…` link for the current
     /// draft (the web client's `buildNewThreadLink`, including its
     /// provider/model params when the config stream names the driver) and
     /// copy it to the clipboard.
@@ -3534,7 +3534,7 @@ impl AppView {
                     menu_row(
                         "share-prompt",
                         "Copy prompt link",
-                        Some("app.t3.codes link that opens a new thread with this draft".into()),
+                        Some("app.67.codes link that opens a new thread with this draft".into()),
                         false,
                     )
                     .on_mouse_down(

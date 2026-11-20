@@ -1738,7 +1738,7 @@ async fn pr_change_breakdown(state: Arc<AppState>, payload: Value) -> RpcResult 
 }
 
 // ---------------------------------------------------------------------------
-// filesViewed persistence (a small JSON map under the T3 home)
+// filesViewed persistence (a small JSON map under the 67 home)
 // ---------------------------------------------------------------------------
 
 fn viewed_key(project_id: &str, host: &str, repository: &str, number: i64) -> String {
@@ -2701,6 +2701,7 @@ async fn review_merge_base(
             async move { git(&cwd, &owned, operation).await.ok().map(|s| s.trim().to_string()) }
         };
         // 1) `branch.<name>.t3-merge-base-ref` config override (full refs only).
+        //    Shared with the TS server (`GitManager.ts`) — keep the key name.
         if let Some(branch) = git_ok(&["rev-parse", "--abbrev-ref", "HEAD"]).await.filter(|b| b != "HEAD") {
             let key = format!("branch.{branch}.t3-merge-base-ref");
             if let Some(cfg) = git_ok(&["config", "--get", key.as_str()]).await {
@@ -3567,7 +3568,7 @@ async fn sc_publish_repository(_state: Arc<AppState>, payload: Value) -> RpcResu
 
 async fn sc_app_access(_state: Arc<AppState>, payload: Value) -> RpcResult {
     let _ = payload;
-    // The T3 Code GitHub App sign-in is not used by this server.
+    // The upstream T3 Code GitHub App sign-in is not used by this server.
     RpcResult::ok(json!({ "status": "signed-out" }))
 }
 

@@ -692,7 +692,7 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 // File registration (external files referenced by assets.createUrl)
 // ---------------------------------------------------------------------------
 
-/// Canonicalize `path`, require it to be a regular file outside the T3 home,
+/// Canonicalize `path`, require it to be a regular file outside the 67 home,
 /// and record it in the index under `f<sha256(path)[..32]>`. Returns the key.
 async fn register_external_file(
     state: &AppState,

@@ -2613,7 +2613,7 @@ impl AppView {
             }))
             .child(
                 // Web `SidebarChromeHeader`: the 52px workspace topbar with the
-                // h-7 brand — T3 wordmark in foreground + "Code" muted.
+                // h-7 brand — 67 wordmark in foreground + "Code" muted.
                 div()
                     .h(px(theme::TOPBAR_H))
                     .pl_3()
@@ -2628,7 +2628,7 @@ impl AppView {
                             .gap_1()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(div().text_color(theme::sidebar_fg()).child("T3"))
+                            .child(div().text_color(theme::sidebar_fg()).child("67"))
                             .child(div().text_color(theme::sidebar_fg_muted()).child("Code")),
                     ),
             )

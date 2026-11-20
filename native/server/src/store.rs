@@ -312,7 +312,7 @@ impl StoreHandle {
         rx.await.unwrap_or_else(|_| json!({}))
     }
 
-    /// The T3 thread id an imported native ACP session maps to, when one was
+    /// The 67 thread id an imported native ACP session maps to, when one was
     /// already imported (mapping row or deterministic derived id).
     pub async fn acp_imported_thread_id(
         &self,

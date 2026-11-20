@@ -274,7 +274,7 @@ impl AppView {
         cx.notify();
     }
 
-    /// `server.importAcpRegistrySession` — resume a native session as a T3
+    /// `server.importAcpRegistrySession` — resume a native session as a 67
     /// thread. One import at a time; already-imported rows are inert.
     fn acp_import_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         if self.acp_state.importing.is_some() {
@@ -605,7 +605,7 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(theme::fg_muted())
-                                .child("Resume agent-owned conversations as T3 threads."),
+                                .child("Resume agent-owned conversations as 67 threads."),
                         )
                         .child(
                             div()
