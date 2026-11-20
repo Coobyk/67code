@@ -211,7 +211,7 @@ impl AppView {
             },
         )
         .detach();
-        let search_field = cx.new(|cx| TextField::new("Search threads…", cx));
+        let search_field = cx.new(|cx| TextField::new("Search", cx));
 
         let mut commands = None;
         let state = match config.endpoint.clone() {
@@ -935,6 +935,15 @@ impl Render for AppView {
         let title = selected_thread
             .map(|t| t.title.clone())
             .unwrap_or_else(|| "67 Code".into());
+        // Web `WorkspaceBreadcrumb`: project chip + muted project name, a
+        // "/" separator, then the emphasized thread title.
+        let selected_project = selected_thread.and_then(|t| {
+            self.state
+                .projects
+                .iter()
+                .find(|p| p.id == t.project_id)
+                .map(|p| (self.project_chip(p), p.name.clone()))
+        });
         let running = selected_thread.is_some_and(|t| {
             !matches!(
                 t.status.as_ref(),
@@ -1046,11 +1055,111 @@ impl Render for AppView {
                             // Drag region for client-side decorations; no-op
                             // under server decorations.
                             .window_control_area(WindowControlArea::Drag)
-                            .child(title)
+                            .child(
+                                // `WorkspaceBreadcrumb`: [chip] project /
+                                // title — muted project segment, `/`
+                                // separator, emphasized thread title.
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .when_some(selected_project, |el, (chip, project)| {
+                                        el.child(chip)
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_color(theme::fg_muted())
+                                                    .child(project),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_color(theme::fg_muted())
+                                                    .child("/"),
+                                            )
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .whitespace_nowrap()
+                                            .overflow_x_hidden()
+                                            .text_ellipsis()
+                                            .child(title),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .flex()
+                                    .flex_none()
+                                    .items_center()
                                     .gap_1()
+                                    // Web `PanelLayoutControls` order ahead
+                                    // of the window controls: diff viewer,
+                                    // thread details, terminal drawer,
+                                    // right panel.
+                                    .child(
+                                        div()
+                                            .id("diff-panel-toggle")
+                                            .w_6()
+                                            .h_6()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(theme::fg_muted())
+                                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                            .child(
+                                                icons::icon(icons::Icon::FileDiff, 14.)
+                                                    .text_color(theme::fg_muted()),
+                                            )
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _ev, _w, cx| {
+                                                    this.panel_state.tab = if this.panel_state.tab
+                                                        == Some(right_panel::Tab::Diff)
+                                                    {
+                                                        None
+                                                    } else {
+                                                        Some(right_panel::Tab::Diff)
+                                                    };
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("thread-panel-toggle")
+                                            .w_6()
+                                            .h_6()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(theme::fg_muted())
+                                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                            .child(
+                                                icons::icon(icons::Icon::SquareMenu, 14.)
+                                                    .text_color(theme::fg_muted()),
+                                            )
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _ev, _w, cx| {
+                                                    this.panel_state.tab = if this.panel_state.tab
+                                                        == Some(right_panel::Tab::Files)
+                                                    {
+                                                        None
+                                                    } else {
+                                                        Some(right_panel::Tab::Files)
+                                                    };
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
                                     .child(
                                         div()
                                             .id("terminal-drawer-toggle")
@@ -1065,7 +1174,7 @@ impl Render for AppView {
                                             .text_color(theme::fg_muted())
                                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
                                             .child(
-                                                icons::icon(icons::Icon::Terminal, 14.)
+                                                icons::icon(icons::Icon::PanelBottom, 14.)
                                                     .text_color(theme::fg_muted()),
                                             )
                                             .on_mouse_down(
