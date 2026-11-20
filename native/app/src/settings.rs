@@ -91,15 +91,6 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
     ),
 ];
 
-/// Label for `section` — used by the content header's breadcrumb.
-fn section_label(section: Section) -> &'static str {
-    NAV_GROUPS
-        .iter()
-        .flat_map(|(_, items)| items.iter())
-        .find(|(s, _)| *s == section)
-        .map(|(_, label)| *label)
-        .unwrap_or("Settings")
-}
 
 /// (keys, description) rows for the static shortcut reference.
 const SHORTCUTS: &[(&str, &str)] = &[

@@ -1,6 +1,7 @@
 //! Design tokens ported from apps/web/src/index.css — exact resolved values
 //! for the web's default dark + light themes. Every surface should consume
 //! these constants instead of hardcoding colors or metrics.
+#![allow(dead_code)] // Token palette — supersets are intentional.
 
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};

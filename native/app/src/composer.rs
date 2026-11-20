@@ -324,6 +324,7 @@ pub struct Attachment {
     pub thumbnail: Option<Arc<RenderImage>>,
 }
 
+#[allow(dead_code)] // `Text` is the wire shape for pasted-text attachments.
 pub enum AttachmentKind {
     Image { bytes: Vec<u8>, mime: String },
     File { path: String },

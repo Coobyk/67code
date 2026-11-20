@@ -46,8 +46,12 @@ pub struct Thread {
     /// Linked PR object (url etc.) when present.
     pub linked_pull_request: Option<serde_json::Value>,
     pub pin_order_key: Option<SharedString>,
+    // Parsed for completeness; not consumed by the UI yet.
+    #[allow(dead_code)]
     pub active_order_key: Option<SharedString>,
+    #[allow(dead_code)]
     pub runtime_mode: Option<SharedString>,
+    #[allow(dead_code)]
     pub interaction_mode: Option<SharedString>,
     /// Latest run id — `targetRunId` for steer/restart dispatch modes.
     pub latest_run_id: Option<SharedString>,
@@ -192,11 +196,6 @@ impl AppState {
         }
     }
 
-    pub fn threads_for<'a>(&'a self, project_id: &'a str) -> impl Iterator<Item = &'a Thread> {
-        self.threads
-            .iter()
-            .filter(move |t| t.project_id.as_ref() == project_id)
-    }
 
     pub fn selected_thread(&self) -> Option<&Thread> {
         let id = self.selected.as_ref()?;
