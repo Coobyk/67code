@@ -20,6 +20,7 @@ use gpui::{
 };
 use serde_json::{Value, json};
 
+use crate::icons::{Icon, icon};
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::{AppView, theme};
@@ -1390,44 +1391,47 @@ impl AppView {
                 .map(|p| p.name.to_string())
                 .unwrap_or_else(|| "Select project".to_string());
             let picker_open = state.project_menu_open;
-            form = form.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child("Project"),
-                    )
-                    .child(
-                        div()
-                            .id("task-project-chip")
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme::input())
-                            .bg(theme::field_surface())
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(theme::fg())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.backend_settings_state.tasks.project_menu_open =
-                                        !this.backend_settings_state.tasks.project_menu_open;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(div().max_w(px(280.)).truncate().child(project_title))
-                            .child(div().text_color(theme::fg_muted()).child("▾")),
-                    ),
-            );
+            form =
+                form.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child("Project"),
+                        )
+                        .child(
+                            div()
+                                .id("task-project-chip")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_1()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(theme::input())
+                                .bg(theme::field_surface())
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme::fg())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.backend_settings_state.tasks.project_menu_open =
+                                            !this.backend_settings_state.tasks.project_menu_open;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(div().max_w(px(280.)).truncate().child(project_title))
+                                .child(div().flex().items_center().child(
+                                    icon(Icon::ChevronDown, 11.).text_color(theme::fg_muted()),
+                                )),
+                        ),
+                );
             if picker_open {
                 let mut menu = div()
                     .flex()
@@ -1440,43 +1444,45 @@ impl AppView {
                 for (index, project) in self.state.projects.iter().enumerate() {
                     let pid = project.id.to_string();
                     let active = self.tasks_project_id().as_deref() == Some(pid.as_str());
-                    menu = menu.child(
-                        div()
-                            .id(("task-project", index))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1p5()
-                            .text_xs()
-                            .cursor_pointer()
-                            .when(active, |s| s.bg(theme::selected()))
-                            .when(!active, |s| s.hover(|s| s.bg(theme::hover())))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    let state = &mut this.backend_settings_state.tasks;
-                                    state.project_id = Some(pid.clone());
-                                    state.project_menu_open = false;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .w(px(14.))
-                                    .flex_none()
-                                    .text_color(theme::primary())
-                                    .child(if active { "✓" } else { "" }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::fg())
-                                    .child(project.name.clone()),
-                            ),
-                    );
+                    menu =
+                        menu.child(
+                            div()
+                                .id(("task-project", index))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1p5()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(active, |s| s.bg(theme::selected()))
+                                .when(!active, |s| s.hover(|s| s.bg(theme::hover())))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        let state = &mut this.backend_settings_state.tasks;
+                                        state.project_id = Some(pid.clone());
+                                        state.project_menu_open = false;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(div().w(px(14.)).flex_none().flex().items_center().when(
+                                    active,
+                                    |el| {
+                                        el.child(
+                                            icon(Icon::Check, 12.).text_color(theme::primary()),
+                                        )
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme::fg())
+                                        .child(project.name.clone()),
+                                ),
+                        );
                 }
                 form = form.child(menu);
             }

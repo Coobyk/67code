@@ -9,6 +9,7 @@
 use gpui::{Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px, rgb};
 
 use crate::composer::MODEL_CATALOG;
+use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::net::ClientCommand;
 use crate::theme;
@@ -91,6 +92,33 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
     ),
 ];
 
+/// Per-section lucide glyph — web `SETTINGS_SECTION_ICONS` in
+/// `SettingsSidebarNav.tsx` (size-4, `--sidebar-icon-color`). Bundled-set
+/// approximations are noted where the exact glyph is absent.
+fn section_icon(section: Section) -> Icon {
+    match section {
+        Section::Appearance => Icon::Sparkles, // web: Palette
+        Section::ChatDefaults => Icon::MessageSquare,
+        Section::Keybindings => Icon::Pencil, // web: Keyboard; Keyboard goes to Shortcuts
+        Section::Shortcuts => Icon::Keyboard,
+        Section::Providers => Icon::Zap, // web: Bot
+        Section::AcpSessions => Icon::Activity,
+        Section::Threads => Icon::ListTodo, // web: MessagesSquare
+        Section::ScheduledTasks => Icon::Clock, // web: CalendarClock
+        Section::Projects => Icon::FolderGit2, // web: PanelsTopLeft
+        Section::SourceControl => Icon::GitBranch,
+        Section::Integrations => Icon::Link,
+        Section::Connection => Icon::Globe, // web: Server
+        Section::Environments => Icon::Monitor,
+        Section::Clients => Icon::Shield, // web: ShieldCheck
+        Section::Secrets => Icon::Lock,   // web: KeyRound
+        Section::Notifications => Icon::Bell,
+        Section::Diagnostics => Icon::Wrench,
+        Section::Usage => Icon::Activity,
+        Section::ArchivedThreads => Icon::Archive,
+        Section::About => Icon::Info,
+    }
+}
 
 /// (keys, description) rows for the static shortcut reference.
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -241,6 +269,7 @@ impl AppView {
                         .h(px(32.))
                         .flex()
                         .items_center()
+                        .gap_2()
                         .px(px(10.))
                         .rounded_lg()
                         .text_sm()
@@ -261,6 +290,9 @@ impl AppView {
                                 cx.notify();
                             }),
                         )
+                        .child(div().flex_none().flex().items_center().child(
+                            icon(section_icon(section), 16.).text_color(theme::sidebar_icon()),
+                        ))
                         .child(*label),
                 );
                 index += 1;
@@ -396,8 +428,11 @@ impl AppView {
                         div()
                             .w(px(14.))
                             .flex_none()
-                            .text_color(theme::primary())
-                            .child(if active { "✓" } else { "" }),
+                            .flex()
+                            .items_center()
+                            .when(active, |el| {
+                                el.child(icon(Icon::Check, 12.).text_color(theme::primary()))
+                            }),
                     )
                     .child(div().flex_none().child(*label))
                     .child(
@@ -604,7 +639,7 @@ impl AppView {
                             cx.notify();
                         }),
                     )
-                    .child("×"),
+                    .child(icon(Icon::X, 14.).text_color(theme::fg_muted())),
             );
 
         div()

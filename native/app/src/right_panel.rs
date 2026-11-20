@@ -11,6 +11,7 @@ use gpui::{Context, Div, MouseButton, div, prelude::*, px};
 use serde_json::{Value, json};
 
 use crate::AppView;
+use crate::icons::{Icon, icon};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +102,12 @@ impl AppView {
             Tab::Diff => self.render_diff_pane(cx).into_any_element(),
             Tab::Browser => self.render_browser_pane(cx).into_any_element(),
         };
+        // Web parity note: the real right panel (`usePreviewPanelInlineSize`)
+        // is user-resizable — min 360px, default 540px, max 70% of the
+        // container. The 280px `--thread-details-panel-width` variable covers
+        // the thread-details/find-bar popover, not this surface. A fixed
+        // 380px keeps us inside the web's supported range without losing a
+        // third of a typical 1200px window to the default.
         div()
             .w(px(380.))
             .flex_none()
@@ -115,17 +122,19 @@ impl AppView {
     }
 
     /// Web `RightPanelTabs`: the strip sits at `--workspace-topbar-height`
-    /// (52px) with compact `h-6 rounded-md` pills — active `bg-accent
-    /// text-foreground`, inactive muted + `hover:bg-accent/60`.
+    /// (52px) with compact `h-6 rounded-md` pills — a leading 12px lucide
+    /// glyph, active `bg-accent text-foreground`, inactive muted +
+    /// `hover:bg-accent/60`.
     fn render_panel_tab_bar(&self, cx: &mut Context<Self>) -> Div {
-        let tab = |label: &'static str, target: Tab, cx: &mut Context<Self>| {
+        let tab = |tab_icon: Icon, label: &'static str, target: Tab, cx: &mut Context<Self>| {
             let active = self.panel_state.tab == Some(target);
             div()
                 .h(px(24.))
                 .flex()
                 .items_center()
-                .pl_1p5()
-                .pr_2()
+                .gap_1()
+                .pl_1()
+                .pr_1p5()
                 .rounded(theme::radius::MD)
                 .cursor_pointer()
                 .text_xs()
@@ -142,6 +151,11 @@ impl AppView {
                         s.bg(theme::accent_soft()).text_color(theme::fg())
                     }
                 })
+                .child(icon(tab_icon, 12.).text_color(if active {
+                    theme::fg()
+                } else {
+                    theme::fg_muted()
+                }))
                 .child(label)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
@@ -157,12 +171,17 @@ impl AppView {
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
-            .child(tab("Files", Tab::Files, cx))
-            .child(tab("Terminals", Tab::Terminals, cx))
-            .child(tab("Pull requests", Tab::PullRequests, cx))
-            .child(tab("Diff", Tab::Diff, cx))
-            .child(tab("Browser", Tab::Browser, cx))
+            .gap_0p5()
+            .child(tab(Icon::Folder, "Files", Tab::Files, cx))
+            .child(tab(Icon::Terminal, "Terminals", Tab::Terminals, cx))
+            .child(tab(
+                Icon::GitPullRequest,
+                "Pull requests",
+                Tab::PullRequests,
+                cx,
+            ))
+            .child(tab(Icon::GitCompare, "Diff", Tab::Diff, cx))
+            .child(tab(Icon::Globe, "Browser", Tab::Browser, cx))
     }
 
     // ------------------------------------------------------------------
@@ -288,12 +307,16 @@ impl AppView {
                 .child(
                     div()
                         .id("browser-refresh")
-                        .px_1p5()
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded_sm()
                         .cursor_pointer()
                         .text_color(theme::fg_muted())
                         .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .child("↻")
+                        .child(icon(Icon::RefreshCw, 12.).text_color(theme::fg_muted()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _ev, _w, cx| this.browser_refresh(cx)),
@@ -379,7 +402,11 @@ impl AppView {
                 .py_1p5()
                 .border_b_1()
                 .border_color(theme::border())
-                .child(div().flex_none().child("🌐"))
+                .child(
+                    div()
+                        .flex_none()
+                        .child(icon(Icon::Globe, 13.).text_color(theme::icon_muted())),
+                )
                 .child(
                     div()
                         .flex_1()

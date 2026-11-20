@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 
 use crate::AppView;
 use crate::composer::MODEL_CATALOG;
+use crate::icons::{Icon, icon};
 use crate::settings_misc::{
     self, AUTO_VALUE, OpenList, danger, edit_field, exit_failure_message, field_text_in,
     group_label, pack_model, setting_row, switch_control,
@@ -880,10 +881,14 @@ impl AppView {
             let message = issue["message"].as_str().unwrap_or("Invalid rule");
             section = section.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .py_1p5()
                     .text_xs()
                     .text_color(danger())
-                    .child(format!("⚠ {message}")),
+                    .child(icon(Icon::TriangleAlert, 11.).text_color(danger()))
+                    .child(SharedString::from(message.to_string())),
             );
         }
 
@@ -1207,11 +1212,15 @@ impl AppView {
                 if !taken.is_empty() {
                     form = form.child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
                             .py_1()
                             .text_xs()
                             .text_color(danger())
+                            .child(icon(Icon::TriangleAlert, 11.).text_color(danger()))
                             .child(format!(
-                                "⚠ “{draft_key}” is already bound to {} — saving adds another rule for the same keys.",
+                                "“{draft_key}” is already bound to {} — saving adds another rule for the same keys.",
                                 taken.join(", ")
                             )),
                     );

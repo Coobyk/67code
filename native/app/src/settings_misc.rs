@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::AppView;
 use crate::composer::MODEL_CATALOG;
+use crate::icons::{Icon, icon};
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
@@ -948,9 +949,9 @@ impl AppView {
             .child(
                 div()
                     .flex_none()
-                    .text_xs()
-                    .text_color(theme::icon_muted())
-                    .child("▾"),
+                    .flex()
+                    .items_center()
+                    .child(icon(Icon::ChevronDown, 12.).text_color(theme::icon_muted())),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -1039,8 +1040,11 @@ impl AppView {
                         div()
                             .w(px(14.))
                             .flex_none()
-                            .text_color(theme::primary())
-                            .child(if selected { "✓" } else { "" }),
+                            .flex()
+                            .items_center()
+                            .when(selected, |el| {
+                                el.child(icon(Icon::Check, 12.).text_color(theme::primary()))
+                            }),
                     )
                     .child(div().flex_none().child(label.clone()))
                     .when_some(detail.clone(), |s, detail| {
@@ -1134,9 +1138,13 @@ impl AppView {
         } else if state.settings_loading.get() && !state.settings_loaded.get() {
             section = section.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .py_1p5()
                     .text_xs()
                     .text_color(theme::fg_muted())
+                    .child(icon(Icon::LoaderCircle, 12.).text_color(theme::fg_muted()))
                     .child("Loading settings…"),
             );
         }
@@ -2620,6 +2628,9 @@ impl AppView {
                         .child(
                             div()
                                 .id("project-browse-up")
+                                .flex()
+                                .items_center()
+                                .gap_1()
                                 .px_2()
                                 .py_0p5()
                                 .rounded_md()
@@ -2628,7 +2639,8 @@ impl AppView {
                                 .bg(theme::hover())
                                 .text_color(theme::fg())
                                 .hover(|s| s.bg(theme::selected()))
-                                .child("↑ Up")
+                                .child(icon(Icon::ArrowUp, 11.).text_color(theme::fg()))
+                                .child("Up")
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _ev, _window, cx| {
@@ -2692,24 +2704,31 @@ impl AppView {
                     let mut list = div().flex().flex_col();
                     for (entry_index, (name, full)) in state.browse_entries.iter().enumerate() {
                         let full = full.clone();
-                        list = list.child(
-                            div()
-                                .id(("project-browse-entry", entry_index))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_sm()
-                                .cursor_pointer()
-                                .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::hover()))
-                                .child(format!("📁 {name}"))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _ev, _window, cx| {
-                                        this.browse_nav(full.clone(), cx);
-                                    }),
-                                ),
-                        );
+                        list =
+                            list.child(
+                                div()
+                                    .id(("project-browse-entry", entry_index))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .text_color(theme::fg())
+                                    .hover(|s| s.bg(theme::hover()))
+                                    .child(div().flex_none().child(
+                                        icon(Icon::Folder, 13.).text_color(theme::fg_muted()),
+                                    ))
+                                    .child(SharedString::from(name.clone()))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, _window, cx| {
+                                            this.browse_nav(full.clone(), cx);
+                                        }),
+                                    ),
+                            );
                     }
                     panel = panel.child(
                         div()

@@ -20,11 +20,12 @@ use std::cell::{Cell, RefCell};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Context, Div, Entity, Focusable, FontWeight, MouseButton, Rgba, Stateful, Subscription, Window,
-    div, prelude::*, px,
+    Context, Div, Entity, Focusable, FontWeight, MouseButton, Rgba, Stateful, Subscription, Svg,
+    Window, div, prelude::*, px, svg,
 };
 use serde_json::{Value, json};
 
+use crate::icons::{Icon, icon};
 use crate::net::ClientCommand;
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, TextField};
@@ -132,13 +133,36 @@ fn pr_key(entry: &Value) -> String {
     )
 }
 
-/// `(glyph, color)` for a PR's open/draft/merged/closed state.
-fn pr_state_glyph(state: &str, is_draft: bool) -> (&'static str, Rgba) {
+/// Lucide `git-pull-request-draft` — not in the bundled set, inlined
+/// (same 24×24 stroke geometry as the bundled glyphs).
+const PR_DRAFT_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"18\" cy=\"18\" r=\"3\"/><circle cx=\"6\" cy=\"6\" r=\"3\"/><path d=\"M18 6V5\"/><path d=\"M18 11v-1\"/><line x1=\"6\" x2=\"6\" y1=\"9\" y2=\"21\"/></svg>";
+/// Lucide `git-pull-request-closed`.
+const PR_CLOSED_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"6\" cy=\"6\" r=\"3\"/><path d=\"M6 9v12\"/><path d=\"m21 3-6 6\"/><path d=\"m21 9-6-6\"/><path d=\"M18 11.5V15\"/><circle cx=\"18\" cy=\"18\" r=\"3\"/></svg>";
+/// Lucide `circle-check` (web `CircleCheckIcon` for passing checks).
+const CIRCLE_CHECK_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m9 12 2 2 4-4\"/></svg>";
+/// Lucide `circle-x` (web `CircleXIcon` for failed/cancelled checks).
+const CIRCLE_X_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m15 9-6 6\"/><path d=\"m9 9 6 6\"/></svg>";
+
+/// Leading glyph for a PR's open/draft/merged/closed state — the web
+/// `PullRequestGlyph` lucide set (arrow/draft/closed/merge variants).
+fn pr_state_icon(state: &str, is_draft: bool) -> Svg {
+    let color = pr_state_color(state, is_draft);
     match (state, is_draft) {
-        ("merged", _) => ("◆", pr_merged_color()),
-        ("closed", _) => ("●", pr_closed_color()),
-        (_, true) => ("○", theme::pr_draft()),
-        _ => ("●", pr_open_color()),
+        ("merged", _) => icon(Icon::GitMerge, 14.),
+        ("closed", _) => svg().data(PR_CLOSED_SVG).w(px(14.)).h(px(14.)),
+        (_, true) => svg().data(PR_DRAFT_SVG).w(px(14.)).h(px(14.)),
+        _ => icon(Icon::GitPullRequest, 14.),
+    }
+    .text_color(color)
+}
+
+/// State color for the same PR row/detail presentation.
+fn pr_state_color(state: &str, is_draft: bool) -> Rgba {
+    match (state, is_draft) {
+        ("merged", _) => pr_merged_color(),
+        ("closed", _) => pr_closed_color(),
+        (_, true) => theme::pr_draft(),
+        _ => pr_open_color(),
     }
 }
 
@@ -151,22 +175,43 @@ fn pr_state_label(state: &str, is_draft: bool) -> &'static str {
     }
 }
 
-/// `(glyph, color)` for one `PullRequestCheck.status`.
-fn check_glyph(status: &str) -> (&'static str, Rgba) {
+/// Status glyph for one `PullRequestCheck.status` — web
+/// `CHECK_STATUS_PRESENTATION`: circle-check / circle-x / spinner /
+/// circle-dot / circle-dashed at 11px.
+fn check_icon(status: &str) -> Svg {
+    let size = 11.;
+    let color = check_color(status);
     match status {
-        "success" => ("✓", check_pass_color()),
-        "failure" | "cancelled" => ("×", theme::error()),
-        "pending" | "action-required" => ("◐", check_pending_color()),
-        _ => ("○", theme::fg_muted()),
+        "success" => svg().data(CIRCLE_CHECK_SVG).w(px(size)).h(px(size)),
+        "failure" | "cancelled" => svg().data(CIRCLE_X_SVG).w(px(size)).h(px(size)),
+        "pending" => icon(Icon::LoaderCircle, size),
+        "action-required" => icon(Icon::CircleDot, size),
+        _ => icon(Icon::Circle, size),
+    }
+    .text_color(color)
+}
+
+/// `CHECK_STATUS_PRESENTATION.toneClassName` equivalents.
+fn check_color(status: &str) -> Rgba {
+    match status {
+        "success" => check_pass_color(),
+        "failure" | "cancelled" => theme::error(),
+        "pending" | "action-required" => check_pending_color(),
+        _ => theme::fg_muted(),
     }
 }
 
-/// `(label, color)` for a `PullRequestReviewDecision`.
-fn review_decision_chip(decision: &str) -> (String, Rgba) {
+/// `(icon, label, color)` for a `PullRequestReviewDecision` — web
+/// `REVIEW_OUTCOME_PRESENTATION` (amber changes-requested, not red).
+fn review_decision_chip(decision: &str) -> (Icon, &'static str, Rgba) {
     match decision {
-        "approved" => ("✓ Approved".to_string(), check_pass_color()),
-        "changes-requested" => ("× Changes requested".to_string(), theme::error()),
-        _ => ("○ Awaiting review".to_string(), theme::fg_muted()),
+        "approved" => (Icon::Check, "Approved", check_pass_color()),
+        "changes-requested" => (
+            Icon::TriangleAlert,
+            "Changes requested",
+            theme::warning_fg(),
+        ),
+        _ => (Icon::CircleDot, "Awaiting review", theme::fg_muted()),
     }
 }
 
@@ -517,7 +562,7 @@ impl AppView {
         s.status_error = None;
     }
 
-    /// ↻ on the status card — a manual `vcs.refreshStatus` re-poll.
+    /// Refresh button on the status card — a manual `vcs.refreshStatus` re-poll.
     fn vcs_refresh_status(&mut self, cx: &mut Context<Self>) {
         let Some((_pid, cwd)) = self.pr_scope() else {
             return;
@@ -1410,7 +1455,12 @@ impl AppView {
                     .py_2()
                     .text_xs()
                     .text_color(theme::fg_muted())
-                    .child(div().text_color(theme::error()).child("⚠"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(icon(Icon::TriangleAlert, 12.).text_color(theme::error())),
+                    )
                     .child(err.clone()),
             );
         }
@@ -1464,11 +1514,14 @@ impl AppView {
                 .cursor_pointer()
                 .hover(|h| h.bg(theme::hover()))
                 .child(
-                    div()
-                        .w(px(12.))
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(if picker_open { "▾" } else { "▸" }),
+                    div().w(px(12.)).flex().items_center().child(
+                        if picker_open {
+                            icon(Icon::ChevronDown, 10.)
+                        } else {
+                            icon(Icon::ChevronRight, 10.)
+                        }
+                        .text_color(theme::fg_muted()),
+                    ),
                 )
                 .child(
                     div()
@@ -1578,7 +1631,8 @@ impl AppView {
             .flex_wrap();
         actions = actions.child(action_button(
             "vcs-action-refresh",
-            "↻ Refresh",
+            Some(Icon::RefreshCw),
+            "Refresh",
             s.pull_pending,
             cx.listener(|this, _ev, _window, cx| {
                 this.vcs_refresh_status(cx);
@@ -1587,11 +1641,8 @@ impl AppView {
         if has_upstream {
             actions = actions.child(action_button(
                 "vcs-action-pull",
-                if s.pull_pending {
-                    "Pulling…"
-                } else {
-                    "↓ Pull"
-                },
+                Some(Icon::Download),
+                if s.pull_pending { "Pulling…" } else { "Pull" },
                 s.pull_pending,
                 cx.listener(|this, _ev, _window, cx| {
                     this.vcs_pull(cx);
@@ -1600,6 +1651,7 @@ impl AppView {
         }
         actions = actions.child(action_button(
             "vcs-action-review",
+            None,
             "Review changes",
             false,
             cx.listener(|this, _ev, _window, cx| {
@@ -1633,7 +1685,12 @@ impl AppView {
                 .cursor_pointer()
                 .text_xs()
                 .hover(|h| h.bg(theme::hover()))
-                .child(div().text_color(theme::primary()).child("+"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(icon(Icon::Plus, 11.).text_color(theme::primary())),
+                )
                 .child("New branch")
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1711,12 +1768,9 @@ impl AppView {
                 row = row.cursor_pointer().hover(|h| h.bg(theme::hover()));
             }
             row = row
-                .child(
-                    div()
-                        .w(px(12.))
-                        .text_color(check_pass_color())
-                        .child(if current { "✓" } else { "" }),
-                )
+                .child(div().w(px(12.)).flex().items_center().when(current, |el| {
+                    el.child(icon(Icon::Check, 11.).text_color(check_pass_color()))
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -1784,6 +1838,9 @@ impl AppView {
         header = header.child(
             div()
                 .id("vcs-new-worktree")
+                .flex()
+                .items_center()
+                .gap_1()
                 .px_1p5()
                 .py_0p5()
                 .rounded_sm()
@@ -1791,7 +1848,8 @@ impl AppView {
                 .text_xs()
                 .text_color(theme::primary())
                 .hover(|h| h.bg(theme::hover()))
-                .child("+ New")
+                .child(icon(Icon::Plus, 10.).text_color(theme::primary()))
+                .child("New")
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, window, cx| {
@@ -1958,14 +2016,17 @@ impl AppView {
             .child(
                 div()
                     .id("vcs-pr-refresh")
-                    .px_1p5()
-                    .py_0p5()
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(theme::fg_muted())
-                    .hover(|h| h.bg(theme::hover()))
-                    .child("↻")
+                    .hover(|h| h.bg(theme::hover()).text_color(theme::fg()))
+                    .child(icon(Icon::RefreshCw, 11.).text_color(theme::fg_muted()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _window, cx| {
@@ -2037,7 +2098,12 @@ impl AppView {
                                 .child(format!("#{number}")),
                         )
                         .child(div().flex_1().min_w_0().truncate().text_xs().child(repo))
-                        .child(div().text_xs().text_color(theme::fg_muted()).child("↗"))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(icon(Icon::ExternalLink, 10.).text_color(theme::fg_muted())),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _ev, _window, cx| {
@@ -2070,11 +2136,15 @@ impl AppView {
         for err in &s.pr_item_errors {
             list = list.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .px_2()
                     .py_1()
                     .text_xs()
                     .text_color(check_pending_color())
-                    .child(format!("⚠ {err}")),
+                    .child(icon(Icon::TriangleAlert, 11.).text_color(check_pending_color()))
+                    .child(err.clone()),
             );
         }
 
@@ -2206,7 +2276,7 @@ impl AppView {
             let expanded = s.expanded.as_deref() == Some(key.as_str());
             let state = entry["state"].as_str().unwrap_or("open").to_string();
             let is_draft = entry["isDraft"].as_bool() == Some(true);
-            let (glyph, glyph_color) = pr_state_glyph(&state, is_draft);
+            let state_color = pr_state_color(&state, is_draft);
             let number = entry["number"].as_i64().unwrap_or(0);
             let title = entry["title"].as_str().unwrap_or("").to_string();
             let repo = entry["repository"].as_str().unwrap_or("").to_string();
@@ -2242,8 +2312,17 @@ impl AppView {
                 top = top.child(chip("review"));
             }
             if let Some(rd) = &review {
-                let (label, color) = review_decision_chip(rd);
-                top = top.child(div().text_xs().text_color(color).child(label));
+                let (decision_icon, label, color) = review_decision_chip(rd);
+                top = top.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(color)
+                        .child(icon(decision_icon, 10.).text_color(color))
+                        .child(label),
+                );
             }
             if additions + deletions > 0 {
                 top = top.child(
@@ -2302,9 +2381,10 @@ impl AppView {
                 .child(
                     div()
                         .pt_0p5()
-                        .text_sm()
-                        .text_color(glyph_color)
-                        .child(glyph),
+                        .flex()
+                        .items_center()
+                        .text_color(state_color)
+                        .child(pr_state_icon(&state, is_draft)),
                 )
                 .child(
                     div()
@@ -2316,10 +2396,20 @@ impl AppView {
                         .child(sub),
                 );
             if linked {
-                row = row.child(div().text_xs().text_color(theme::primary()).child("⧉"));
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(icon(Icon::Link, 11.).text_color(theme::primary())),
+                );
             }
             if expanded {
-                row = row.child(div().text_xs().text_color(theme::fg_muted()).child("▾"));
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(icon(Icon::ChevronDown, 10.).text_color(theme::fg_muted())),
+                );
             }
             row = row.on_mouse_down(
                 MouseButton::Left,
@@ -2456,7 +2546,7 @@ impl AppView {
         if let Some(d) = &s.detail {
             let state = d["state"].as_str().unwrap_or("open");
             let is_draft = d["isDraft"].as_bool() == Some(true);
-            let (_, state_color) = pr_state_glyph(state, is_draft);
+            let state_color = pr_state_color(state, is_draft);
             let mut line1 = div().flex().items_center().gap_2().text_xs().child(
                 div()
                     .text_color(state_color)
@@ -2544,7 +2634,6 @@ impl AppView {
             );
             for c in checks.iter().take(check_rows) {
                 let status = c["status"].as_str().unwrap_or("");
-                let (g, color) = check_glyph(status);
                 let name = c["name"].as_str().unwrap_or("");
                 checks_box = checks_box.child(
                     div()
@@ -2552,7 +2641,14 @@ impl AppView {
                         .items_center()
                         .gap_1p5()
                         .text_xs()
-                        .child(div().w(px(12.)).text_color(color).child(g))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .flex()
+                                .items_center()
+                                .text_color(check_color(status))
+                                .child(check_icon(status)),
+                        )
                         .child(div().flex_1().min_w_0().truncate().child(name.to_string())),
                 );
             }
@@ -2591,35 +2687,38 @@ impl AppView {
                 for (ix, t) in threads.iter().take(6).enumerate() {
                     let tid = t["id"].as_str().unwrap_or("").to_string();
                     let title = t["title"].as_str().unwrap_or("Untitled").to_string();
-                    box_ = box_.child(
-                        div()
-                            .id(("vcs-linked-thread", ix))
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .hover(|h| h.bg(theme::hover()))
-                            .child(div().text_color(theme::primary()).child("↗"))
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    // Same body as lib.rs's private select_thread.
-                                    this.thread_items.clear();
-                                    this.turn_started_at = None;
-                                    if let Some(commands) = &this.commands {
-                                        let _ = commands.send(ClientCommand::SubscribeThread {
-                                            thread_id: tid.clone(),
-                                        });
-                                    }
-                                    this.state.selected = Some(tid.clone().into());
-                                    cx.notify();
-                                }),
-                            ),
-                    );
+                    box_ =
+                        box_.child(
+                            div()
+                                .id(("vcs-linked-thread", ix))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .hover(|h| h.bg(theme::hover()))
+                                .child(div().flex().items_center().child(
+                                    icon(Icon::MessageSquare, 11.).text_color(theme::primary()),
+                                ))
+                                .child(div().flex_1().min_w_0().truncate().child(title))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        // Same body as lib.rs's private select_thread.
+                                        this.thread_items.clear();
+                                        this.turn_started_at = None;
+                                        if let Some(commands) = &this.commands {
+                                            let _ = commands.send(ClientCommand::SubscribeThread {
+                                                thread_id: tid.clone(),
+                                            });
+                                        }
+                                        this.state.selected = Some(tid.clone().into());
+                                        cx.notify();
+                                    }),
+                                ),
+                        );
                 }
                 block = block.child(box_);
             }
@@ -2644,7 +2743,7 @@ impl AppView {
                     .text_color(theme::primary())
                     .hover(|h| h.bg(theme::hover()))
                     .child("Open on GitHub")
-                    .child("↗")
+                    .child(icon(Icon::ExternalLink, 11.).text_color(theme::primary()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |_this, _ev, _window, cx| {
@@ -2657,24 +2756,36 @@ impl AppView {
     }
 }
 
-/// Small clickable ghost button for the status-card action row.
+/// Small clickable ghost button for the status-card action row — an
+/// optional 11px leading icon like the web's `Button variant=ghost` with
+/// a lucide prefix.
 fn action_button(
     id: &'static str,
+    leading: Option<Icon>,
     label: &'static str,
     busy: bool,
     listener: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
     let mut b = div()
         .id(id)
+        .flex()
+        .items_center()
+        .gap_1()
         .px_1p5()
         .py_0p5()
         .rounded_sm()
         .text_xs()
         .text_color(theme::fg_muted());
     if !busy {
-        b = b.cursor_pointer().hover(|h| h.bg(theme::hover()));
+        b = b
+            .cursor_pointer()
+            .hover(|h| h.bg(theme::hover()).text_color(theme::fg()));
     }
-    b.child(label).on_mouse_down(MouseButton::Left, listener)
+    b.when_some(leading, |b, leading| {
+        b.child(icon(leading, 11.).text_color(theme::fg_muted()))
+    })
+    .child(label)
+    .on_mouse_down(MouseButton::Left, listener)
 }
 
 /// Small muted badge used for "default"/"remote"/"worktree"/"review"/labels.

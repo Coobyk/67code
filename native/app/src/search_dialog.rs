@@ -825,7 +825,10 @@ impl AppView {
         } else {
             el = el.hover(|s| s.bg(theme::accent_soft()));
         }
-        el.child(
+        el.child(div().flex_none().flex().items_center().child(
+            crate::icons::icon(crate::icons::Icon::FileText, 12.).text_color(theme::icon_muted()),
+        ))
+        .child(
             div()
                 .flex_none()
                 .font_weight(gpui::FontWeight::MEDIUM)
@@ -1103,11 +1106,10 @@ impl AppView {
                     .min_h(px(46.))
                     .text_sm()
                     .child(
-                        div()
-                            .flex_none()
-                            .w(px(16.))
-                            .text_color(theme::icon_muted())
-                            .child("⌕"),
+                        div().flex_none().w(px(16.)).flex().items_center().child(
+                            crate::icons::icon(crate::icons::Icon::Search, 14.)
+                                .text_color(theme::icon_muted()),
+                        ),
                     )
                     .child(
                         div()

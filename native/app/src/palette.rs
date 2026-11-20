@@ -1340,11 +1340,10 @@ impl AppView {
                     .min_h(px(46.))
                     .text_sm()
                     .child(
-                        div()
-                            .flex_none()
-                            .w(px(16.))
-                            .text_color(theme::icon_muted())
-                            .child("⌕"),
+                        div().flex_none().w(px(16.)).flex().items_center().child(
+                            crate::icons::icon(crate::icons::Icon::Search, 14.)
+                                .text_color(theme::icon_muted()),
+                        ),
                     )
                     .child(
                         div()

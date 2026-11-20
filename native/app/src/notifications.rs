@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, deferred, div, prelude::*,
-    px, rgb,
+    AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, Svg, deferred, div,
+    prelude::*, px, rgb, svg,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::net::ShellEvent;
 use crate::{AppView, theme};
@@ -29,15 +30,34 @@ pub enum ToastKind {
     Approval,
 }
 
+/// Lucide `circle-check` — not in the bundled icon set; the web toast's
+/// success glyph (CircleCheckIcon).
+const CIRCLE_CHECK_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m9 12 2 2 4-4\"/></svg>";
+
 impl ToastKind {
-    /// Left accent-bar color; mirrors the sidebar status-dot palette.
-    fn accent(self) -> Rgba {
+    /// Semantic icon tint — the web toast's `--info`/`--success`/etc.
+    /// foreground colors (sonner-style leading glyph).
+    fn icon_color(self) -> Rgba {
         match self {
-            ToastKind::Info => theme::primary(),
-            ToastKind::Success => rgb(0x34d399),
+            ToastKind::Info => theme::info(),
+            ToastKind::Success => theme::success_fg(),
             ToastKind::Error => rgb(0xf87171),
             ToastKind::Approval => rgb(0xfbbf24),
         }
+    }
+
+    /// Leading glyph — the web toast's per-kind lucide icon (error →
+    /// CircleAlert, info → Info, success → CircleCheck, warning →
+    /// TriangleAlert).
+    fn icon(self) -> Svg {
+        let color = self.icon_color();
+        match self {
+            ToastKind::Info => icon(Icon::Info, 15.),
+            ToastKind::Success => svg().data(CIRCLE_CHECK_SVG).w(px(15.)).h(px(15.)),
+            ToastKind::Error => icon(Icon::CircleAlert, 15.),
+            ToastKind::Approval => icon(Icon::TriangleAlert, 15.),
+        }
+        .text_color(color)
     }
 }
 
@@ -688,7 +708,9 @@ impl AppView {
         );
     }
 
-    /// Transient toast stack rendered above the composer, bottom-right.
+    /// Transient toast stack — web `ToastProvider` default "top-right":
+    /// `top = --toast-inset + --workspace-topbar-height` (32 + 52 = 84px),
+    /// `right = --toast-inset` (32px), max width 360px.
     pub fn render_notifications(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let toasts: Vec<AnyElement> = self
             .notifications_state
@@ -696,12 +718,11 @@ impl AppView {
             .iter()
             .map(|toast| self.render_toast(toast, cx))
             .collect();
-        // Web viewport: `max-w-90` (360px), sm inset `--spacing(8)` (32px).
         deferred(
             div()
                 .absolute()
+                .top(px(84.))
                 .right(px(32.))
-                .bottom(px(140.))
                 .flex()
                 .flex_col()
                 .items_end()
@@ -712,27 +733,35 @@ impl AppView {
     }
 
     /// One toast — web `Toast.Content`: `dropdown-glass rounded-lg shadow-xl`
-    /// card, `pl-3.5 py-2.5 text-sm` body, `font-medium` title, muted
-    /// description, xs-size action button.
+    /// card with a semantic leading icon (per-kind lucide, sonner-style),
+    /// `font-medium` title, muted description, xs primary action button, and
+    /// the corner `bg-popover/92` dismiss orb at `-top-1.5 -right-1.5`.
     fn render_toast(&self, toast: &Toast, cx: &mut Context<Self>) -> AnyElement {
         let dismiss_id = toast.id;
         let mut card = div()
             .id(("toast", toast.id as usize))
             .w(px(360.))
+            .relative()
             .flex()
             .rounded_lg()
             .bg(theme::raised())
             .border_1()
             .border_color(theme::border())
             .shadow_xl()
-            .overflow_hidden()
             .occlude()
-            .child(div().w(px(3.)).flex_shrink_0().bg(toast.kind.accent()))
+            .child(
+                div()
+                    .pl_3p5()
+                    .pt_2p5()
+                    .flex_none()
+                    .text_color(toast.kind.icon_color())
+                    .child(toast.kind.icon()),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl_3p5()
+                    .pl_2()
                     .pr_3()
                     .py_2p5()
                     .flex()
@@ -758,6 +787,8 @@ impl AppView {
                     .when_some(toast.action.clone(), |d, action| {
                         let action_label = action.label().to_string();
                         d.child(
+                            // Web `Button size=xs` default variant — primary
+                            // fill + `hover:bg-primary/90`.
                             div()
                                 .id(("toast-action", toast.id as usize))
                                 .h(px(24.))
@@ -767,12 +798,12 @@ impl AppView {
                                 .mt_1()
                                 .self_start()
                                 .rounded_md()
-                                .bg(theme::kbd_bg())
+                                .bg(theme::primary())
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme::fg())
+                                .text_color(gpui::white())
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme::hover()))
+                                .hover(|s| s.bg(theme::primary_hover()))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _event, _window, cx| {
@@ -786,21 +817,25 @@ impl AppView {
                     }),
             )
             .child(
+                // Web `ToastCloseButton`: 24px popover/92 orb with a
+                // border/60 hairline pinned at the card's top-right corner.
                 div()
                     .id(("toast-dismiss", toast.id as usize))
+                    .absolute()
+                    .top(px(-6.))
+                    .right(px(-6.))
                     .w(px(24.))
                     .h(px(24.))
-                    .mt_1()
-                    .mr_1()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .flex_shrink_0()
                     .rounded_full()
+                    .border_1()
+                    .border_color(theme::toast_orb_border())
+                    .bg(theme::popover_92())
                     .cursor_pointer()
-                    .text_sm()
                     .text_color(theme::fg_muted())
-                    .hover(|s| s.text_color(theme::fg()).bg(theme::accent()))
+                    .hover(|s| s.text_color(theme::fg()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
@@ -808,7 +843,7 @@ impl AppView {
                             this.dismiss_toast(dismiss_id, cx);
                         }),
                     )
-                    .child("×"),
+                    .child(icon(Icon::X, 11.).text_color(theme::fg_muted())),
             );
 
         // Toasts about a thread navigate to it when the body is clicked.

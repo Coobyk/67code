@@ -14,7 +14,7 @@
 //! with `&mut self` as usual.
 // INTEGRATE: web refreshes the tree on `workspaceMutationId` bumps (agent
 // edits). When a mutation-refresh hook exists, call `explorer_refresh` so
-// agent-written files appear without a manual ↻.
+// agent-written files appear without a manual refresh.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use gpui::{
 };
 use serde_json::{Value, json};
 
+use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::net::ServerEndpoint;
 use crate::{AppView, theme};
@@ -72,15 +73,12 @@ enum ExternalKind {
 }
 
 impl ExternalKind {
-    fn emoji(self) -> &'static str {
+    /// Bundled lucide glyph for the external-file card (documents →
+    /// FileText, media/binaries → File).
+    fn glyph(self) -> Icon {
         match self {
-            Self::Pdf => "📕",
-            Self::Office => "📄",
-            Self::Notebook => "📓",
-            Self::Font => "🔤",
-            Self::Audio => "🎵",
-            Self::Video => "🎬",
-            Self::Binary => "📦",
+            Self::Pdf | Self::Office | Self::Notebook | Self::Font => Icon::FileText,
+            Self::Audio | Self::Video | Self::Binary => Icon::File,
         }
     }
 
@@ -1130,12 +1128,16 @@ impl AppView {
                 .child(
                     div()
                         .id("explorer-refresh")
-                        .px_1p5()
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded_sm()
                         .cursor_pointer()
                         .text_color(theme::fg_muted())
                         .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .child("↻")
+                        .child(icon(Icon::RefreshCw, 12.).text_color(theme::fg_muted()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _ev, _w, cx| this.explorer_refresh(cx)),
@@ -1219,13 +1221,20 @@ impl AppView {
     ) -> gpui::Stateful<Div> {
         let is_selected =
             !row.is_dir && self.explorer_state.selected.as_deref() == Some(row.path.as_str());
-        let chevron = if row.is_dir {
-            if row.expanded { "▾" } else { "▸" }
-        } else {
-            ""
-        };
         let path = row.path.clone();
         let is_dir = row.is_dir;
+        // Pierre FileTree glyphs: 13px carets (ChevronRight/ChevronDown) in
+        // --trees-fg-muted, then the type icon — FolderOpen/Folder for dirs,
+        // File for files — with ignored names dimmed to --trees-fg at 40%.
+        let type_icon = if row.is_dir {
+            if row.expanded {
+                Icon::FolderOpen
+            } else {
+                Icon::Folder
+            }
+        } else {
+            Icon::File
+        };
         // Pierre trees: 30px rows (--trees-item-height), 8px level gap,
         // 8px item padding-x, radius-md, fg·7% hover / fg·12% selected.
         let mut el = div()
@@ -1250,14 +1259,39 @@ impl AppView {
                     }
                 }),
             )
-            // 16px caret/icon lane (--trees-icon-width) + 6px row gap.
+            // 16px caret lane (--trees-icon-width) — chevron for dirs only.
             .child(
                 div()
                     .w(px(16.))
-                    .pr(px(6.))
                     .flex_none()
-                    .text_color(theme::fg_muted())
-                    .child(chevron),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(row.is_dir, |el| {
+                        el.child(
+                            if row.expanded {
+                                icon(Icon::ChevronDown, 13.)
+                            } else {
+                                icon(Icon::ChevronRight, 13.)
+                            }
+                            .text_color(theme::tree_chevron_fg()),
+                        )
+                    }),
+            )
+            // Type icon + 6px row gap.
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mr(px(6.))
+                    .child(icon(type_icon, 14.).text_color(if row.is_dir {
+                        theme::fg_muted()
+                    } else {
+                        theme::tree_icon_fg()
+                    })),
             )
             .child(
                 div()
@@ -1265,10 +1299,10 @@ impl AppView {
                     .min_w_0()
                     .overflow_x_hidden()
                     .text_ellipsis()
-                    // Web tree: git-ignored names dim to muted-fg;
+                    // Web tree: git-ignored names dim to --trees-fg at 40%;
                     // directories keep the normal foreground.
                     .text_color(if row.ignored {
-                        theme::fg_muted()
+                        theme::tree_ignored()
                     } else {
                         theme::fg()
                     })
@@ -1279,8 +1313,7 @@ impl AppView {
                 div()
                     .flex_none()
                     .pl_1()
-                    .text_color(theme::fg_muted())
-                    .child("…"),
+                    .child(icon(Icon::LoaderCircle, 12.).text_color(theme::tree_chevron_fg())),
             );
         }
         if let Some(err) = &row.error {
@@ -1394,7 +1427,9 @@ impl AppView {
                                 } else {
                                     theme::fg_muted()
                                 })
-                                .child(if dirty { "●" } else { "○" })
+                                .when(dirty, |el| {
+                                    el.child(icon(Icon::Dot, 14.).text_color(gpui::rgb(0xf5a97f)))
+                                })
                                 .child(if ed.saving {
                                     "saving…"
                                 } else if dirty {
@@ -1443,12 +1478,16 @@ impl AppView {
                         div()
                             .id("explorer-preview-close")
                             .flex_none()
-                            .px_1()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded_sm()
                             .cursor_pointer()
                             .text_color(theme::fg_muted())
                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                            .child("✕")
+                            .child(icon(Icon::X, 12.).text_color(theme::fg_muted()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _w, cx| {
@@ -1525,7 +1564,7 @@ impl AppView {
                     .gap_2()
                     .p_4()
                     .text_color(theme::fg_muted())
-                    .child(div().text_xl().child(kind.emoji()))
+                    .child(div().child(icon(kind.glyph(), 32.).text_color(theme::icon_muted())))
                     .child(
                         div()
                             .font_family(theme::FONT_MONO)

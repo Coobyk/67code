@@ -35,6 +35,7 @@ use gpui::{
 };
 use serde_json::{Value, json};
 
+use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::notifications::ToastKind;
 use crate::{AppView, theme};
@@ -1991,12 +1992,7 @@ impl AppView {
             .border_b_1()
             .border_color(theme::border())
             .text_xs()
-            .child(
-                div()
-                    .text_color(theme::fg_muted())
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("❯"),
-            );
+            .child(icon(Icon::Terminal, 12.).text_color(theme::fg_muted()));
         match (tid.as_ref(), session_info.as_ref()) {
             (Some(_), Some((label, status, pid, dot, _dead))) => {
                 header = header.child(div().text_color(theme::fg()).child(label.clone()));
@@ -2034,7 +2030,7 @@ impl AppView {
         header = header.child(div().flex_1());
         // +: new terminal for the selected thread.
         header = header.child(
-            drawer_button("+", "new-terminal")
+            drawer_button(Icon::Plus, "new-terminal")
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, _w, cx| {
@@ -2043,10 +2039,10 @@ impl AppView {
                 )
                 .into_any_element(),
         );
-        // ⟳: restart the active session.
+        // Restart the active session.
         if let (Some(t), Some(term)) = (tid.clone(), term.clone()) {
             header = header.child(
-                drawer_button("⟳", "restart-terminal")
+                drawer_button(Icon::RefreshCw, "restart-terminal")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
@@ -2057,9 +2053,9 @@ impl AppView {
                     .into_any_element(),
             );
         }
-        // ×: hide the drawer (streams stay attached — persistent terminals).
+        // Hide the drawer (streams stay attached — persistent terminals).
         header = header.child(
-            drawer_button("×", "close-drawer")
+            drawer_button(Icon::X, "close-drawer")
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, w, cx| {
@@ -2078,7 +2074,7 @@ impl AppView {
             Some((_, status, _, _, false)) if status == "running" => {
                 "type to send input · ctrl-c interrupt · ctrl-l clear"
             }
-            Some((_, _, _, _, true)) => "session ended — press ⟳ to restart",
+            Some((_, _, _, _, true)) => "session ended — use the restart button above",
             Some(_) => "connecting…",
             None => "",
         };
@@ -2093,13 +2089,13 @@ impl AppView {
             .text_xs()
             .child(
                 div()
-                    .text_color(if focused {
+                    .flex()
+                    .items_center()
+                    .child(icon(Icon::Terminal, 12.).text_color(if focused {
                         theme::primary()
                     } else {
                         theme::fg_muted()
-                    })
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("❯"),
+                    })),
             )
             .child(
                 div()
@@ -2294,17 +2290,22 @@ fn center_note(text: &str) -> Div {
         .child(text.to_string())
 }
 
-fn drawer_button(label: &str, id: &'static str) -> gpui::Stateful<Div> {
+/// Toolbar icon button — the web drawer's `size="icon"` ghost buttons
+/// (h-6 w-6, muted glyph, `hover:bg-accent` + fg).
+fn drawer_button(button_icon: Icon, id: &'static str) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .px_2()
-        .py_1()
+        .w(px(24.))
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded_sm()
         .cursor_pointer()
         .text_xs()
         .text_color(theme::fg_muted())
         .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-        .child(label.to_string())
+        .child(icon(button_icon, 13.).text_color(theme::fg_muted()))
 }
 
 // (kept small on purpose — the drawer is a fixed 280px, not drag-resizable)
@@ -2349,7 +2350,7 @@ impl AppView {
             .child("Terminals")
             .child(div().flex_1());
         header = header.child(
-            drawer_button("+", "pane-new-terminal")
+            drawer_button(Icon::Plus, "pane-new-terminal")
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, _w, cx| {
@@ -2409,13 +2410,53 @@ impl AppView {
             .gap_1();
 
         if mine.is_empty() {
-            list = list.child(div().p_2().text_xs().text_color(theme::fg_muted()).child(
-                if connected {
-                    "No terminals on this thread — press + to open one.".to_string()
-                } else {
-                    "Connect to a server to list terminals.".to_string()
-                },
-            ));
+            if connected {
+                // Web drawer empty state: centered text-sm muted copy + an
+                // outline xs "New terminal" button.
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .px_4()
+                        .py_6()
+                        .child(
+                            div()
+                                .text_color(theme::fg_muted())
+                                .child("No terminal sessions for this thread yet."),
+                        )
+                        .child(
+                            div()
+                                .id("empty-new-terminal")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme::border())
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::hover()))
+                                .child("New terminal")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _w, cx| {
+                                        this.terminal_new_for_selected(cx);
+                                    }),
+                                ),
+                        ),
+                );
+            } else {
+                list = list.child(
+                    div()
+                        .p_2()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child("Connect to a server to list terminals."),
+                );
+            }
         }
         for (tid, term, label, status, pid, _upd) in mine {
             list = list.child(self.render_terminal_row(tid, term, label, status, pid, cx));
@@ -2554,13 +2595,17 @@ impl AppView {
             .child(
                 div()
                     .id(format!("term-close-{thread_id}-{terminal_id}"))
-                    .px_1()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(theme::fg_muted())
                     .hover(|s| s.bg(theme::accent_soft()).text_color(theme::fg()))
-                    .child("×")
+                    .child(icon(Icon::X, 11.).text_color(theme::fg_muted()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {

@@ -520,3 +520,73 @@ pub fn hairline() -> Rgba {
 pub fn rule_color() -> Rgba {
     pick(rgb(0xa3a3a3), rgb(0xe4e4e7))
 }
+
+// ── Sidebar/menu extras (visual-polish icon pass) ─────────────────
+/// `hover:bg-destructive/10` — hover tint under a destructive menu row
+/// (contextMenuFallback / MenuItem destructive variant).
+/// dark error·10% · light error·10%
+pub fn destructive_tint() -> Rgba {
+    pick(rgba(0xf157571a), rgba(0xef44441a))
+}
+
+// ── Icon / option marks & chip accents ────────────────────────────
+/// `--context-chip-citation`: oklch(0.62 0.16 259) solved to min contrast 5
+/// over the default themes' surfaces (themePalette `contextChipVariables`).
+/// dark #4f8def · light #215fbc
+pub fn citation_accent() -> Rgba {
+    pick(rgb(0x4f8def), rgb(0x215fbc))
+}
+/// `border-foreground/55` — pending-option radio/checkbox rings and
+/// task-list checkbox outlines.
+/// dark neutral-100·55% · light zinc-900·55%
+pub fn option_mark_border() -> Rgba {
+    pick(rgba(0xf5f5f58c), rgba(0x18181b8c))
+}
+/// `text-foreground/70` — unselected pending-option labels.
+/// dark neutral-100·70% · light zinc-900·70%
+pub fn fg_dim() -> Rgba {
+    pick(rgba(0xf5f5f5b3), rgba(0x18181bb3))
+}
+/// `color-mix(--contrast-border 60%, transparent)` — `.chat-markdown`
+/// table row separators (border-bottom on th/td).
+/// dark border(white·8%)·60% ≈ white·4.8% · light zinc-200·60%
+pub fn table_rule() -> Rgba {
+    pick(rgba(0xffffff0c), rgba(0xe4e4e799))
+}
+/// `bg-destructive/30` — the failed divider rules on error/lifecycle rows.
+/// dark #f15757·30% · light #ef4444·30%
+pub fn error_rule() -> Rgba {
+    pick(rgba(0xf157574d), rgba(0xef44444d))
+}
+/// `border-warning/32`-ish ring for pending-attention chips.
+/// dark #f59e0b·33% · light #f59e0b·33%
+pub fn warning_border() -> Rgba {
+    pick(rgba(0xf59e0b55), rgba(0xf59e0b55))
+}
+
+// ── Explorer / toast polish (P4 icon + state pass) ───────────────
+/// pierre FileTree `--trees-icon-gray`: the default file-glyph stroke.
+/// dark #adadb1 · light #84848a
+pub fn tree_icon_fg() -> Rgba {
+    pick(rgb(0xadadb1), rgb(0x84848a))
+}
+/// pierre FileTree `--trees-fg-muted`: carets / "…" meta affordances.
+/// #84848a in both themes.
+pub fn tree_chevron_fg() -> Rgba {
+    rgb(0x84848a)
+}
+/// Ignored-file name ink — `--trees-fg` at ~40%.
+/// dark #4a4a4e · light #adadb1
+pub fn tree_ignored() -> Rgba {
+    pick(rgb(0x4a4a4e), rgb(0xadadb1))
+}
+/// Toast dismiss orb `bg-popover/92` (apps/web toast.tsx).
+/// dark #111·92% · light #fff·92%
+pub fn popover_92() -> Rgba {
+    pick(rgba(0x111111eb), rgba(0xffffffeb))
+}
+/// Toast orb hairline `border-border/60`.
+/// dark white·6% · light #e4e4e7·60%
+pub fn toast_orb_border() -> Rgba {
+    pick(rgba(0xffffff0f), rgba(0xe4e4e799))
+}

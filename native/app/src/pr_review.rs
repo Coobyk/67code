@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use gpui::{Context, Div, FontWeight, MouseButton, SharedString, div, prelude::*, px};
 use serde_json::{Value, json};
 
+use crate::icons::{Icon, icon};
 use crate::right_panel::Tab;
 use crate::{AppView, theme};
 
@@ -357,7 +358,7 @@ pub(crate) struct DiffState {
     pub selected: usize,
     /// Display paths the user collapsed.
     pub collapsed: BTreeSet<String>,
-    /// Payload for the ↻ refresh (`review.getDiffPreview`).
+    /// Payload for the refresh action (`review.getDiffPreview`).
     request: Option<Value>,
     /// Replies stamped with an older generation are dropped.
     pub generation: u64,
@@ -470,7 +471,7 @@ impl AppView {
         .detach();
     }
 
-    /// ↻ — resend the stored `review.getDiffPreview` request.
+    /// Resend the stored `review.getDiffPreview` request.
     fn diff_reload(&mut self, cx: &mut Context<Self>) {
         let Some(request) = self.vcs_state.diff.request.clone() else {
             return;
@@ -510,14 +511,18 @@ impl AppView {
         head = head.child(
             div()
                 .id("diff-back")
+                .flex()
+                .items_center()
+                .gap_1()
                 .px_1p5()
                 .py_0p5()
                 .rounded_sm()
                 .cursor_pointer()
                 .text_xs()
                 .text_color(theme::fg_muted())
-                .hover(|h| h.bg(theme::hover()))
-                .child("← PRs")
+                .hover(|h| h.bg(theme::hover()).text_color(theme::fg()))
+                .child(icon(Icon::ArrowLeft, 11.).text_color(theme::fg_muted()))
+                .child("PRs")
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev, _window, cx| {
@@ -543,14 +548,17 @@ impl AppView {
             head = head.child(
                 div()
                     .id("diff-refresh")
-                    .px_1p5()
-                    .py_0p5()
+                    .w(px(22.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(theme::fg_muted())
-                    .hover(|h| h.bg(theme::hover()))
-                    .child("↻")
+                    .hover(|h| h.bg(theme::hover()).text_color(theme::fg()))
+                    .child(icon(Icon::RefreshCw, 12.).text_color(theme::fg_muted()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _window, cx| {
@@ -564,13 +572,17 @@ impl AppView {
         if let Some(note) = &s.note {
             pane = pane.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .px_3()
                     .py_1p5()
                     .text_xs()
                     .text_color(theme::warning_fg())
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(format!("⚠ {note}")),
+                    .child(icon(Icon::TriangleAlert, 12.).text_color(theme::warning_fg()))
+                    .child(SharedString::from(note.clone())),
             );
         }
 
@@ -711,11 +723,14 @@ impl AppView {
                 .border_color(theme::border())
                 .hover(|h| h.bg(theme::accent_soft()))
                 .child(
-                    div()
-                        .w(px(12.))
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(if collapsed { "▸" } else { "▾" }),
+                    div().w(px(12.)).flex().items_center().child(
+                        if collapsed {
+                            icon(Icon::ChevronRight, 10.)
+                        } else {
+                            icon(Icon::ChevronDown, 10.)
+                        }
+                        .text_color(theme::fg_muted()),
+                    ),
                 )
                 .child(
                     div()

@@ -820,14 +820,21 @@ impl AppView {
                     .child(
                         div()
                             .id("center-back-chat")
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .px_2()
                             .py_0p5()
                             .rounded_sm()
                             .cursor_pointer()
                             .text_xs()
                             .text_color(theme::fg_muted())
-                            .hover(|s| s.bg(theme::hover()))
-                            .child("← Chat")
+                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                            .child(
+                                icons::icon(icons::Icon::ArrowLeft, 11.)
+                                    .text_color(theme::fg_muted()),
+                            )
+                            .child("Chat")
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, _ev, _window, cx| {
@@ -858,11 +865,12 @@ impl AppView {
 }
 
 /// Linux/Windows client-decoration buttons mirroring Electron's
-/// `titleBarOverlay` (minimize / maximize-restore / close).
+/// `titleBarOverlay` (minimize / maximize-restore / close) — 12px lucide
+/// glyphs to match the titlebar chrome size.
 fn window_controls() -> impl IntoElement {
     fn btn(
         id: &'static str,
-        glyph: &'static str,
+        control_icon: icons::Icon,
         area: WindowControlArea,
         close_danger: bool,
         handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -879,7 +887,7 @@ fn window_controls() -> impl IntoElement {
             .text_xs()
             .text_color(theme::fg_muted())
             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-            .child(glyph)
+            .child(icons::icon(control_icon, 12.).text_color(theme::fg_muted()))
             .window_control_area(area)
             .on_mouse_down(gpui::MouseButton::Left, handler);
         if close_danger {
@@ -894,21 +902,21 @@ fn window_controls() -> impl IntoElement {
         .ml_2()
         .child(btn(
             "win-min",
-            "\u{2013}",
+            icons::Icon::Minus,
             WindowControlArea::Min,
             false,
             |_ev, w, _cx| w.minimize_window(),
         ))
         .child(btn(
             "win-max",
-            "\u{25a1}",
+            icons::Icon::Maximize2,
             WindowControlArea::Max,
             false,
             |_ev, w, _cx| w.zoom_window(),
         ))
         .child(btn(
             "win-close",
-            "\u{00d7}",
+            icons::Icon::X,
             WindowControlArea::Close,
             true,
             |_ev, w, _cx| w.remove_window(),
@@ -1046,14 +1054,20 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("terminal-drawer-toggle")
-                                            .px_2()
-                                            .py_1()
+                                            .w_6()
+                                            .h_6()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
                                             .rounded_sm()
                                             .cursor_pointer()
                                             .text_xs()
                                             .text_color(theme::fg_muted())
-                                            .hover(|s| s.bg(theme::hover()))
-                                            .child("❯_")
+                                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                            .child(
+                                                icons::icon(icons::Icon::Terminal, 14.)
+                                                    .text_color(theme::fg_muted()),
+                                            )
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, w, cx| {
@@ -1065,14 +1079,20 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("right-panel-toggle")
-                                            .px_2()
-                                            .py_1()
+                                            .w_6()
+                                            .h_6()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
                                             .rounded_sm()
                                             .cursor_pointer()
                                             .text_xs()
                                             .text_color(theme::fg_muted())
-                                            .hover(|s| s.bg(theme::hover()))
-                                            .child("▤")
+                                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                            .child(
+                                                icons::icon(icons::Icon::PanelRight, 14.)
+                                                    .text_color(theme::fg_muted()),
+                                            )
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, _w, cx| {
