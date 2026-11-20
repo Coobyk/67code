@@ -544,6 +544,26 @@ impl AppView {
                     SharedString::from(s.title.clone())
                 }),
         );
+        // Web header cluster: diff stat label (+N −N), refresh, then the
+        // collapse/expand-all-files toggle when a diff is loaded.
+        let selected_src = s.sources.get(s.selected);
+        if let Some(src) = selected_src {
+            let adds: usize = src.files.iter().map(|f| f.adds).sum();
+            let dels: usize = src.files.iter().map(|f| f.dels).sum();
+            if adds + dels > 0 {
+                head = head.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .mr_1()
+                        .text_xs()
+                        .child(div().text_color(add_count()).child(format!("+{adds}")))
+                        .child(div().text_color(del_count()).child(format!("−{dels}"))),
+                );
+            }
+        }
         if s.request.is_some() {
             head = head.child(
                 div()
@@ -566,6 +586,59 @@ impl AppView {
                         }),
                     ),
             );
+        }
+        if let Some(src) = selected_src {
+            if !src.files.is_empty() {
+                let all_collapsed = src.files.iter().all(|f| s.collapsed.contains(&f.path));
+                head = head.child(
+                    div()
+                        .id("diff-collapse-all")
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .hover(|h| h.bg(theme::hover()).text_color(theme::fg()))
+                        .child(
+                            icon(
+                                if all_collapsed {
+                                    Icon::ChevronsUpDown
+                                } else {
+                                    Icon::ChevronsDownUp
+                                },
+                                12.,
+                            )
+                            .text_color(theme::fg_muted()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                let Some(src) = this
+                                    .vcs_state
+                                    .diff
+                                    .sources
+                                    .get(this.vcs_state.diff.selected)
+                                else {
+                                    return;
+                                };
+                                let paths: Vec<String> =
+                                    src.files.iter().map(|f| f.path.clone()).collect();
+                                if all_collapsed {
+                                    for p in &paths {
+                                        this.vcs_state.diff.collapsed.remove(p);
+                                    }
+                                } else {
+                                    this.vcs_state.diff.collapsed.extend(paths);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
         }
         pane = pane.child(head);
 
@@ -603,7 +676,8 @@ impl AppView {
             return pane.child(super::muted_status_row(if s.title.is_empty() {
                 "Open a diff from the pull-requests pane."
             } else {
-                "No changes."
+                // Web DiffPanel empty-net-diff copy.
+                "No net changes in this selection."
             }));
         }
 
@@ -652,7 +726,9 @@ impl AppView {
         }
 
         let Some(src) = s.sources.get(s.selected) else {
-            return pane.child(super::muted_status_row("No changes."));
+            return pane.child(super::muted_status_row(
+                "No patch available for this selection.",
+            ));
         };
 
         if !src.base_ref.is_empty() {

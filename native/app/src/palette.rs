@@ -23,6 +23,7 @@ use gpui::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::net::ClientCommand;
 use crate::notifications::ToastKind;
@@ -126,14 +127,42 @@ struct SearchHit {
 struct Row {
     entry: Entry,
     section: &'static str,
+    /// Leading 16px lucide glyph (`ITEM_ICON_CLASS` in the web palette).
+    icon: Icon,
     label: String,
+    /// Second line under the title (web `item.description`).
     detail: Option<String>,
-    /// Keyboard-hint chip on the right edge.
+    /// Right-edge keyboard hint — web `CommandShortcut` (plain text-xs).
     hint: Option<&'static str>,
+    /// Right-edge relative timestamp (web `item.timestamp`, thread rows).
+    timestamp: Option<String>,
     /// Disabled rows render dimmed and are skipped by keyboard navigation.
     enabled: bool,
     /// Render in the destructive color (armed delete confirmation).
     danger: bool,
+}
+
+/// `ITEM_ICON_CLASS` — the web palette maps every item kind to a lucide
+/// glyph; mirror that mapping for the native command/thread/search rows.
+fn row_icon(entry: &Entry) -> Icon {
+    match entry {
+        Entry::Thread(_) => Icon::MessagesSquare,
+        Entry::Command(kind) => match kind {
+            CommandKind::NewThread => Icon::SquarePen,
+            CommandKind::OpenSettings => Icon::Settings,
+            CommandKind::Archive => Icon::Archive,
+            CommandKind::Pin => Icon::Pin,
+            CommandKind::Rename => Icon::Pencil,
+            CommandKind::Delete => Icon::Trash2,
+            CommandKind::Stop => Icon::CircleStop,
+            CommandKind::Triage => Icon::Bug,
+            CommandKind::OpenInWindow => Icon::AppWindow,
+            CommandKind::ConnectToServer => Icon::Plug,
+            CommandKind::UsageView => Icon::ChartNoAxesColumn,
+            CommandKind::PullRequestsView => Icon::GitPullRequest,
+        },
+        Entry::SearchHit(_) => Icon::FileSearch,
+    }
 }
 
 /// Case-insensitive subsequence match — every query char appears in order.
@@ -147,7 +176,8 @@ fn fuzzy_match(query: &str, haystack: &str) -> bool {
 
 /// Read a text field's contents when no `&mut Window` is on the update stack
 /// (entity observers run with `&mut App` only). Same approach sidebar.rs uses.
-fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
+/// Shared with settings.rs's nav search field.
+pub(crate) fn field_text(field: &Entity<TextField>, cx: &mut Context<AppView>) -> String {
     if let Some(text) = cx
         .with_window(field.entity_id(), |window, app| {
             field.update(app, |field, cx| {
@@ -182,7 +212,8 @@ impl AppView {
         if self.palette_state.field.is_some() {
             return;
         }
-        let field = cx.new(|cx| TextField::new("Search threads and commands…", cx));
+        // Web `getCommandPaletteInputPlaceholder("root")`.
+        let field = cx.new(|cx| TextField::new("Search commands, projects, and threads...", cx));
 
         // Keep the plain-string query mirror in sync so `&self` render can
         // filter. A changed query resets highlight + delete arming.
@@ -474,50 +505,13 @@ impl AppView {
         cx.notify();
     }
 
-    /// The flat list of result rows for the current query, threads first.
+    /// The flat list of result rows — web `buildRootGroups` order: the
+    /// "Actions" group first, then "Recent Threads", then project-search
+    /// hits while filtering.
     fn palette_rows(&self) -> Vec<Row> {
         let query = self.palette_state.query.trim();
         let filtering = !query.is_empty();
         let mut rows = Vec::new();
-
-        let mut threads: Vec<&crate::model::Thread> = self.state.threads.iter().collect();
-        threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let mut thread_count = 0usize;
-        for thread in threads {
-            let limit = if filtering {
-                FILTERED_THREAD_LIMIT
-            } else {
-                RECENT_THREAD_LIMIT
-            };
-            if thread_count >= limit {
-                break;
-            }
-            let project = self
-                .state
-                .projects
-                .iter()
-                .find(|p| p.id == thread.project_id)
-                .map(|p| p.name.to_string())
-                .unwrap_or_default();
-            let haystack = format!("{} {}", thread.title, project);
-            if filtering && !fuzzy_match(query, &haystack) {
-                continue;
-            }
-            thread_count += 1;
-            rows.push(Row {
-                entry: Entry::Thread(thread.id.clone()),
-                section: if filtering {
-                    "Threads"
-                } else {
-                    "Recent threads"
-                },
-                label: thread.title.to_string(),
-                detail: (!project.is_empty()).then_some(project),
-                hint: None,
-                enabled: true,
-                danger: false,
-            });
-        }
 
         let selected = self.state.selected_thread();
         let has_thread = selected.is_some();
@@ -631,9 +625,11 @@ impl AppView {
                 continue;
             }
             let armed = kind == CommandKind::Delete && self.palette_state.delete_confirm;
+            let entry = Entry::Command(kind);
             rows.push(Row {
-                entry: Entry::Command(kind),
-                section: "Commands",
+                icon: row_icon(&entry),
+                entry,
+                section: "Actions",
                 label: if armed {
                     "Confirm delete thread".to_string()
                 } else {
@@ -645,8 +641,54 @@ impl AppView {
                     detail.map(str::to_string)
                 },
                 hint,
+                timestamp: None,
                 enabled,
                 danger: armed,
+            });
+        }
+
+        // Web `recent-threads` group — `MessageSquareIcon` rows with the
+        // project/branch description line and a relative-time trailing label.
+        let mut threads: Vec<&crate::model::Thread> = self.state.threads.iter().collect();
+        threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let mut thread_count = 0usize;
+        for thread in threads {
+            let limit = if filtering {
+                FILTERED_THREAD_LIMIT
+            } else {
+                RECENT_THREAD_LIMIT
+            };
+            if thread_count >= limit {
+                break;
+            }
+            let project = self
+                .state
+                .projects
+                .iter()
+                .find(|p| p.id == thread.project_id)
+                .map(|p| p.name.to_string())
+                .unwrap_or_default();
+            let haystack = format!("{} {}", thread.title, project);
+            if filtering && !fuzzy_match(query, &haystack) {
+                continue;
+            }
+            thread_count += 1;
+            let entry = Entry::Thread(thread.id.clone());
+            rows.push(Row {
+                icon: row_icon(&entry),
+                entry,
+                section: if filtering {
+                    "Threads"
+                } else {
+                    "Recent Threads"
+                },
+                label: thread.title.to_string(),
+                detail: (!project.is_empty()).then_some(project),
+                hint: None,
+                timestamp: Some(crate::vcs::relative_time(&thread.updated_at))
+                    .filter(|t| !t.is_empty()),
+                enabled: true,
+                danger: false,
             });
         }
 
@@ -654,21 +696,28 @@ impl AppView {
         if filtering {
             for hit in &self.palette_state.search_results {
                 match hit.line_number {
-                    None => rows.push(Row {
-                        entry: Entry::SearchHit(hit.path.clone()),
-                        section: "Files",
-                        label: hit.path.clone(),
-                        detail: None,
-                        hint: None,
-                        enabled: true,
-                        danger: false,
-                    }),
+                    None => {
+                        let entry = Entry::SearchHit(hit.path.clone());
+                        rows.push(Row {
+                            icon: Icon::FileSearch,
+                            entry,
+                            section: "Files",
+                            label: hit.path.clone(),
+                            detail: None,
+                            hint: None,
+                            timestamp: None,
+                            enabled: true,
+                            danger: false,
+                        });
+                    }
                     Some(line_number) => rows.push(Row {
+                        icon: Icon::FileText,
                         entry: Entry::SearchHit(hit.path.clone()),
                         section: "Matching content",
                         label: format!("{}:{line_number}", hit.path),
                         detail: Some(hit.line.trim().chars().take(80).collect()),
                         hint: None,
+                        timestamp: None,
                         enabled: true,
                         danger: false,
                     }),
@@ -676,11 +725,13 @@ impl AppView {
             }
             if self.palette_state.search_pending {
                 rows.push(Row {
+                    icon: Icon::LoaderCircle,
                     entry: Entry::SearchHit(String::new()),
                     section: "Files",
                     label: "Searching project…".to_string(),
                     detail: None,
                     hint: None,
+                    timestamp: None,
                     enabled: false,
                     danger: false,
                 });
@@ -1146,7 +1197,10 @@ impl AppView {
     }
 
     /// One result row — the web `CommandItem`: `min-h-7 px-2 py-1.5 rounded-sm
-    /// gap-2 text-sm`, highlighted `bg-foreground/[0.09]`.
+    /// gap-2 text-sm`, highlighted `bg-foreground/[0.09]`, leading
+    /// `CommandPaletteTitleIcon` (16px glyph in an h-5 top-aligned slot),
+    /// two-line `title + description` content column, then a timestamp or
+    /// `CommandShortcut` at the right edge.
     fn render_palette_row(
         &self,
         row: &Row,
@@ -1158,6 +1212,7 @@ impl AppView {
         let mut el = div()
             .id(("palette-row", dom_id))
             .flex()
+            .flex_none()
             .items_center()
             .gap_2()
             .px_2()
@@ -1171,7 +1226,8 @@ impl AppView {
         if row.enabled {
             el = el.cursor_pointer();
         } else {
-            el = el.opacity(0.45);
+            // Web disabled rows: `opacity-64`.
+            el = el.opacity(0.64);
         }
         if let Some(ix) = enabled_index {
             el = el
@@ -1189,45 +1245,80 @@ impl AppView {
                     }
                 }));
         }
-        el.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .whitespace_nowrap()
-                .overflow_x_hidden()
-                .text_ellipsis()
-                .text_color(if row.danger {
-                    gpui::rgb(0xf87171)
-                } else if row.enabled {
-                    theme::fg()
-                } else {
-                    theme::fg_muted()
-                })
-                .child(SharedString::from(row.label.clone())),
-        )
-        .when_some(row.detail.clone(), |el, detail| {
-            el.child(
+        let title_color = if row.danger {
+            gpui::rgb(0xf87171)
+        } else if row.enabled {
+            theme::fg()
+        } else {
+            theme::fg_muted()
+        };
+        el = el
+            // `CommandPaletteTitleIcon`: h-5 shrink-0 self-start pt-0.5 —
+            // keep the glyph on the title line for two-line rows.
+            .child(
                 div()
                     .flex_none()
-                    .max_w(px(200.))
-                    .truncate()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(detail),
+                    .w(px(16.))
+                    .h(px(20.))
+                    .pt(px(2.))
+                    .flex()
+                    .items_start()
+                    .child(icon(row.icon, 16.).text_color(theme::icon_muted())),
             )
-        })
-        // `CommandShortcut`: plain text-xs font-medium text-secondary-label
-        // at the row's right edge — no chip box.
-        .when_some(row.hint, |el, hint| {
-            el.child(
+            .child(
                 div()
-                    .flex_none()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme::secondary_label())
-                    .child(hint),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(18.))
+                            .truncate()
+                            .text_color(title_color)
+                            .child(SharedString::from(row.label.clone())),
+                    )
+                    .when_some(row.detail.clone(), |col, detail| {
+                        col.child(
+                            div()
+                                // Explicit height — the nowrap+ellipsis text
+                                // measures ~0 in a scroll list, letting it
+                                // paint over the next row otherwise.
+                                .h(px(15.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted_soft())
+                                .child(detail),
+                        )
+                    }),
             )
-        })
+            // `item.timestamp`: `min-w-12 text-right text-xs tabular-nums
+            // text-muted-foreground/70`.
+            .when_some(row.timestamp.clone(), |el, ts| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .min_w(px(48.))
+                        .flex()
+                        .justify_end()
+                        .text_xs()
+                        .text_color(theme::fg_muted_soft())
+                        .child(ts),
+                )
+            })
+            // `CommandShortcut`: plain text-xs font-medium text-secondary-label
+            // at the row's right edge — no chip box.
+            .when_some(row.hint, |el, hint| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::secondary_label())
+                        .child(hint),
+                )
+            });
+        el
     }
 
     pub fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1264,18 +1355,24 @@ impl AppView {
             let mut enabled_ix = 0usize;
             let mut highlighted_child = None;
             let mut last_section = "";
+            let mut first_section = true;
             for row in &rows {
                 if row.section != last_section {
                     last_section = row.section;
-                    list = list.child(
-                        div()
-                            .px_2()
-                            .py_1p5()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme::fg_muted())
-                            .child(row.section),
-                    );
+                    // Web `CommandPaletteResults` separates groups with
+                    // `pt-1.5` on every group after the first.
+                    let mut label = div()
+                        .px_2()
+                        .py_1p5()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg_muted())
+                        .child(row.section);
+                    if !first_section {
+                        label = label.pt_1p5();
+                    }
+                    first_section = false;
+                    list = list.child(label);
                     child_ix += 1;
                 }
                 let enabled_index = if row.enabled {
@@ -1292,13 +1389,17 @@ impl AppView {
                 child_ix += 1;
             }
             if rows.is_empty() {
+                // `CommandPaletteEmptyState`: py-10 text-center text-sm
+                // text-muted-foreground.
                 list = list.child(
                     div()
+                        .flex()
+                        .justify_center()
                         .px_3()
-                        .py_3()
-                        .text_xs()
+                        .py_10()
+                        .text_sm()
                         .text_color(theme::fg_muted())
-                        .child("No results"),
+                        .child("No matching commands, projects, or threads."),
                 );
             }
             if let Some(ix) = highlighted_child {
@@ -1356,28 +1457,29 @@ impl AppView {
         }
 
         // `CommandFooter`: border-t fg/7% over fg/2.5%, px-4 py-2.5, text-sm
-        // font-medium muted — kbd chips `bg-foreground/[0.08]` + labels.
-        let footer_hint = |keys: &'static str, label: &'static str| {
+        // font-medium muted — `Kbd` chips `bg-foreground/[0.08]` fg text,
+        // `KbdGroup`s [↑][↓] Navigate · [Enter] Select · [Esc] Close.
+        let kbd = |content: gpui::AnyElement| {
             div()
+                .h(px(20.))
+                .min_w(px(20.))
                 .flex()
                 .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .h(px(20.))
-                        .min_w(px(20.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(theme::kbd_bg())
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme::fg())
-                        .child(keys),
-                )
-                .child(div().text_color(theme::fg_muted()).child(label))
+                .justify_center()
+                .px_1()
+                .rounded_sm()
+                .bg(theme::kbd_bg())
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .child(content)
+        };
+        let footer_hint = |label: &'static str, chips: Vec<gpui::AnyElement>| {
+            let mut group = div().flex().items_center().gap_1();
+            for chip in chips {
+                group = group.child(kbd(chip));
+            }
+            group.child(div().text_color(theme::fg_muted()).text_sm().child(label))
         };
         panel = panel.child(body).child(
             div()
@@ -1389,11 +1491,21 @@ impl AppView {
                 .border_t_1()
                 .border_color(theme::command_footer_border())
                 .bg(theme::command_footer_bg())
-                .text_xs()
+                .text_sm()
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .child(footer_hint("↑↓", "Navigate"))
-                .child(footer_hint("↵", "Select"))
-                .child(footer_hint("esc", "Close")),
+                .child(footer_hint(
+                    "Navigate",
+                    vec![
+                        icon(Icon::ArrowUp, 12.)
+                            .text_color(theme::fg())
+                            .into_any_element(),
+                        icon(Icon::ArrowDown, 12.)
+                            .text_color(theme::fg())
+                            .into_any_element(),
+                    ],
+                ))
+                .child(footer_hint("Select", vec!["Enter".into_any_element()]))
+                .child(footer_hint("Close", vec!["Esc".into_any_element()])),
         );
 
         // Full-window dimmed backdrop; a click outside the panel dismisses.

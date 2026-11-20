@@ -7,7 +7,7 @@
 //! and offers "Open in browser" via `xdg-open`. There is no embedded
 //! webview — the GPUI client doesn't pretend to render pages.
 
-use gpui::{Context, Div, MouseButton, div, prelude::*, px};
+use gpui::{Context, Div, MouseButton, ScrollHandle, div, point, prelude::*, px};
 use serde_json::{Value, json};
 
 use crate::AppView;
@@ -63,6 +63,9 @@ pub struct State {
     pub tab: Option<Tab>,
     /// Browser-preview pane (preview.list).
     pub browser: BrowserState,
+    /// Horizontal scroll position of the tab strip (overflow at the
+    /// web-matching 280px width is real — the strip scrolls, like the web).
+    pub tab_scroll: ScrollHandle,
 }
 
 /// Reduce a `PreviewSessionSnapshot` to a display row.
@@ -102,14 +105,19 @@ impl AppView {
             Tab::Diff => self.render_diff_pane(cx).into_any_element(),
             Tab::Browser => self.render_browser_pane(cx).into_any_element(),
         };
-        // Web parity note: the real right panel (`usePreviewPanelInlineSize`)
-        // is user-resizable — min 360px, default 540px, max 70% of the
-        // container. The 280px `--thread-details-panel-width` variable covers
-        // the thread-details/find-bar popover, not this surface. A fixed
-        // 380px keeps us inside the web's supported range without losing a
-        // third of a typical 1200px window to the default.
+        // Web parity: measured on the 1280×800 dark reference the right
+        // panel runs exactly 280px (`--thread-details-panel-width: 17.5rem`,
+        // apps/web/src/index.css:132; THREAD_DETAILS_CARD_WIDTH = 280). At
+        // that width five tab pills overflow, so the strip scrolls with ‹ ›
+        // buttons — the same behaviour the web's RightPanelTabs implements
+        // (`hasOverflow` → ChevronLeft/ChevronRight icon-xs buttons).
         div()
-            .w(px(380.))
+            // w + max_w: content min-width (long tree names etc.) would
+            // otherwise stretch the item past 280 despite flex_none.
+            .w(px(theme::DETAILS_PANEL_W))
+            .max_w(px(theme::DETAILS_PANEL_W))
+            .min_w_0()
+            .overflow_x_hidden()
             .flex_none()
             .h_full()
             .border_l_1()
@@ -122,22 +130,31 @@ impl AppView {
     }
 
     /// Web `RightPanelTabs`: the strip sits at `--workspace-topbar-height`
-    /// (52px) with compact `h-6 rounded-md` pills — a leading 12px lucide
-    /// glyph, active `bg-accent text-foreground`, inactive muted +
-    /// `hover:bg-accent/60`.
+    /// (52px) with compact `h-6 max-w-36 shrink-0 gap-0.5 rounded-md
+    /// pr-2 pl-1.5 text-xs` pills — a leading 12px lucide glyph, active
+    /// `bg-accent text-foreground`, inactive muted + `hover:bg-accent/60`.
+    /// When pills overflow the panel the strip scrolls horizontally and
+    /// ghost ‹ › buttons (`icon-xs`, scroll by ~75% of the viewport)
+    /// appear at the right edge.
     fn render_panel_tab_bar(&self, cx: &mut Context<Self>) -> Div {
-        let tab = |tab_icon: Icon, label: &'static str, target: Tab, cx: &mut Context<Self>| {
+        let tab = |tab_icon: Icon,
+                   label: &'static str,
+                   target: Tab,
+                   ix: usize,
+                   cx: &mut Context<Self>| {
             let active = self.panel_state.tab == Some(target);
             div()
                 .h(px(24.))
+                .flex_none()
                 .flex()
                 .items_center()
-                .gap_1()
-                .pl_1()
-                .pr_1p5()
+                .gap_0p5()
+                .pl_1p5()
+                .pr_2()
                 .rounded(theme::radius::MD)
                 .cursor_pointer()
                 .text_xs()
+                .whitespace_nowrap()
                 .text_color(if active {
                     theme::fg()
                 } else {
@@ -161,27 +178,93 @@ impl AppView {
                     gpui::MouseButton::Left,
                     cx.listener(move |this, _ev, _w, cx| {
                         this.panel_state.tab = Some(target);
+                        // Web scrolls a newly-active tab into view.
+                        this.panel_state.tab_scroll.scroll_to_item(ix);
                         cx.notify();
                     }),
                 )
         };
-        div()
+        // Web `scrollTabs(direction)`: `max(120, viewport.clientWidth * 0.75)`
+        // — ~180px at the 280px panel width.
+        let scroll_step = px(180.);
+        let scroll_btn = |dir_icon: Icon, id: &'static str, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .w(px(20.))
+                .h(px(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(theme::fg_muted())
+                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                .child(icon(dir_icon, 12.).text_color(theme::fg_muted()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        let handle = &this.panel_state.tab_scroll;
+                        let max = handle.max_offset().x;
+                        let cur = handle.offset().x;
+                        // GPUI scroll offsets are ≤0 and grow more negative
+                        // toward the max ("distance from container top-left
+                        // to first child").
+                        let next = if dir_icon == Icon::ChevronLeft {
+                            (cur + scroll_step).min(px(0.))
+                        } else {
+                            (cur - scroll_step).max(-max)
+                        };
+                        handle.set_offset(point(next, px(0.)));
+                        cx.notify();
+                    }),
+                )
+        };
+        let scroll = self.panel_state.tab_scroll.clone();
+        let overflowing = scroll.max_offset().x > px(0.5);
+        let mut strip = div()
             .h(px(theme::TOPBAR_H))
             .pl_2()
+            .pr_1()
             .flex()
             .flex_row()
             .items_center()
-            .gap_0p5()
-            .child(tab(Icon::Folder, "Files", Tab::Files, cx))
-            .child(tab(Icon::Terminal, "Terminals", Tab::Terminals, cx))
-            .child(tab(
-                Icon::GitPullRequest,
-                "Pull requests",
-                Tab::PullRequests,
-                cx,
-            ))
-            .child(tab(Icon::GitCompare, "Diff", Tab::Diff, cx))
-            .child(tab(Icon::Globe, "Browser", Tab::Browser, cx))
+            .child(
+                div()
+                    .id("panel-tab-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_0p5()
+                    .overflow_x_scroll()
+                    .track_scroll(&scroll)
+                    .child(tab(Icon::Folder, "Files", Tab::Files, 0, cx))
+                    .child(tab(Icon::Terminal, "Terminals", Tab::Terminals, 1, cx))
+                    .child(tab(
+                        Icon::GitPullRequest,
+                        "Pull requests",
+                        Tab::PullRequests,
+                        2,
+                        cx,
+                    ))
+                    .child(tab(Icon::GitCompare, "Diff", Tab::Diff, 3, cx))
+                    .child(tab(Icon::Globe, "Browser", Tab::Browser, 4, cx)),
+            );
+        if overflowing {
+            strip = strip.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .pl_1()
+                    .child(scroll_btn(Icon::ChevronLeft, "panel-tab-scroll-left", cx))
+                    .child(scroll_btn(Icon::ChevronRight, "panel-tab-scroll-right", cx)),
+            );
+        }
+        strip
     }
 
     // ------------------------------------------------------------------

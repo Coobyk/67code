@@ -261,6 +261,41 @@ pub(crate) fn group_label(text: &'static str) -> gpui::Div {
         .child(text)
 }
 
+/// Section title inside a settings page — web `SettingsSection` h2
+/// (`text-base font-semibold`, min-h-7) with `space-y-2.5` below it.
+pub(crate) fn settings_section_title(text: &'static str) -> gpui::Div {
+    div()
+        .min_h(px(28.))
+        .pb_2p5()
+        .flex()
+        .items_center()
+        .text_base()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme::fg())
+        .child(text)
+}
+
+/// Web `SettingsGroup variant="grouped"`: `rounded-xl border
+/// border-border/60 bg-card/40` card; child rows are divided by
+/// `border-t border-border/50` after the first (web `divide-y`).
+pub(crate) fn settings_card(rows: Vec<gpui::Div>) -> gpui::Div {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .rounded_xl()
+        .border_1()
+        .border_color(theme::card_border())
+        .bg(theme::card_surface_40());
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            card = card.child(row.border_t_1().border_color(theme::card_border()));
+        } else {
+            card = card.child(row);
+        }
+    }
+    card
+}
+
 /// Destructive accent used across the app (palette/sidebar danger).
 pub(crate) fn danger() -> gpui::Rgba {
     rgb(0xf87171)
@@ -1067,7 +1102,6 @@ impl AppView {
 
     pub(crate) fn render_notifications_section(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = &self.misc_settings_state;
-        let mut section = div().flex().flex_col();
 
         // notificationMode — the web stores this in ClientSettings (device-
         // local persistence); here it lives on misc state (INTEGRATE note in
@@ -1082,7 +1116,7 @@ impl AppView {
             .find(|(value, _)| *value == mode)
             .map(|(_, label)| *label)
             .unwrap_or("Off");
-        section = section.child(self.select_setting(
+        let mode_row = self.select_setting(
             "Thread notifications",
             "System alerts when a thread finishes, fails, or needs input or approval. Applies to this device while the app is open.",
             OpenList::NotificationMode,
@@ -1093,10 +1127,10 @@ impl AppView {
                 .map(|(value, label)| (value.to_string(), label.to_string(), None))
                 .collect(),
             cx,
-        ));
+        );
 
         let in_app = state.in_app_notifications;
-        section = section.child(setting_row(
+        let in_app_row = setting_row(
             "In-app notifications",
             "Show a toast when another thread finishes, fails, or needs input or approval while this app has focus.",
             div()
@@ -1113,9 +1147,15 @@ impl AppView {
                         cx.notify();
                     }),
                 ),
-        ));
+        );
 
-        section
+        // Web `GeneralSettingsPanel` → `SettingsSection "Notifications"`:
+        // section title + a single bordered card around the two rows.
+        div()
+            .flex()
+            .flex_col()
+            .child(settings_section_title("Notifications"))
+            .child(settings_card(vec![mode_row, in_app_row]))
     }
 
     // ─── Chat defaults ────────────────────────────────────────────────────

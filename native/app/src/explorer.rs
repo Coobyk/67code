@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    Context, Div, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, ScrollHandle, SharedString,
-    Window, div, img, prelude::*, px, relative,
+    Context, Div, Focusable, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, ScrollHandle,
+    SharedString, Window, div, img, prelude::*, px, relative,
 };
 use serde_json::{Value, json};
 
@@ -240,6 +240,23 @@ pub struct State {
     generation: u64,
     tree_scroll: ScrollHandle,
     preview_scroll: ScrollHandle,
+    /// Header search input (web `FileSearchField`) — created lazily since
+    /// `cx.new` needs an entity context.
+    search_field: Option<gpui::Entity<crate::text_field::TextField>>,
+    /// Mirror of `search_field`'s contents (observer-synced for `&self`
+    /// render). Non-empty → flat `projects.searchEntries` results replace
+    /// the tree.
+    search_query: String,
+    /// Flat path hits for `search_query` (files + dirs).
+    search_results: Vec<Entry>,
+    /// A `projects.searchEntries` request is in flight or debounced.
+    search_pending: bool,
+    /// Bumps per keystroke; stale search debounces/replies check it.
+    search_generation: u64,
+    /// Expand-all toggle (web `expandAll`) — expanding keeps cascading into
+    /// freshly-loaded directories while on.
+    expand_all: bool,
+    search_subs: Vec<gpui::Subscription>,
 }
 
 /// `(project_id, workspace_root, thread_id)` for the selected thread.
@@ -587,10 +604,151 @@ impl AppView {
                 .dirs
                 .insert(dir.clone(), parse_entries(&exit["value"]));
             self.explorer_state.errors.remove(&dir);
+            // Expand-all cascades into freshly-loaded children (web keeps
+            // `setAllDirectoriesExpanded` running as dirs arrive).
+            if self.explorer_state.expand_all {
+                self.explorer_expand_loaded(cx);
+            }
         } else {
             let (_, message) = rpc_error(&exit);
             self.explorer_state.errors.insert(dir, message);
         }
+        cx.notify();
+    }
+
+    /// Expand every *loaded* non-ignored directory and queue loads for the
+    /// unloaded ones (web skips `node_modules`-scale ignored dirs too).
+    fn explorer_expand_loaded(&mut self, cx: &mut Context<Self>) {
+        let mut to_load = Vec::new();
+        for (dir, entries) in self.explorer_state.dirs.iter() {
+            if !dir.is_empty() {
+                self.explorer_state.expanded.insert(dir.clone());
+            }
+            for e in entries {
+                if e.is_dir && !e.ignored {
+                    self.explorer_state.expanded.insert(e.path.clone());
+                    if !self.explorer_state.dirs.contains_key(&e.path)
+                        && !self.explorer_state.loading.contains(&e.path)
+                        && !self.explorer_state.errors.contains_key(&e.path)
+                    {
+                        to_load.push(e.path.clone());
+                    }
+                }
+            }
+        }
+        for dir in to_load {
+            self.explorer_load_dir(dir, false, cx);
+        }
+    }
+
+    /// Web `toggleAllDirectories` — on: mark `expand_all` and expand/load
+    /// everything; off: collapse back to the root.
+    fn explorer_toggle_expand_all(&mut self, cx: &mut Context<Self>) {
+        let next = !self.explorer_state.expand_all;
+        self.explorer_state.expand_all = next;
+        if next {
+            self.explorer_expand_loaded(cx);
+        } else {
+            self.explorer_state.expanded.clear();
+        }
+        cx.notify();
+    }
+
+    /// Lazily build the header search `TextField` + the observer that mirrors
+    /// its text into `search_query` and arms the debounce (same pattern as
+    /// palette.rs's field).
+    fn explorer_ensure_search_field(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_state.search_field.is_some() {
+            return;
+        }
+        let field = cx.new(|cx| crate::text_field::TextField::new("Search files", cx));
+        self.explorer_state
+            .search_subs
+            .push(cx.observe(&field, |this, field, cx| {
+                let query = crate::palette::field_text(&field, cx);
+                if this.explorer_state.search_query != query {
+                    this.explorer_state.search_query = query;
+                    this.explorer_schedule_search(cx);
+                }
+            }));
+        self.explorer_state.search_field = Some(field);
+    }
+
+    /// 300ms debounce → `projects.searchEntries` (web `FileSearchField`
+    /// drives the same RPC; queries under 2 chars short-circuit like
+    /// palette.rs).
+    fn explorer_schedule_search(&mut self, cx: &mut Context<Self>) {
+        self.explorer_state.search_generation =
+            self.explorer_state.search_generation.wrapping_add(1);
+        let short = self.explorer_state.search_query.trim().chars().count() < 1;
+        self.explorer_state.search_pending = !short;
+        if short {
+            self.explorer_state.search_results.clear();
+        }
+        let generation = self.explorer_state.search_generation;
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(std::time::Duration::from_millis(300)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.explorer_state.search_generation == generation {
+                    this.explorer_run_search(generation, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `projects.searchEntries {cwd, query, limit}` — files + dirs, flat.
+    fn explorer_run_search(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let query = self.explorer_state.search_query.trim().to_string();
+        if query.is_empty() || self.explorer_state.project_key.is_none() {
+            self.explorer_state.search_pending = false;
+            self.explorer_state.search_results.clear();
+            cx.notify();
+            return;
+        }
+        let Some(rx) = self.send_query(
+            "projects.searchEntries",
+            json!({
+                "cwd": self.explorer_state.project_root,
+                "query": query,
+                "limit": 50,
+            }),
+        ) else {
+            self.explorer_state.search_pending = false;
+            self.explorer_state.search_results.clear();
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let exit = rx.recv().await.unwrap_or_else(|_| {
+                json!({"_tag": "Failure", "cause": {"error": {"message": "Connection closed before the reply arrived."}}})
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.explorer_state.search_generation != generation {
+                    return;
+                }
+                this.explorer_state.search_pending = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    this.explorer_state.search_results = parse_entries(&exit["value"]);
+                } else {
+                    this.explorer_state.search_results.clear();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Clear the header search — resets the field, query mirror, and hits.
+    fn explorer_clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = &self.explorer_state.search_field {
+            field.update(cx, |f, cx| f.reset(window, cx));
+        }
+        self.explorer_state.search_query.clear();
+        self.explorer_state.search_results.clear();
+        self.explorer_state.search_pending = false;
+        self.explorer_state.search_generation =
+            self.explorer_state.search_generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -1085,6 +1243,13 @@ impl AppView {
             })
             .detach();
         }
+        // The search TextField is an entity — create it deferred too.
+        if self.explorer_state.search_field.is_none() {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| this.explorer_ensure_search_field(cx));
+            })
+            .detach();
+        }
 
         let mut pane = div()
             .flex()
@@ -1094,56 +1259,83 @@ impl AppView {
             .w_full()
             .text_xs();
 
-        // Header: project name + refresh.
-        let project_name = explorer_target(&self.state)
-            .and_then(|(pid, _, _)| {
-                self.state
-                    .projects
-                    .iter()
-                    .find(|p| p.id.as_ref() == pid)
-                    .map(|p| p.name.to_string())
-            })
-            .unwrap_or_else(|| "Files".to_string());
-        // Header: project name + refresh. Matches the web
-        // FILE_SURFACE_SUBHEADER inline variant: h-9 (36px), px-2, no
-        // bottom border, 4px gap before the content.
-        pane = pane.child(
+        // Header — web `FileBrowserPanel` inline-preview subheader (h-9,
+        // px-2, gap-1, no border): refresh icon-xs ghost, the ghost
+        // `FileSearchField` (h-7, flex-1), then the expand/collapse-all
+        // toggle.
+        let has_dirs = self
+            .explorer_state
+            .dirs
+            .values()
+            .flatten()
+            .any(|e| e.is_dir);
+        let all_expanded = has_dirs
+            && self
+                .explorer_state
+                .dirs
+                .values()
+                .flatten()
+                .filter(|e| e.is_dir && !e.ignored)
+                .all(|e| self.explorer_state.expanded.contains(&e.path));
+        let ghost_btn = |id: &'static str, glyph: Icon| {
             div()
+                .id(id)
+                .w(px(22.))
+                .h(px(22.))
+                .flex_none()
                 .flex()
                 .items_center()
-                .justify_between()
-                .h(px(36.))
-                .px_2()
-                .mb_1()
-                .child(
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(theme::fg_muted())
+                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                .child(icon(glyph, 12.).text_color(theme::fg_muted()))
+        };
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(36.))
+            .px_2()
+            .mb_1()
+            .child(
+                ghost_btn("explorer-refresh", Icon::RefreshCw).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _w, cx| this.explorer_refresh(cx)),
+                ),
+            )
+            .when_some(self.explorer_state.search_field.clone(), |h, field| {
+                h.child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .whitespace_nowrap()
-                        .overflow_x_hidden()
-                        .text_ellipsis()
-                        .text_color(theme::fg_muted())
-                        .child(project_name),
+                        .text_color(theme::fg())
+                        .on_mouse_down(MouseButton::Left, {
+                            let field = field.clone();
+                            move |_ev, window, cx| {
+                                field.read(cx).focus_handle(cx).focus(window, cx);
+                            }
+                        })
+                        .child(field),
                 )
-                .child(
-                    div()
-                        .id("explorer-refresh")
-                        .w(px(22.))
-                        .h(px(22.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_color(theme::fg_muted())
-                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .child(icon(Icon::RefreshCw, 12.).text_color(theme::fg_muted()))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, _w, cx| this.explorer_refresh(cx)),
-                        ),
+            });
+        if has_dirs {
+            let expand_glyph = if all_expanded {
+                Icon::ChevronsDownUp
+            } else {
+                Icon::ChevronsUpDown
+            };
+            header = header.child(
+                ghost_btn("explorer-expand-all", expand_glyph).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _w, cx| this.explorer_toggle_expand_all(cx)),
                 ),
-        );
+            );
+        }
+        pane = pane.child(header);
+
+        let searching = !self.explorer_state.search_query.trim().is_empty();
 
         // Tree body.
         if self.explorer_state.project_key.is_none() {
@@ -1169,6 +1361,85 @@ impl AppView {
                         ),
                 );
             pane = pane.child(el);
+        } else if searching {
+            // Web pathSearch replaces the tree with flat `searchEntries`
+            // hits; dir hits expand+focus in the tree on click.
+            if self.explorer_state.search_pending {
+                pane = pane.child(self.explorer_empty("Searching…"));
+            } else if self.explorer_state.search_results.is_empty() {
+                pane = pane.child(self.explorer_empty("No files match your search"));
+            } else {
+                let truncated = self.explorer_state.search_results.len() >= 50;
+                if truncated {
+                    pane = pane.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("More matches available. Refine your search."),
+                    );
+                }
+                let mut list = div()
+                    .id("explorer-search-results")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_1()
+                    .py_1();
+                for (ix, hit) in self.explorer_state.search_results.iter().enumerate() {
+                    let path = hit.path.clone();
+                    let is_dir = hit.is_dir;
+                    let is_selected =
+                        self.explorer_state.selected.as_deref() == Some(hit.path.as_str());
+                    let glyph = if hit.is_dir { Icon::Folder } else { Icon::File };
+                    let mut el = div()
+                        .id(("xpl-hit", ix))
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .h(px(30.))
+                        .px_2()
+                        .rounded(theme::radius::MD)
+                        .cursor_pointer()
+                        .whitespace_nowrap()
+                        .when(is_selected, |s| s.bg(theme::tree_selected()))
+                        .when(!is_selected, |s| s.hover(|s| s.bg(theme::tree_hover())))
+                        .child(icon(glyph, 13.).text_color(theme::icon_muted()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .overflow_x_hidden()
+                                .text_color(if hit.ignored {
+                                    theme::tree_ignored()
+                                } else {
+                                    theme::fg()
+                                })
+                                .child(path.clone()),
+                        );
+                    el = el.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _w, cx| {
+                            if is_dir {
+                                // Reveal the dir in the tree and leave
+                                // search so the expanded state is visible.
+                                if this.explorer_state.expanded.insert(path.clone()) {
+                                    this.explorer_load_dir(path.clone(), false, cx);
+                                }
+                                this.explorer_clear_search(_w, cx);
+                            } else {
+                                this.explorer_open_file(path.clone(), cx);
+                            }
+                        }),
+                    );
+                    list = list.child(el);
+                }
+                pane = pane.child(list);
+            }
         } else if !self.explorer_state.dirs.contains_key("") {
             pane = pane.child(self.explorer_empty("Loading…"));
         } else {

@@ -302,7 +302,8 @@ fn parse_iso_epoch(s: &str) -> Option<i64> {
 }
 
 /// "5m ago" / "2d ago" from an ISO timestamp; short date on parse failure.
-fn relative_time(iso: &str) -> String {
+/// Shared with palette.rs (thread-row timestamps).
+pub(crate) fn relative_time(iso: &str) -> String {
     if iso.is_empty() {
         return String::new();
     }

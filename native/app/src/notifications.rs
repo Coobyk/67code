@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, IntoElement, MouseButton, Rgba, SharedString, Svg, deferred, div,
-    prelude::*, px, rgb, svg,
+    prelude::*, px, rgb,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -30,10 +30,6 @@ pub enum ToastKind {
     Approval,
 }
 
-/// Lucide `circle-check` — not in the bundled icon set; the web toast's
-/// success glyph (CircleCheckIcon).
-const CIRCLE_CHECK_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m9 12 2 2 4-4\"/></svg>";
-
 impl ToastKind {
     /// Semantic icon tint — the web toast's `--info`/`--success`/etc.
     /// foreground colors (sonner-style leading glyph).
@@ -46,16 +42,16 @@ impl ToastKind {
         }
     }
 
-    /// Leading glyph — the web toast's per-kind lucide icon (error →
-    /// CircleAlert, info → Info, success → CircleCheck, warning →
-    /// TriangleAlert).
+    /// Leading glyph — the web toast's per-kind lucide icon at `w-4` (16px):
+    /// error → CircleAlert, info → Info, success → CircleCheck, warning →
+    /// TriangleAlert.
     fn icon(self) -> Svg {
         let color = self.icon_color();
         match self {
-            ToastKind::Info => icon(Icon::Info, 15.),
-            ToastKind::Success => svg().data(CIRCLE_CHECK_SVG).w(px(15.)).h(px(15.)),
-            ToastKind::Error => icon(Icon::CircleAlert, 15.),
-            ToastKind::Approval => icon(Icon::TriangleAlert, 15.),
+            ToastKind::Info => icon(Icon::Info, 16.),
+            ToastKind::Success => icon(Icon::CircleCheck, 16.),
+            ToastKind::Error => icon(Icon::CircleAlert, 16.),
+            ToastKind::Approval => icon(Icon::TriangleAlert, 16.),
         }
         .text_color(color)
     }
@@ -726,7 +722,8 @@ impl AppView {
                 .flex()
                 .flex_col()
                 .items_end()
-                .gap_2()
+                // Web `--toast-gap: spacing(3)` = 12px between cards.
+                .gap_3()
                 .children(toasts),
         )
         .with_priority(1)
@@ -762,7 +759,7 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .pl_2()
-                    .pr_3()
+                    .pr_3p5()
                     .py_2p5()
                     .flex()
                     .flex_col()

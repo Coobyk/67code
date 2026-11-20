@@ -18,15 +18,18 @@ use crate::{AppView, ToggleSettings};
 /// Sections listed in the settings left nav.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Section {
-    Appearance,
+    /// The web's `/settings/general` page — notification preferences and
+    /// device-local defaults (the native surface hosts the Notifications
+    /// content there).
     #[default]
+    General,
+    Appearance,
     Connection,
     Environments,
     Providers,
     AcpSessions,
     Clients,
     ArchivedThreads,
-    Notifications,
     ChatDefaults,
     Projects,
     ScheduledTasks,
@@ -42,12 +45,18 @@ pub enum Section {
 }
 
 /// Left-nav groups (heading, sections) mirroring `SETTINGS_NAV_GROUPS` in
-/// apps/web settingsSearch.ts: an unheaded block, Agents, Code, Connections,
-/// and a trailing unheaded block.
+/// apps/web settingsSearch.ts: an unheaded block (General … SnapShots),
+/// Agents, Code, Connections, and a trailing unheaded block. Sections the
+/// web has but native doesn't implement (Diffs & pull requests, Voice,
+/// SnapShots, Browser, Devices, Worktrees, Maintenance, Labs) are omitted
+/// rather than stubbed; native-only sections (Keyboard Shortcuts,
+/// ACP Sessions, Connection, Authorized Clients, Diagnostics, Usage)
+/// stay in the nearest matching group.
 const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
     (
         None,
         &[
+            (Section::General, "General"),
             (Section::Appearance, "Appearance"),
             (Section::ChatDefaults, "Chat"),
             (Section::Keybindings, "Keybindings"),
@@ -58,16 +67,16 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
         Some("Agents"),
         &[
             (Section::Providers, "Providers"),
-            (Section::AcpSessions, "ACP Sessions"),
             (Section::Threads, "Threads"),
-            (Section::ScheduledTasks, "Scheduled Tasks"),
+            (Section::AcpSessions, "ACP Sessions"),
+            (Section::ScheduledTasks, "Scheduled tasks"),
         ],
     ),
     (
         Some("Code"),
         &[
             (Section::Projects, "Projects"),
-            (Section::SourceControl, "Source Control"),
+            (Section::SourceControl, "Source control"),
             (Section::Integrations, "Integrations"),
         ],
     ),
@@ -76,9 +85,8 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
         &[
             (Section::Connection, "Connection"),
             (Section::Environments, "Environments"),
-            (Section::Clients, "Authorized Clients"),
+            (Section::Clients, "Authorized clients"),
             (Section::Secrets, "Secrets"),
-            (Section::Notifications, "Notifications"),
         ],
     ),
     (
@@ -86,35 +94,34 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
         &[
             (Section::Diagnostics, "Diagnostics"),
             (Section::Usage, "Usage Limits"),
-            (Section::ArchivedThreads, "Archived Threads"),
             (Section::About, "About"),
+            (Section::ArchivedThreads, "Archive"),
         ],
     ),
 ];
 
 /// Per-section lucide glyph — web `SETTINGS_SECTION_ICONS` in
-/// `SettingsSidebarNav.tsx` (size-4, `--sidebar-icon-color`). Bundled-set
-/// approximations are noted where the exact glyph is absent.
+/// `SettingsSidebarNav.tsx` (size-4, `--sidebar-icon-color`).
 fn section_icon(section: Section) -> Icon {
     match section {
-        Section::Appearance => Icon::Sparkles, // web: Palette
-        Section::ChatDefaults => Icon::MessageSquare,
-        Section::Keybindings => Icon::Pencil, // web: Keyboard; Keyboard goes to Shortcuts
-        Section::Shortcuts => Icon::Keyboard,
-        Section::Providers => Icon::Zap, // web: Bot
+        Section::General => Icon::Settings2,
+        Section::Appearance => Icon::Palette,
+        Section::ChatDefaults => Icon::MessageSquareText,
+        Section::Keybindings => Icon::Keyboard,
+        Section::Shortcuts => Icon::ScrollText,
+        Section::Providers => Icon::Bot,
         Section::AcpSessions => Icon::Activity,
-        Section::Threads => Icon::ListTodo, // web: MessagesSquare
-        Section::ScheduledTasks => Icon::Clock, // web: CalendarClock
-        Section::Projects => Icon::FolderGit2, // web: PanelsTopLeft
+        Section::Threads => Icon::MessagesSquare,
+        Section::ScheduledTasks => Icon::CalendarClock,
+        Section::Projects => Icon::PanelsTopLeft,
         Section::SourceControl => Icon::GitBranch,
         Section::Integrations => Icon::Link,
-        Section::Connection => Icon::Globe, // web: Server
-        Section::Environments => Icon::Monitor,
-        Section::Clients => Icon::Shield, // web: ShieldCheck
-        Section::Secrets => Icon::Lock,   // web: KeyRound
-        Section::Notifications => Icon::Bell,
+        Section::Connection => Icon::Globe,
+        Section::Environments => Icon::Server,
+        Section::Clients => Icon::ShieldCheck,
+        Section::Secrets => Icon::KeyRound,
         Section::Diagnostics => Icon::Wrench,
-        Section::Usage => Icon::Activity,
+        Section::Usage => Icon::ChartNoAxesColumn,
         Section::ArchivedThreads => Icon::Archive,
         Section::About => Icon::Info,
     }
@@ -135,6 +142,13 @@ pub struct State {
     pub open: bool,
     /// Section selected in the left nav.
     pub section: Section,
+    /// Nav search input (web `SettingsSidebarNav` search row) — created
+    /// lazily on first open since `cx.new` needs a window context.
+    pub search_field: Option<gpui::Entity<crate::text_field::TextField>>,
+    /// Mirror of `search_field`'s contents; an observer syncs it so the
+    /// `&self` nav render can filter.
+    pub search_query: String,
+    search_subs: Vec<gpui::Subscription>,
 }
 
 /// Dot + label + optional detail for the live `ConnectionStatus`.
@@ -209,42 +223,193 @@ impl AppView {
     pub fn on_toggle_settings(
         &mut self,
         _action: &ToggleSettings,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.settings_state.open = !self.settings_state.open;
+        if self.settings_state.open {
+            self.ensure_settings_search_field(window, cx);
+            self.settings_state.search_query.clear();
+            if let Some(field) = self.settings_state.search_field.clone() {
+                field.update(cx, |field, cx| field.reset(window, cx));
+            }
+        }
         cx.notify();
     }
 
+    /// Lazily build the nav search `TextField` + the observer that mirrors
+    /// its text into `search_query` (same pattern as palette.rs's field).
+    fn ensure_settings_search_field(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_state.search_field.is_some() {
+            return;
+        }
+        let field = cx.new(|cx| crate::text_field::TextField::new("Search", cx));
+        self.settings_state
+            .search_subs
+            .push(cx.observe(&field, |this, field, cx| {
+                let query = crate::palette::field_text(&field, cx);
+                if this.settings_state.search_query != query {
+                    this.settings_state.search_query = query;
+                    cx.notify();
+                }
+            }));
+        self.settings_state.search_field = Some(field);
+    }
+
     /// Left nav — the web `SettingsSidebarNav`: w-60 bg-sidebar column with
-    /// `SidebarMenuButton` rows (h-8, rounded control-radius, px-2.5) grouped
-    /// under muted headings.
+    /// an `h-8 rounded-md` search row (SearchIcon + input + `/` Kbd), then
+    /// `SidebarMenuButton` rows (h-8, rounded, px-2.5) grouped under muted
+    /// headings. A non-empty query swaps the grouped nav for the flat
+    /// filtered result list (web `isSearching`).
     fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut nav = div()
-            .id("settings-nav-scroll")
-            .flex()
-            .flex_col()
-            .w(px(240.))
-            .flex_none()
-            .h_full()
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(theme::border())
-            .bg(theme::sidebar())
-            .px_2()
-            .py_3()
-            .gap_1()
-            .child(
-                div()
-                    .h(px(32.))
-                    .flex()
-                    .items_center()
-                    .px(px(10.))
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme::sidebar_fg())
-                    .child("Settings"),
-            );
+        let query = self.settings_state.search_query.trim().to_lowercase();
+        let searching = !query.is_empty();
+        let mut nav =
+            div()
+                .id("settings-nav-scroll")
+                .flex()
+                .flex_col()
+                .w(px(240.))
+                .flex_none()
+                .h_full()
+                .overflow_y_scroll()
+                .border_r_1()
+                .border_color(theme::border())
+                .bg(theme::sidebar())
+                .px_2()
+                .py_3()
+                .gap_1()
+                .child(
+                    // Web search row: h-8 rounded-md px-2 py-1.5 gap-2, SearchIcon
+                    // size-4 `text-sidebar-muted-foreground/80`, input "Search",
+                    // `Kbd "/"` (decorative — "/" isn't bound natively).
+                    div()
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::sidebar_fg_muted())
+                        .child(
+                            div().flex_none().flex().items_center().child(
+                                icon(Icon::Search, 16.).text_color(theme::sidebar_fg_muted()),
+                            ),
+                        )
+                        .when_some(self.settings_state.search_field.clone(), |row, field| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(theme::sidebar_fg())
+                                    .child(field),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .h(px(20.))
+                                .min_w(px(20.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(theme::kbd_bg())
+                                .text_xs()
+                                .text_color(theme::sidebar_fg_muted())
+                                .child("/"),
+                        ),
+                );
+
+        if searching {
+            // Web result rows: section icon + title + group-label sub-line.
+            let mut any = false;
+            let mut result_ix = 0usize;
+            for (heading, items) in NAV_GROUPS {
+                for (section, label) in items.iter() {
+                    result_ix += 1;
+                    let section = *section;
+                    let haystack = format!(
+                        "{} {}",
+                        label.to_lowercase(),
+                        heading.unwrap_or("").to_lowercase()
+                    );
+                    if !haystack.contains(&query) {
+                        continue;
+                    }
+                    any = true;
+                    let heading_label = heading.map(|h| h.to_string());
+                    nav = nav.child(
+                        div()
+                            .id(("settings-search", result_ix))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px(px(10.))
+                            .py_1()
+                            .min_h(px(40.))
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_sm()
+                            .hover(|s| s.bg(theme::sidebar_hover()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, window, cx| {
+                                    this.settings_state.section = section;
+                                    this.settings_state.search_query.clear();
+                                    if let Some(field) = this.settings_state.search_field.clone() {
+                                        field.update(cx, |field, cx| field.reset(window, cx));
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(div().flex_none().flex().items_center().child(
+                                icon(section_icon(section), 16.).text_color(theme::sidebar_icon()),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme::sidebar_fg())
+                                            .child(*label),
+                                    )
+                                    .when_some(heading_label, |col, h| {
+                                        col.child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(theme::sidebar_fg_muted())
+                                                .child(h),
+                                        )
+                                    }),
+                            ),
+                    );
+                }
+            }
+            if !any {
+                nav = nav.child(
+                    div()
+                        .px_2()
+                        .py_6()
+                        .flex()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme::sidebar_fg_muted())
+                        .child("No settings found"),
+                );
+            }
+            return nav;
+        }
 
         let mut index = 0usize;
         for (group_ix, (heading, items)) in NAV_GROUPS.iter().enumerate() {
@@ -545,8 +710,8 @@ impl AppView {
                 "Archived Threads",
                 self.render_archived_section(cx).into_any_element(),
             ),
-            Section::Notifications => (
-                "Notifications",
+            Section::General => (
+                "General",
                 self.render_notifications_section(cx).into_any_element(),
             ),
             Section::ChatDefaults => (
@@ -596,8 +761,82 @@ impl AppView {
             Section::About => ("About", self.render_about_section().into_any_element()),
         };
 
-        // Web header: h-12 border-b with a "Settings / <section>" breadcrumb
-        // and the modal close button on the right (`AppRouteModalClose`).
+        // Web header: h-12 border-b ps-5 pe-2 with a "Settings / <section>"
+        // breadcrumb, "Restore device defaults" (ghost xs, only on
+        // /settings/general), then `AppRouteModalClose` (ghost icon-sm X).
+        let device_defaults_changed = self.client_config.notification_mode != ""
+            || !self.client_config.in_app_notifications
+            || self.client_config.diff_layout != "stacked"
+            || !self.client_config.diff_ignore_whitespace
+            || !self.client_config.diff_files_collapsed
+            || self.client_config.proactive_panels
+            || self.client_config.settings_scope_project.is_some();
+        let close_btn = div()
+            .id("settings-close")
+            .w(px(28.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_sm()
+            .text_color(theme::fg_muted())
+            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    cx.stop_propagation();
+                    this.settings_state.open = false;
+                    cx.notify();
+                }),
+            )
+            .child(icon(Icon::X, 14.).text_color(theme::fg_muted()));
+        let mut header_right = div().flex().items_center().gap_1();
+        if self.settings_state.section == Section::General {
+            // `RestoreDeviceDefaultsButton` — resets the device-local
+            // (ClientSettings-mirroring) fields on ClientConfig and re-seeds
+            // the misc settings mirror; ghost xs, disabled at defaults.
+            header_right = header_right.child(
+                div()
+                    .id("settings-restore-defaults")
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .when(device_defaults_changed, |b| {
+                        b.cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    })
+                    .when(!device_defaults_changed, |b| b.opacity(0.5))
+                    .child(icon(Icon::RefreshCw, 13.).text_color(theme::fg_muted()))
+                    .child("Restore device defaults")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            if !device_defaults_changed {
+                                return;
+                            }
+                            let cfg = &mut this.client_config;
+                            cfg.notification_mode.clear();
+                            cfg.in_app_notifications = true;
+                            cfg.diff_layout = "stacked".to_string();
+                            cfg.diff_ignore_whitespace = true;
+                            cfg.diff_files_collapsed = true;
+                            cfg.proactive_panels = false;
+                            cfg.settings_scope_project = None;
+                            cfg.save();
+                            this.misc_settings_state.seed_from_config(cfg);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        header_right = header_right.child(close_btn);
         let header = div()
             .h(px(48.))
             .flex_none()
@@ -606,6 +845,7 @@ impl AppView {
             .justify_between()
             .pl_5()
             .pr_2()
+            .gap_3()
             .border_b_1()
             .border_color(theme::border())
             .child(
@@ -618,29 +858,7 @@ impl AppView {
                     .child(div().text_color(theme::fg_muted()).child("/"))
                     .child(div().text_color(theme::fg()).child(heading)),
             )
-            .child(
-                div()
-                    .id("settings-close")
-                    .w(px(28.))
-                    .h(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(theme::fg_muted())
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev, _window, cx| {
-                            cx.stop_propagation();
-                            this.settings_state.open = false;
-                            cx.notify();
-                        }),
-                    )
-                    .child(icon(Icon::X, 14.).text_color(theme::fg_muted())),
-            );
+            .child(header_right);
 
         div()
             .flex()
@@ -655,11 +873,26 @@ impl AppView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px_5()
-                    .pt_6()
-                    .pb_12()
-                    .child(section_heading(heading))
-                    .child(content),
+                    .child(
+                        // Web `SettingsPageContainer` → `WorkspacePageContainer`:
+                        // `mx-auto w-full max-w-4xl gap-6 px-5 pt-6 pb-12`.
+                        div()
+                            .w_full()
+                            .max_w(px(896.))
+                            .mx_auto()
+                            .flex()
+                            .flex_col()
+                            .px_5()
+                            .pt_6()
+                            .pb_12()
+                            // The web General page's first visible heading is
+                            // its "Notifications" SettingsSection title, not
+                            // a page-level "General" h2 — skip it there.
+                            .when(self.settings_state.section != Section::General, |col| {
+                                col.child(section_heading(heading))
+                            })
+                            .child(content),
+                    ),
             )
     }
 
@@ -682,11 +915,16 @@ impl AppView {
                     cx.notify();
                 }),
             )
+            .p(px(40.))
             .child(
+                // Web `DialogPrimitive.Popup`: `size-full sm:max-w-[80rem]
+                // sm:max-h-[60rem]` inside `lg:p-10` — 1200×720 at the
+                // 1280×800 reference size.
                 div()
                     .flex()
-                    .w(px(960.))
-                    .h(px(620.))
+                    .size_full()
+                    .max_w(px(1280.))
+                    .max_h(px(960.))
                     .rounded_2xl()
                     .bg(theme::canvas())
                     .border_1()
