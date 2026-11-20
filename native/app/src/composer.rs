@@ -3858,7 +3858,9 @@ impl AppView {
         }
 
         // `composer-tiptap`: text-sm foreground, leading-relaxed (22.75px at
-        // 14px), min-h of two lines + p-1, max-h-52 scroll.
+        // 14px), min-h of two lines + p-1, max-h-52 scroll. The field's own
+        // hitbox is one line tall; clicks in the wrapper's dead space below
+        // forward focus like a real textarea.
         body = body.child(
             div()
                 .min_h(px(54.))
@@ -3866,6 +3868,15 @@ impl AppView {
                 .text_sm()
                 .line_height(px(22.75))
                 .text_color(theme::fg())
+                .on_mouse_down(MouseButton::Left, {
+                    let composer = composer.clone();
+                    move |_event, window, cx| {
+                        composer
+                            .read(cx)
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                    }
+                })
                 .child(composer.clone()),
         );
 
