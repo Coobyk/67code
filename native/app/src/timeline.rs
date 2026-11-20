@@ -8,13 +8,16 @@
 //! (idle, pending, running, waiting, completed, failed, cancelled, interrupted).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use chrono::{DateTime, Datelike, Local};
 use gpui::{
-    AnyElement, ClipboardItem, Entity, EntityInputHandler, Focusable, Rgba, Subscription, div,
-    prelude::*, px, rgb, rgba,
+    AnyElement, ClipboardItem, Entity, EntityInputHandler, Focusable, FontFeatures, Rgba,
+    Subscription, div, prelude::*, px, rgba,
 };
 use serde_json::{Value, json};
 
+use crate::icons::{self, Icon};
 use crate::model::{ConnectionStatus, Role};
 use crate::net::TurnItemView;
 use crate::notifications::ToastKind;
@@ -49,24 +52,19 @@ pub struct State {
     pub feedback_sub: Option<Subscription>,
 }
 
+/// `text-success` (`--success`) — approved outcomes, "Answered", +N counts.
 fn success() -> Rgba {
-    rgb(0x4cc38a)
+    theme::success()
 }
 
+/// `text-destructive` (`--destructive`) — failure rows and destructive marks.
 fn danger() -> Rgba {
-    rgb(0xff5a5a)
+    theme::error()
 }
 
-fn danger_border() -> Rgba {
-    rgba(0xff5a5a55)
-}
-
+/// `text-warning` (`--warning`) — "Waiting for approval", usage-limit rows.
 fn warning() -> Rgba {
-    rgb(0xe8b45a)
-}
-
-fn warning_border() -> Rgba {
-    rgba(0xe8b45a55)
+    theme::warning()
 }
 
 /// The item is still producing content (streaming or actively running).
@@ -107,131 +105,177 @@ fn is_work_kind(kind: &str) -> bool {
     )
 }
 
-/// DejaVu-covered stand-ins for the lucide `WorkEntryIconName` set the web
-/// maps each entry kind to (`toolIconFor` in TimelineWorkEntryRow.logic.ts).
-fn work_glyph(kind: &str) -> &'static str {
+/// The lucide icon the web maps each entry kind to (`workEntryIconName` in
+/// TimelineWorkEntryRow.logic.ts → `WorkEntryIcon`). Where the web's glyph
+/// isn't bundled, the closest lucide substitute is noted in the comment.
+fn work_entry_icon(kind: &str) -> Icon {
     match kind {
         // terminal
-        "command_execution" => "❯",
-        // square-pen
-        "file_change" => "✎",
-        // brain
-        "reasoning" => "☁",
-        // bot
-        "subagent" => "⌘",
+        "command_execution" => Icon::Terminal,
+        // square-pen → closest bundled pen
+        "file_change" => Icon::Pencil,
+        // brain → closest bundled "AI thinking" glyph
+        "reasoning" => Icon::Sparkles,
+        // bot → closest bundled
+        "subagent" => Icon::Users,
         // globe
-        "web_search" => "⊚",
+        "web_search" => Icon::Globe,
         // search
-        "file_search" => "◍",
+        "file_search" => Icon::Search,
         // list-todo
-        "todo_list" => "☑",
-        // message-circle / shield
-        "approval_request" | "user_input_request" => "?",
-        // info
-        "system_notice" | "notification" => "ℹ",
-        // hammer / wrench
-        _ => "⚒",
+        "todo_list" => Icon::ListTodo,
+        // message-circle → closest bundled
+        "approval_request" | "user_input_request" => Icon::MessageSquare,
+        // wrench (and the `hammer` fallback)
+        _ => Icon::Wrench,
     }
+}
+
+/// `system_notice`/`notification` icon — mirrors `workEntryIconName`:
+/// a notification resolves from `source.kind` (failed → circle-alert);
+/// a plain system notice has `info` tone → the check icon.
+fn notice_icon(item: &TurnItemView, failed: bool) -> Icon {
+    if failed {
+        return Icon::CircleAlert;
+    }
+    if item.kind == "notification" {
+        return match item.raw["source"]["kind"].as_str().unwrap_or_default() {
+            // bot
+            "subagent" | "delegated_task" => Icon::Users,
+            "command" => Icon::Terminal,
+            "monitor" => Icon::Eye,
+            // t3-code wordmark → closest bundled
+            "system" => Icon::Sparkles,
+            // background_task / unknown
+            _ => Icon::Zap,
+        };
+    }
+    Icon::Check
 }
 
 /// `approval_request`/`user_input_request` icon per `requestKind` — mirrors
 /// `APPROVAL_PRESENTATION` in TimelinePendingApprovalRow.tsx.
-fn approval_glyph(kind: &str) -> &'static str {
+fn approval_icon(kind: &str) -> Icon {
     match kind {
-        "command" => "❯",
-        "file-change" => "✎",
-        "file-read" => "◉",
-        "permission" | "mcp-elicitation" => "⚒",
-        _ => "?",
+        // terminal
+        "command" => Icon::Terminal,
+        // square-pen
+        "file-change" => Icon::Pencil,
+        // eye
+        "file-read" => Icon::Eye,
+        // wrench
+        "permission" => Icon::Wrench,
+        // hammer ("App access") → closest bundled access glyph
+        "mcp-elicitation" => Icon::Shield,
+        _ => Icon::MessageSquare,
     }
 }
 
-/// The `w-6` icon slot: a `size-4` (16-px) glyph centered in 24 px.
-/// `text-icon-muted` normally; failed calls tint it `text-tool-error-icon/40`
-/// like `failedToolIconClassName` does for tintable icons.
-fn work_icon(glyph: &'static str, failed: bool) -> gpui::Div {
+/// The `w-6` icon slot: a `size-4` (16-px) lucide icon centered in 24 px.
+/// Work rows render it `text-icon-muted` at `muted` opacity (the web's
+/// `opacity-70 light:brightness-60`); `dim: false` skips the fade for
+/// full-strength destructive/warning icons.
+fn glyph_slot(icon: Icon, color: Rgba, dim: bool) -> gpui::Div {
     div()
         .w(px(24.))
+        .h(px(24.))
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(15.))
-        .text_color(if failed {
+        .when(dim, |d| d.opacity(0.7))
+        .child(icons::icon(icon, 16.).text_color(color))
+}
+
+fn work_icon(icon: Icon, failed: bool) -> gpui::Div {
+    // `text-icon-muted` normally; failed calls tint it
+    // `text-tool-error-icon/40` like `failedToolIconClassName` does.
+    glyph_slot(
+        icon,
+        if failed {
             theme::tool_error_icon()
         } else {
             theme::icon_muted()
-        })
-        .child(glyph)
+        },
+        true,
+    )
 }
 
-/// Trailing `size-3` ChevronRight at `text-icon-muted opacity-70`, rotated
-/// 90° while expanded — rendered as ▸/▾ since there is no icon font.
+/// Trailing `size-3` chevron at `text-icon-muted opacity-70` inside a size-4
+/// slot — ChevronRight collapsed, ChevronDown expanded (the web rotates the
+/// right chevron 90°; a down chevron is the same affordance without a
+/// transform).
 fn work_chevron(expanded: bool) -> gpui::Div {
     div()
         .w(px(16.))
+        .h(px(24.))
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
-        .text_xs()
         .opacity(0.7)
-        .text_color(theme::icon_muted())
-        .child(if expanded { "▾" } else { "▸" })
+        .child(
+            icons::icon(
+                if expanded {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                12.,
+            )
+            .text_color(theme::icon_muted()),
+        )
 }
 
-/// Days since the Unix epoch for a civil `Y-M-D` (Howard Hinnant's
-/// days_from_civil) — lets timestamps pick today/yesterday/older like the
-/// web's `formatDayAwareTimestamp`.
-fn civil_days(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+/// `tabular-nums` — enabled on timestamps and the working timer like the
+/// web's `tabular-nums` class.
+fn tabular_nums() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
+}
+
+/// `h:mm AM` in the viewer's local zone — matches the web's en-US
+/// `Intl.DateTimeFormat` output for the default 12-hour timestamp format.
+fn hhmm_ampm(dt: &DateTime<Local>) -> String {
+    format!("{} {}", dt.format("%-I:%M"), dt.format("%p"))
+}
+
+/// `formatDayAwareTimestamp` — `h:mm AM` today, `yesterday at h:mm AM`,
+/// `M/D h:mm AM` this year, `M/D/YYYY h:mm AM` older.
+fn day_aware_label(dt: &DateTime<Local>) -> String {
+    let now = Local::now();
+    let hhmm = hhmm_ampm(dt);
+    let days = now.date_naive() - dt.date_naive();
+    match days.num_days() {
+        d if d <= 0 => hhmm,
+        1 => format!("yesterday at {hhmm}"),
+        _ if dt.year() == now.year() => format!("{} {hhmm}", dt.format("%-m/%-d")),
+        _ => format!("{} {hhmm}", dt.format("%-m/%-d/%Y")),
+    }
 }
 
 /// `TimelineRowTimestamp` — `text-xs text-muted-foreground tabular-nums`,
-/// `opacity-0` until the `.group("timeline-row")` ancestor is hovered.
-/// Rendered UTC (the native build has no timezone database).
-fn item_timestamp(item: &TurnItemView) -> Option<gpui::Div> {
+/// `opacity-0` until the `.group("timeline-row")` ancestor is hovered unless
+/// `always_visible` (the web's `alwaysVisible`, used on error rows and the
+/// under-bubble meta).
+fn item_timestamp(item: &TurnItemView, always_visible: bool) -> Option<gpui::Div> {
     let iso = raw_str(item, "updatedAt")?;
-    let (date, time) = iso.split_once('T')?;
-    let (y, m, d) = (
-        date.get(..4)?.parse::<i64>().ok()?,
-        date.get(5..7)?.parse::<i64>().ok()?,
-        date.get(8..10)?.parse::<i64>().ok()?,
-    );
-    let (mut h, min) = (time.get(..2)?.parse::<u32>().ok()?, time.get(3..5)?);
-    // Locale default ≈ 12-hour for en-US.
-    let ampm = if h < 12 { "AM" } else { "PM" };
-    h %= 12;
-    if h == 0 {
-        h = 12;
-    }
-    let hhmm = format!("{h}:{min} {ampm}");
-    let days = civil_days(y, m, d);
-    let today = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let dt = DateTime::parse_from_rfc3339(iso)
         .ok()?
-        .as_secs()
-        / 86_400) as i64;
-    let label = match today - days {
-        diff if diff <= 0 => hhmm,
-        1 => format!("yesterday at {hhmm}"),
-        _ => format!("{m}/{d}/{y} {hhmm}"),
-    };
+        .with_timezone(&Local);
+    let label = day_aware_label(&dt);
     // Both ancestors gate the reveal: "timeline-row" on work rows,
     // "msg" on the under-bubble meta rows of user/assistant messages.
     Some(
         div()
             .flex_shrink_0()
             .text_xs()
+            .font_features(tabular_nums())
             .text_color(theme::fg_muted())
-            .opacity(0.)
-            .group_hover("timeline-row", |s| s.opacity(1.))
-            .group_hover("msg", |s| s.opacity(1.))
+            .when(!always_visible, |d| {
+                d.opacity(0.)
+                    .group_hover("timeline-row", |s| s.opacity(1.))
+                    .group_hover("msg", |s| s.opacity(1.))
+            })
             .child(label),
     )
 }
@@ -291,7 +335,7 @@ fn detail_text(namespace: &'static str, index: usize) -> gpui::Stateful<gpui::Di
 fn work_header(
     index: usize,
     item: &TurnItemView,
-    glyph: &'static str,
+    icon: Icon,
     label: gpui::Div,
 ) -> gpui::Stateful<gpui::Div> {
     let failed = item.status == "failed";
@@ -300,8 +344,16 @@ fn work_header(
         .group("timeline-row")
         .cursor_pointer()
         .on_click(toggle_expanded(item.id.clone()))
-        .child(work_icon(glyph, failed))
+        .child(work_icon(icon, failed))
         .child(label.flex_1().min_w_0().truncate())
+}
+
+/// `text-tool-error-icon/40` `size-3` XIcon — the web's failed-indicator
+/// mark on tool-ish work rows.
+fn failed_x() -> gpui::Div {
+    div()
+        .flex_shrink_0()
+        .child(icons::icon(Icon::X, 12.).text_color(theme::tool_error_icon()))
 }
 
 /// `render_timeline` takes `&self`, so click handlers reach the view through
@@ -407,12 +459,22 @@ fn cap_detail(text: String) -> String {
     )
 }
 
-/// Ghost icon button — the web's `MessageCopyButton variant="ghost"` / thumbs
-/// glyphs: a `size-6` muted target revealed on row hover (callers may set a
+/// Ghost icon button — the web's `ghost-muted` icon-xs Button: a `size-6`
+/// rounded target with a `size-3` (12-px) muted icon, `bg-accent` +
+/// `text-foreground` on hover, revealed on row hover (callers may set a
 /// starting opacity for "already sent" states).
-fn ghost_icon_chip(
+fn ghost_icon_chip(id: impl Into<gpui::ElementId>, icon: Icon) -> gpui::Stateful<gpui::Div> {
+    ghost_icon_chip_colored(id, icon, theme::fg_muted(), theme::fg())
+}
+
+/// `icon_color` — resting glyph ink; `hover_color` — the glyph ink under the
+/// chip's `bg-accent` hover (kept distinct so the primary "copied" check
+/// stays primary on hover like the web's `CheckIcon text-primary`).
+fn ghost_icon_chip_colored(
     id: impl Into<gpui::ElementId>,
-    glyph: &'static str,
+    icon: Icon,
+    icon_color: Rgba,
+    hover_color: Rgba,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -421,19 +483,14 @@ fn ghost_icon_chip(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
-        .text_sm()
+        .rounded_lg()
         .cursor_pointer()
-        .text_color(theme::fg_muted())
-        .opacity(0.)
-        .group_hover("msg", |s| s.opacity(1.))
-        .group_hover("timeline-row", |s| s.opacity(1.))
-        .hover(|s| s.text_color(theme::fg()))
-        .child(glyph)
+        .hover(move |s| s.bg(theme::accent()).text_color(hover_color))
+        .child(icons::icon(icon, 12.).text_color(icon_color))
 }
 
 /// "Copy" ghost chip revealed when its `.group("msg")` ancestor is hovered;
-/// writes `text` to the clipboard and flips to a check.
+/// writes `text` to the clipboard and flips to the web's primary check.
 fn copy_chip(
     key: &'static str,
     index: usize,
@@ -441,7 +498,13 @@ fn copy_chip(
     item_id: String,
     text: String,
 ) -> gpui::Stateful<gpui::Div> {
-    ghost_icon_chip((key, index), if copied { "✓" } else { "❐" }).on_click(
+    let (icon, color, hover_color) = if copied {
+        // `CheckIcon size-3 text-primary` — stays primary under the hover bg.
+        (Icon::Check, theme::primary(), theme::primary())
+    } else {
+        (Icon::Copy, theme::fg_muted(), theme::fg())
+    };
+    ghost_icon_chip_colored((key, index), icon, color, hover_color).on_click(
         move |_event, window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             let item_id = item_id.clone();
@@ -604,40 +667,27 @@ fn citation_label(c: &AssistantCitation) -> String {
     }
 }
 
-/// Compact quote chip replacing a `t3-citation:` link. Clicking navigates to
-/// the cited thread — the web routes to the source thread and reveals the
-/// quoted range; the native timeline can only land on the thread.
+/// The web's `ContextChip kind="citation"`: an inline `font-medium` span in
+/// the `--context-chip-citation` accent — a `size-[1em]` QuoteIcon plus the
+/// label (comment or quoted text), which underlines on hover. Clicking
+/// navigates to the cited thread — the web routes to the source thread and
+/// reveals the quoted range; the native timeline can only land on the thread.
 fn citation_chip(
     index: usize,
     ci: usize,
     citation: &AssistantCitation,
 ) -> gpui::Stateful<gpui::Div> {
     let label = citation_label(citation);
-    let quote = citation
-        .comment
-        .as_ref()
-        .map(|_| {
-            citation
-                .text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|q| !q.is_empty());
     let thread_id = citation.thread_id.clone();
-    let mut chip = div()
+    div()
         .id(("cite", index * 64 + ci))
         .flex()
         .items_center()
-        .gap_1()
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(theme::border())
-        .bg(theme::canvas())
+        .gap(px(3.)) // gap-[0.2em] at text-sm ≈ 3px
         .cursor_pointer()
-        .hover(|s| s.bg(theme::hover()))
+        .text_sm()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme::citation_accent())
         .on_click(move |_event, window, cx| {
             let thread_id = thread_id.clone();
             update_view(window, cx, move |this, cx| {
@@ -646,30 +696,16 @@ fn citation_chip(
         })
         .child(
             div()
-                .text_xs()
-                .text_color(theme::fg_muted())
                 .flex_shrink_0()
-                .child("❝"),
+                .child(icons::icon(Icon::Quote, 14.).text_color(theme::citation_accent())),
         )
         .child(
             div()
-                .text_xs()
                 .truncate()
-                .max_w(px(320.))
-                .text_color(theme::fg())
+                .max_w(px(224.)) // max-w-[16em] at 14px
+                .hover(|s| s.underline())
                 .child(label),
-        );
-    if let Some(quote) = quote {
-        chip = chip.child(
-            div()
-                .text_xs()
-                .truncate()
-                .max_w(px(220.))
-                .text_color(theme::fg_muted())
-                .child(format!("· “{quote}”")),
-        );
-    }
-    chip
+        )
 }
 
 /// Run `f` on a TextField from a context that carries no `&mut Window` —
@@ -731,10 +767,68 @@ fn rpc_error_text(exit: &Value) -> String {
     "The request failed.".to_string()
 }
 
-/// One selectable option row inside a pending user-input card. Clicking
-/// toggles the value in `timeline_state.user_input_answers` — multi-select
-/// questions accumulate, single-select replaces (matching the web's
-/// `togglePendingUserInputOptionSelection`).
+/// The web's `CheckboxMark variant="contrast"`: a `size-4` (16px) rounded-[4px]
+/// box — `border-foreground/55` on the input surface; checked fills
+/// `bg-primary` with a primary-foreground check.
+fn checkbox_mark(checked: bool) -> gpui::Div {
+    let mut box_ = div()
+        .size(px(16.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(if checked {
+            theme::primary()
+        } else {
+            theme::option_mark_border()
+        });
+    box_ = if checked {
+        box_.bg(theme::primary())
+            .child(icons::icon(Icon::Check, 12.).text_color(gpui::white()))
+    } else {
+        box_.bg(theme::field_surface())
+    };
+    box_
+}
+
+/// The web's `OptionRadio`: a `size-4` circle — `border-foreground/55` on the
+/// input surface; checked fills `bg-primary` with a `size-1.5`
+/// primary-foreground center dot.
+fn radio_mark(checked: bool) -> gpui::Div {
+    let mut ring = div()
+        .size(px(16.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(theme::option_mark_border())
+        .bg(theme::field_surface());
+    if checked {
+        ring = ring.child(
+            div()
+                .size(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme::primary())
+                .child(div().size(px(6.)).rounded_full().bg(gpui::white())),
+        );
+    }
+    ring
+}
+
+/// One selectable option row inside a pending user-input card — the web's
+/// `group … gap-2.5 rounded-md py-1.5 ps-2` row: the CheckboxMark/OptionRadio
+/// mark in a `h-5` slot, a `text-sm font-medium` label with the `text-2xs`
+/// `text-secondary-label` description under it, `text-foreground/70` until
+/// selected, `hover:bg-muted/30`. Clicking toggles the value in
+/// `timeline_state.user_input_answers` — multi-select questions accumulate,
+/// single-select replaces (matching `togglePendingUserInputOptionSelection`).
 fn user_input_option(
     item_index: usize,
     question_index: usize,
@@ -750,31 +844,50 @@ fn user_input_option(
     let request_id = request_id.to_string();
     let question_id = question_id.to_string();
     let value = value.to_string();
-    let mark = match (multi_select, selected) {
-        (true, true) => "☑",
-        (true, false) => "☐",
-        (false, true) => "●",
-        (false, false) => "○",
+    let mark = if multi_select {
+        checkbox_mark(selected)
+    } else {
+        radio_mark(selected)
     };
-    let mut row = div()
+    let mut label_col = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(label.to_string()),
+        );
+    // The contract makes `description` required; the web hides it when it
+    // just repeats the label.
+    if !description.is_empty() && description != label {
+        label_col = label_col.child(
+            div()
+                .text_size(theme::text_size::XS_2)
+                .text_color(theme::secondary_label())
+                .child(description.to_string()),
+        );
+    }
+    div()
         .id((
             "ui-opt",
             item_index * 4096 + question_index * 64 + option_index,
         ))
         .flex()
         .items_start()
-        .gap_2()
+        .gap(px(10.)) // gap-2.5
         .px_2()
         .py_1p5()
         .rounded_md()
-        .border_1()
         .cursor_pointer()
-        .border_color(if selected {
-            theme::primary()
+        .text_color(if selected {
+            theme::fg()
         } else {
-            theme::border()
+            theme::fg_dim()
         })
-        .when(selected, |d| d.bg(theme::selected()))
         .hover(|s| s.bg(theme::hover()))
         .on_click(move |_event, window, cx| {
             let request_id = request_id.clone();
@@ -801,42 +914,17 @@ fn user_input_option(
                 cx.notify();
             });
         })
+        // The `flex h-5 items-center` slot keeps the mark on the label's
+        // first line (text-sm at 22.75px leading ≈ h-5).
         .child(
             div()
-                .text_xs()
+                .h(px(20.))
                 .flex_shrink_0()
-                .text_color(if selected {
-                    theme::primary()
-                } else {
-                    theme::fg_muted()
-                })
+                .flex()
+                .items_center()
                 .child(mark),
         )
-        .child(
-            div().flex().flex_col().flex_1().min_w_0().gap_1().child(
-                div()
-                    .text_sm()
-                    .text_color(if selected {
-                        theme::fg()
-                    } else {
-                        theme::fg_muted()
-                    })
-                    .child(label.to_string()),
-            ),
-        );
-    // The contract makes `description` required; the web hides it when it
-    // just repeats the label.
-    if !description.is_empty() && description != label {
-        row = row.child(
-            div()
-                .flex_shrink_0()
-                .max_w(px(280.))
-                .text_xs()
-                .text_color(theme::fg_muted())
-                .child(description.to_string()),
-        );
-    }
-    row
+        .child(label_col)
 }
 
 /// Display form of a recorded `questionAnswer.answers` value: a string, or a
@@ -884,9 +972,11 @@ fn diff_line_color(line: &str) -> Rgba {
     if line.starts_with("+++") || line.starts_with("---") {
         theme::fg_muted()
     } else if line.starts_with('+') {
-        success()
+        // `--diff-addition-foreground`
+        theme::diff_add_fg()
     } else if line.starts_with('-') {
-        danger()
+        // `--diff-deletion-foreground`
+        theme::diff_del_fg()
     } else if line.starts_with("@@") {
         theme::primary()
     } else {
@@ -1070,13 +1160,22 @@ impl AppView {
             .turn_started_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        let label = if elapsed < 60 {
-            format!("{elapsed}s")
-        } else if elapsed < 3600 {
-            format!("{}m {:02}s", elapsed / 60, elapsed % 60)
-        } else {
-            format!("{}h {:02}m", elapsed / 3600, (elapsed % 3600) / 60)
-        };
+        // `formatWorkingTimer` → `formatDuration`: "Ns" under a minute, then
+        // "Hm Ss" / "Hh Mm Ss" with zero parts dropped (never zero-padded).
+        let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
+        let mut parts = Vec::new();
+        if elapsed >= 60 {
+            if h > 0 {
+                parts.push(format!("{h}h"));
+            }
+            if m > 0 {
+                parts.push(format!("{m}m"));
+            }
+        }
+        if elapsed < 60 || s > 0 || m > 0 {
+            parts.push(format!("{s}s"));
+        }
+        let label = parts.join(" ");
         div()
             .border_b_1()
             .border_color(theme::hairline())
@@ -1092,6 +1191,7 @@ impl AppView {
                     .px_1()
                     .text_sm()
                     .line_height(px(22.75))
+                    .font_features(tabular_nums())
                     .text_color(theme::fg_muted())
                     .child(format!("Working for {label}")),
             )
@@ -1186,7 +1286,7 @@ impl AppView {
                     .child("queued"),
             );
         }
-        if let Some(ts) = item_timestamp(item) {
+        if let Some(ts) = item_timestamp(item, false) {
             meta = meta.child(ts);
         }
         meta = meta.child(copy_chip(
@@ -1298,15 +1398,18 @@ impl AppView {
                 .map(str::to_owned)
                 .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()))
                 .unwrap_or_default();
-            for (up, glyph, eid) in [(true, "☝", 0usize), (false, "☟", 1usize)] {
+            for (up, icon, eid) in [
+                (true, Icon::ThumbsUp, 0usize),
+                (false, Icon::ThumbsDown, 1usize),
+            ] {
                 let tid = thread_id.clone();
                 let iid = item.id.clone();
                 let shown = if sent {
-                    "✓"
+                    Icon::Check
                 } else if busy {
-                    "…"
+                    Icon::LoaderCircle
                 } else {
-                    glyph
+                    icon
                 };
                 let mut chip = ghost_icon_chip(("fb", index * 4 + eid), shown);
                 if sent || busy {
@@ -1329,7 +1432,7 @@ impl AppView {
         }
         meta = meta.child(buttons);
         if !item.streaming {
-            if let Some(ts) = item_timestamp(item) {
+            if let Some(ts) = item_timestamp(item, false) {
                 meta = meta.child(ts);
             }
         }
@@ -1382,7 +1485,12 @@ impl AppView {
             .items_center()
             .gap_2()
             .pt_1()
-            .child(div().text_xs().text_color(theme::fg_muted()).child("☟"))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme::fg_muted())
+                    .child(icons::icon(Icon::ThumbsDown, 12.).text_color(theme::fg_muted())),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1429,7 +1537,6 @@ impl AppView {
                     .id(("fb-cancel", index))
                     .px_1()
                     .py_0p5()
-                    .text_xs()
                     .cursor_pointer()
                     .text_color(theme::fg_muted())
                     .hover(|s| s.text_color(theme::fg()))
@@ -1439,7 +1546,7 @@ impl AppView {
                             cx.notify();
                         });
                     })
-                    .child("×"),
+                    .child(icons::icon(Icon::X, 12.).text_color(theme::fg_muted())),
             )
     }
 
@@ -1599,13 +1706,13 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("reasoning"),
+            work_entry_icon("reasoning"),
             div()
                 .text_color(self.live_label_color(live))
                 .child(label_text),
         );
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
         let mut col = div().flex().flex_col().child(header);
         if expanded && !text.is_empty() {
@@ -1650,22 +1757,16 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("command_execution"),
+            work_entry_icon("command_execution"),
             div()
                 .text_color(self.live_label_color(live))
                 .child(format!("{verb} {input}")),
         );
         if failed {
-            header = header.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::tool_error_icon())
-                    .flex_shrink_0()
-                    .child("✕"),
-            );
+            header = header.child(failed_x());
         }
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -1734,20 +1835,14 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("dynamic_tool"),
+            work_entry_icon("dynamic_tool"),
             div().text_color(self.live_label_color(live)).child(label),
         );
         if failed {
-            header = header.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::tool_error_icon())
-                    .flex_shrink_0()
-                    .child("✕"),
-            );
+            header = header.child(failed_x());
         }
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -1838,14 +1933,14 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("file_change"),
+            work_entry_icon("file_change"),
             div()
                 .text_color(self.live_label_color(live))
                 .child(format!("{verb} {file_label}")),
         );
         header = header
             .child(stats)
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
 
         let mut col = div().flex().flex_col().child(header);
@@ -1930,7 +2025,7 @@ impl AppView {
             .id(("head", index))
             .group("timeline-row")
             .items_start()
-            .child(work_icon(approval_glyph(kind), item.status == "failed"))
+            .child(work_icon(approval_icon(kind), item.status == "failed"))
             .child(
                 div()
                     .flex_1()
@@ -1945,7 +2040,7 @@ impl AppView {
                             .unwrap_or_else(|| request_kind_label(kind).to_string()),
                     ),
             );
-        header = header.when_some(item_timestamp(item), |d, ts| d.child(ts));
+        header = header.when_some(item_timestamp(item, false), |d, ts| d.child(ts));
         col = col.child(header);
 
         // `ms-7.5 flex flex-col gap-1 pb-1 text-xs`
@@ -1967,7 +2062,11 @@ impl AppView {
                     .items_center()
                     .gap_1()
                     .text_color(warning())
-                    .child(div().flex_shrink_0().child("⚠"))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(icons::icon(Icon::Shield, 14.).text_color(warning())),
+                    )
                     .child(div().child("Waiting for approval")),
             );
             actions = actions.child(div().text_color(theme::fg_muted()).child("·"));
@@ -2005,7 +2104,11 @@ impl AppView {
                                 cx.notify();
                             });
                         })
-                        .when(*has_warning, |d| d.child(div().child("⚠")))
+                        .when(*has_warning, |d| {
+                            d.child(div().child(
+                                icons::icon(Icon::TriangleAlert, 12.).text_color(theme::warning()),
+                            ))
+                        })
                         .child(div().child(label)),
                 );
             }
@@ -2128,7 +2231,7 @@ impl AppView {
                     .items_center()
                     .min_h(px(24.))
                     .gap(px(6.))
-                    .child(work_icon("?", false))
+                    .child(work_icon(Icon::MessageSquare, false))
                     .child(
                         div()
                             .text_sm()
@@ -2437,7 +2540,7 @@ impl AppView {
         // `ContextCompactionTimelineRow`: `mx-auto … gap-3 py-1 text-xs
         // text-muted-foreground` flanked by `h-px flex-1 bg-border/70` rules.
         let line_color = if failed {
-            danger_border()
+            theme::error_rule()
         } else {
             theme::hairline()
         };
@@ -2452,13 +2555,14 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .when(failed, |d| d.text_color(danger()))
-                            .when(!failed, |d| d.text_color(theme::fg_muted()))
-                            .child(if failed { "⚠" } else { "⇥⇤" }),
-                    )
+                    .when(failed, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(danger())
+                                .child(icons::icon(Icon::TriangleAlert, 12.).text_color(danger())),
+                        )
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -2497,11 +2601,11 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("todo_list"),
+            work_entry_icon("todo_list"),
             div().text_color(self.live_label_color(live)).child(label),
         );
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -2532,10 +2636,15 @@ impl AppView {
                 // Contract: pending | running | completed; accept provider
                 // spellings like in_progress/done too.
                 let status = step["status"].as_str().unwrap_or("pending");
-                let (glyph, color, done) = match status {
-                    "completed" | "done" => ("✓", success(), true),
-                    "running" | "in_progress" | "in-progress" => ("◐", theme::primary(), false),
-                    _ => ("○", theme::fg_muted(), false),
+                let (icon, color, done) = match status {
+                    // check
+                    "completed" | "done" => (Icon::Check, success(), true),
+                    // circle-dot (in progress)
+                    "running" | "in_progress" | "in-progress" => {
+                        (Icon::CircleDot, theme::primary(), false)
+                    }
+                    // circle
+                    _ => (Icon::Circle, theme::fg_muted(), false),
                 };
                 let text = step["text"]
                     .as_str()
@@ -2547,7 +2656,16 @@ impl AppView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().text_xs().text_color(color).child(glyph))
+                        .child(
+                            div()
+                                .w(px(16.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(color)
+                                .child(icons::icon(icon, 14.).text_color(color)),
+                        )
                         .child(
                             div()
                                 .text_sm()
@@ -2574,7 +2692,7 @@ impl AppView {
             .unwrap_or_else(|| item.kind.clone());
         work_row_line()
             .group("timeline-row")
-            .child(work_icon("ℹ", failed))
+            .child(work_icon(notice_icon(item, failed), failed))
             .child(
                 div()
                     .flex_1()
@@ -2587,7 +2705,7 @@ impl AppView {
                     })
                     .child(text),
             )
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .into_any_element()
     }
 
@@ -2623,7 +2741,7 @@ impl AppView {
             // row style — ⚠ icon + `text-destructive` heading, no card.
             return work_row_line()
                 .group("timeline-row")
-                .child(work_icon("⚠", true))
+                .child(work_icon(Icon::CircleAlert, true))
                 .child(
                     div()
                         .flex_1()
@@ -2652,14 +2770,14 @@ impl AppView {
                             )
                         }),
                 )
-                .when_some(item_timestamp(item), |d, ts| d.child(ts))
+                .when_some(item_timestamp(item, true), |d, ts| d.child(ts))
                 .into_any_element();
         }
         // Usage-limit failures keep the warning-toned banner.
         div()
             .rounded_lg()
             .border_1()
-            .border_color(warning_border())
+            .border_color(theme::warning_border())
             .bg(rgba(0xe8b45a14))
             .px_3()
             .py_2()
@@ -2671,6 +2789,11 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(icons::icon(Icon::TriangleAlert, 14.).text_color(warning())),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -2778,7 +2901,7 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph("subagent"),
+            work_entry_icon("subagent"),
             div()
                 .text_color(self.live_label_color(live))
                 .child(if status_label.is_empty() {
@@ -2788,7 +2911,7 @@ impl AppView {
                 }),
         );
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
 
         let mut col = div().flex().flex_col().child(header);
@@ -2819,7 +2942,7 @@ impl AppView {
                         .py_1()
                         .rounded_md()
                         .border_1()
-                        .border_color(warning_border())
+                        .border_color(theme::warning_border())
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(move |_event, window, cx| {
@@ -2830,10 +2953,9 @@ impl AppView {
                         })
                         .child(
                             div()
-                                .text_xs()
                                 .text_color(warning())
                                 .flex_shrink_0()
-                                .child("⚠"),
+                                .child(icons::icon(Icon::TriangleAlert, 12.).text_color(warning())),
                         )
                         .child(
                             div()
@@ -2889,11 +3011,11 @@ impl AppView {
         let mut header = work_header(
             index,
             item,
-            work_glyph(item.kind.as_str()),
+            work_entry_icon(item.kind.as_str()),
             div().text_color(self.live_label_color(live)).child(text),
         );
         header = header
-            .when_some(item_timestamp(item), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -3004,7 +3126,12 @@ impl AppView {
                     .child(text),
             );
         if is_live(item) {
-            row = row.child(div().text_xs().text_color(theme::primary()).child("…"));
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme::primary())
+                    .child(icons::icon(Icon::Ellipsis, 14.).text_color(theme::primary())),
+            );
         }
         row = row.child(div().flex_1().h(px(1.)).bg(theme::hairline()));
         row.into_any_element()

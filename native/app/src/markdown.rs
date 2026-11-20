@@ -14,6 +14,7 @@ use gpui::{
     SharedString, StrikethroughStyle, StyledText, TextAlign, div, prelude::*, px, rems, rgb,
 };
 
+use crate::icons::{self, Icon};
 use crate::theme;
 
 /// Render a markdown document into block-level elements.
@@ -606,12 +607,7 @@ fn render_list(items: &[ListItem], first: bool, ctx: &mut RenderCtx) -> AnyEleme
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(
-                                    div()
-                                        .text_size(px(9.))
-                                        .text_color(theme::canvas())
-                                        .child("✓"),
-                                )
+                                .child(icons::icon(Icon::Check, 9.).text_color(theme::canvas()))
                         }),
                 )
                 .into_any_element(),
@@ -636,11 +632,26 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
         .max(table.rows.iter().map(|r| r.len()).max().unwrap_or(0))
         .max(1);
 
-    fn cell(text: &str, ix: usize, align: Align, header: bool, ctx: &mut RenderCtx) -> AnyElement {
-        let mut d = div().flex_1().px_2().py(px(4.));
-        if ix > 0 {
-            d = d.border_l_1().border_color(theme::border());
-        }
+    /// `.chat-markdown th, td`: `padding: 0.45rem 0.75rem`, `vertical-align:
+    /// top`, `text-align: start`, `max-width: 24rem`; the first/last cells
+    /// drop their outer horizontal padding so the columns sit flush with the
+    /// surrounding prose. `thead th` adds weight 600 and a taller 0.55rem
+    /// block padding.
+    fn cell(
+        text: &str,
+        ix: usize,
+        last: usize,
+        align: Align,
+        header: bool,
+        ctx: &mut RenderCtx,
+    ) -> AnyElement {
+        let mut d = div()
+            .flex_1()
+            .min_w_0()
+            .max_w(px(384.)) // 24rem
+            .py(px(if header { 8.8 } else { 7.2 }))
+            .when(ix > 0, |d| d.pl(px(12.)))
+            .when(ix < last, |d| d.pr(px(12.)));
         d = match align {
             Align::Center => d.text_align(TextAlign::Center),
             Align::Right => d.text_align(TextAlign::Right),
@@ -653,25 +664,33 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
     }
 
     let align_at = |ix: usize| table.aligns.get(ix).copied().unwrap_or(Align::Left);
+    let last = cols - 1;
 
+    // Diagnostics-style table: no card chrome — a 100%-width row of `border-
+    // bottom: contrast-border/60` separators, one step under 15px prose.
+    // The container scrolls horizontally when a wide table overflows.
     let mut tbl = div()
+        .id(ctx.next_id())
         .mt(px(if first { 0. } else { 10.4 }))
         .w_full()
+        .overflow_x_scroll()
         .flex()
         .flex_col()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme::border())
-        .overflow_hidden()
-        .bg(theme::canvas())
-        .text_xs()
+        .text_sm() // 0.875rem
         .text_color(theme::chat_fg());
 
-    let mut hrow = div().flex().w_full().bg(theme::raised());
+    // `thead th`: `border-bottom` + `font-weight: 600`.
+    let mut hrow = div()
+        .flex()
+        .w_full()
+        .items_start()
+        .border_b_1()
+        .border_color(theme::table_rule());
     for ix in 0..cols {
         hrow = hrow.child(cell(
             table.header.get(ix).map(|s| s.as_str()).unwrap_or(""),
             ix,
+            last,
             align_at(ix),
             true,
             ctx,
@@ -679,16 +698,19 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
     }
     tbl = tbl.child(hrow);
 
+    // `tbody td`: every body row gets the same bottom separator.
     for row in &table.rows {
         let mut r = div()
             .flex()
             .w_full()
-            .border_t_1()
-            .border_color(theme::border());
+            .items_start()
+            .border_b_1()
+            .border_color(theme::table_rule());
         for ix in 0..cols {
             r = r.child(cell(
                 row.get(ix).map(|s| s.as_str()).unwrap_or(""),
                 ix,
+                last,
                 align_at(ix),
                 false,
                 ctx,
