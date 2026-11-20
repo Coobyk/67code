@@ -96,6 +96,15 @@ pub fn raised() -> Rgba {
 pub fn border() -> Rgba {
     pick(rgba(0xffffff14), rgb(0xe4e4e7))
 }
+/// `border-border/60` — the web's 60%-border (SettingsGroup card outline).
+/// (`border_soft` already covers the terminal drawer's /80 hairline.)
+pub fn card_border() -> Rgba {
+    pick(rgba(0xffffff0d), rgba(0xe4e4e799))
+}
+/// `bg-card/40` — the web SettingsGroup card fill (--card · 40%).
+pub fn card_surface_40() -> Rgba {
+    pick(rgba(0x11111166), rgba(0xffffff66))
+}
 /// `--input`. dark white·11% · light zinc-300 #d4d4d8
 pub fn input() -> Rgba {
     pick(rgba(0xffffff1c), rgb(0xd4d4d8))
@@ -107,6 +116,11 @@ pub fn muted() -> Rgba {
 /// `--muted-foreground`. dark neutral-400 #a3a3a3 · light zinc-500 #71717a
 pub fn fg_muted() -> Rgba {
     pick(rgb(0xa3a3a3), rgb(0x71717a))
+}
+/// `text-muted-foreground/70` — the web's 70%-muted body line (palette row
+/// descriptions, thread-row timestamps).
+pub fn fg_muted_soft() -> Rgba {
+    pick(rgba(0xa3a3a3b3), rgba(0x71717ab3))
 }
 /// `--placeholder` = muted-foreground.
 pub fn placeholder() -> Rgba {
@@ -150,6 +164,16 @@ pub fn user_bubble() -> Rgba {
 /// `--code-background`. dark ~#0f0f0f · light ~#fbfbfb
 pub fn code_bg() -> Rgba {
     pick(rgb(0x0f0f0f), rgb(0xfbfbfb))
+}
+/// `.chat-markdown-codeblock` card: `bg-secondary`, dark `bg-input/32`
+/// (white·11% at 32% ≈ white·3.5%). dark white·3.5% · light zinc-50 #fafafa
+pub fn code_block_bg() -> Rgba {
+    pick(rgba(0xffffff09), rgb(0xfafafa))
+}
+/// `ChangedFilesCard`: `bg-secondary`, dark `bg-input/20` (white·11% at 20%
+/// ≈ white·2.2%). dark white·2.2% · light zinc-50 #fafafa
+pub fn changed_files_bg() -> Rgba {
+    pick(rgba(0xffffff06), rgb(0xfafafa))
 }
 /// `--error` / `--destructive`. dark #f15757 · light #ef4444
 pub fn error() -> Rgba {
@@ -319,8 +343,20 @@ pub fn control_fg() -> Rgba {
 pub fn primary_hover() -> Rgba {
     pick(rgb(0x2f61d9), rgb(0x325fdb))
 }
+/// Disabled send when the blue circle treatment is kept — the dev
+/// stage-backdrop button art at `disabled:opacity-64` (~primary·45% over the
+/// card, matching the reference's #1c3c76 reading).
+pub fn primary_dim() -> Rgba {
+    pick(rgba(0x346bf180), rgba(0x1b4ed880))
+}
+/// The disabled send's white glyph at ~60% (`disabled:opacity-64` over the
+/// primary-foreground white).
+pub fn primary_fg_dim() -> Rgba {
+    rgba(0xffffff99)
+}
 /// Disabled send/stop fill: `bg-foreground/12`.
 /// dark neutral-100·12% · light zinc-900·12%
+#[allow(dead_code)] // Kept for the non-backdrop disabled control look.
 pub fn disabled_fill() -> Rgba {
     pick(rgba(0xf5f5f51f), rgba(0x18181b1f))
 }

@@ -8,6 +8,7 @@
 //! (idle, pending, running, waiting, completed, failed, cancelled, interrupted).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local};
@@ -50,6 +51,38 @@ pub struct State {
     pub feedback_comment: Option<(String, String, Entity<TextField>)>,
     /// Keeps the feedback field's `PromptSubmitted` (Enter) subscription.
     pub feedback_sub: Option<Subscription>,
+    /// Fenced-code blocks the user unwrapped (markdown block key → nowrap).
+    /// Absent = wrapped, the web's default `data-wrap`.
+    pub code_unwrapped: HashSet<u64>,
+    /// Fenced-code block key whose header Copy action last ran.
+    pub code_copied: Option<u64>,
+    /// Checkpoint card directory expansion: checkpoint item id → state.
+    pub checkpoint_dirs: HashMap<String, CheckpointDirState>,
+    /// Checkpoint item id → turn-diff fetch for the inline "Open diff".
+    pub checkpoint_diffs: HashMap<String, CheckpointDiff>,
+}
+
+/// Changed-files card directory expansion (web `allDirectoriesExpanded`
+/// plus per-directory overrides), defaulting to collapsed.
+#[derive(Default)]
+pub struct CheckpointDirState {
+    /// The expand/collapse-all baseline (web default `false`).
+    pub all_expanded: bool,
+    /// Directory paths flipped from `all_expanded` by a row click.
+    pub overrides: HashSet<String>,
+}
+
+impl CheckpointDirState {
+    fn is_expanded(&self, path: &str) -> bool {
+        self.overrides.contains(path) != self.all_expanded
+    }
+}
+
+/// A `orchestration.getTurnDiff` result for the changed-files card.
+pub enum CheckpointDiff {
+    Loading,
+    Loaded(String),
+    Error(String),
 }
 
 /// `text-success` (`--success`) — approved outcomes, "Answered", +N counts.
@@ -380,6 +413,153 @@ fn toggle_expanded(
             cx.notify();
         });
     }
+}
+
+// ── Turn folds (web `deriveTurnFolds` → "Worked for 1m 17s ›") ──────
+//
+// Once a turn settles, its work entries (and earlier assistant narration)
+// collapse behind one bordered row; the terminal assistant message stays
+// visible. Compactions, checkpoint cards, notices, errors and answered
+// user-input cards never fold, and a segment containing live items is
+// left alone.
+
+/// Kinds that may hide inside a turn fold (the web's `foldedWorkEntry`).
+fn is_fold_work_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "reasoning"
+            | "command_execution"
+            | "dynamic_tool"
+            | "file_change"
+            | "subagent"
+            | "web_search"
+            | "file_search"
+            | "todo_list"
+            | "approval_request"
+            | "user_input_request"
+    )
+}
+
+struct TurnFold {
+    /// `expanded` key — `fold:{boundary user_message id}`.
+    key: String,
+    label: String,
+}
+
+/// One row in the rendered timeline after fold collapsing.
+enum TimelineRow {
+    Item(usize),
+    Fold {
+        key: String,
+        label: String,
+        anchor: usize,
+        open: bool,
+    },
+}
+
+/// Map `item index → fold key` for every foldable item; the anchor row
+/// renders at the smallest index of each fold's set.
+fn derive_turn_folds(items: &[TurnItemView]) -> (HashMap<usize, TurnFold>, HashMap<usize, String>) {
+    let mut anchors: HashMap<usize, TurnFold> = HashMap::new();
+    let mut hidden: HashMap<usize, String> = HashMap::new();
+    // A turn segment runs from one user message to the next — the web keys
+    // groups by runId, which the boundary message stands in for here.
+    let bounds: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.kind == "user_message")
+        .map(|(i, _)| i)
+        .collect();
+    for (bi, &b) in bounds.iter().enumerate() {
+        let end = bounds.get(bi + 1).copied().unwrap_or(items.len());
+        let seg = (b + 1)..end;
+        if items[seg.clone()].iter().any(is_live) {
+            continue;
+        }
+        // The terminal assistant message (the turn's final reply) stays.
+        let terminal = items[seg.clone()]
+            .iter()
+            .rposition(|it| it.kind == "assistant_message")
+            .map(|p| seg.start + p);
+        let mut members: Vec<usize> = Vec::new();
+        for i in seg.clone() {
+            let it = &items[i];
+            let k = it.kind.as_str();
+            let foldable = if k == "assistant_message" {
+                Some(i) != terminal
+            } else if is_fold_work_kind(k) {
+                // Answered user-input cards stay (web `questionAnswer`).
+                !(k == "user_input_request" && !it.raw["questionAnswer"].is_null())
+            } else {
+                false
+            };
+            if !foldable {
+                continue;
+            }
+            // Work trailing the final reply folds only when it settled
+            // cleanly — failures after the reply stay visible (web
+            // `isFoldableTrailingActivity`).
+            if terminal.is_some_and(|t| i > t) && it.status == "failed" {
+                continue;
+            }
+            members.push(i);
+        }
+        if members.is_empty() {
+            continue;
+        }
+        // Duration: boundary message → the segment's newest timestamp, in
+        // the working-timer's "Ns" / "Hm Ss" / "Hh Mm Ss" form.
+        fn iso<'a>(it: &'a TurnItemView, keys: [&str; 2]) -> Option<&'a str> {
+            keys.iter().find_map(|k| raw_str(it, k))
+        }
+        let start_iso = iso(&items[b], ["createdAt", "updatedAt"]);
+        let end_iso = items[seg.clone()]
+            .iter()
+            .rev()
+            .find_map(|it| iso(it, ["updatedAt", "createdAt"]));
+        let secs = match (start_iso, end_iso) {
+            (Some(a), Some(z)) => DateTime::parse_from_rfc3339(a)
+                .ok()
+                .zip(DateTime::parse_from_rfc3339(z).ok())
+                .map(|(a, z)| (z - a).num_seconds().max(0) as u64),
+            _ => None,
+        };
+        let stopped = items[seg.clone()]
+            .iter()
+            .any(|it| it.status == "interrupted");
+        let label = match (stopped, secs.map(format_work_duration)) {
+            (true, Some(d)) => format!("You stopped after {d}"),
+            (true, None) => "You stopped this response".to_string(),
+            (false, Some(d)) => format!("Worked for {d}"),
+            (false, None) => "Worked".to_string(),
+        };
+        let key = format!("fold:{}", items[b].id);
+        for &i in &members {
+            hidden.insert(i, key.clone());
+        }
+        anchors.insert(members[0], TurnFold { key, label });
+    }
+    (anchors, hidden)
+}
+
+/// `formatDuration` — "Ns" under a minute, then "Hm Ss" / "Hh Mm Ss" with
+/// zero parts dropped (never zero-padded). Shared by the working timer and
+/// turn-fold labels.
+fn format_work_duration(elapsed: u64) -> String {
+    let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
+    let mut parts = Vec::new();
+    if elapsed >= 60 {
+        if h > 0 {
+            parts.push(format!("{h}h"));
+        }
+        if m > 0 {
+            parts.push(format!("{m}m"));
+        }
+    }
+    if elapsed < 60 || s > 0 || m > 0 {
+        parts.push(format!("{s}s"));
+    }
+    parts.join(" ")
 }
 
 /// Pretty-print a JSON detail value; strings pass through verbatim.
@@ -994,6 +1174,131 @@ fn outcome_color(item: &TurnItemView) -> Rgba {
     }
 }
 
+// ── Changed-files tree (web `buildTurnDiffTree`) ─────────────────────
+//
+// Checkpoint `files` become a directory tree: dirs sort before files,
+// everything name-sorted, and single-child directory chains compact into
+// one `a/b` row.
+
+enum FileTreeNode {
+    Dir {
+        name: String,
+        path: String,
+        additions: u64,
+        deletions: u64,
+        children: Vec<FileTreeNode>,
+    },
+    File {
+        name: String,
+        additions: Option<u64>,
+        deletions: Option<u64>,
+    },
+}
+
+#[derive(Default)]
+struct DirBuilder {
+    dirs: std::collections::BTreeMap<String, DirBuilder>,
+    files: Vec<FileTreeNode>,
+    additions: u64,
+    deletions: u64,
+}
+
+impl DirBuilder {
+    fn into_nodes(self, prefix: &str) -> Vec<FileTreeNode> {
+        let mut out: Vec<FileTreeNode> = Vec::new();
+        for (name, dir) in self.dirs {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            // Compact single-child directory chains into one row.
+            let mut name = name;
+            let mut path = path;
+            let mut dir = dir;
+            while dir.dirs.len() == 1 && dir.files.is_empty() {
+                let Some((child_name, child)) = dir.dirs.pop_first() else {
+                    break;
+                };
+                name = format!("{name}/{child_name}");
+                path = format!("{path}/{child_name}");
+                dir = child;
+            }
+            let additions = dir.additions;
+            let deletions = dir.deletions;
+            let children = dir.into_nodes(&path);
+            out.push(FileTreeNode::Dir {
+                name,
+                path,
+                additions,
+                deletions,
+                children,
+            });
+        }
+        out.extend(self.files);
+        // Case-insensitive name sort, directories first (approximates the
+        // web's `Intl.Collator numeric/base` ordering).
+        fn node_name(node: &FileTreeNode) -> &str {
+            match node {
+                FileTreeNode::Dir { name, .. } | FileTreeNode::File { name, .. } => name,
+            }
+        }
+        out.sort_by(|a, b| {
+            let rank = |n: &FileTreeNode| matches!(n, FileTreeNode::Dir { .. });
+            rank(b).cmp(&rank(a)).then_with(|| {
+                node_name(a)
+                    .to_lowercase()
+                    .cmp(&node_name(b).to_lowercase())
+            })
+        });
+        out
+    }
+}
+
+/// Stable element-id hash for tree paths (ids must survive re-renders).
+fn fnv_node(s: &str) -> usize {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h & (u64::MAX >> 1)) as usize
+}
+
+fn build_file_tree(files: &[Value]) -> Vec<FileTreeNode> {
+    let mut root = DirBuilder::default();
+    for file in files {
+        let Some(path) = file["path"].as_str() else {
+            continue;
+        };
+        let segments: Vec<String> = path
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let Some(name) = segments.last() else {
+            continue;
+        };
+        let additions = file["additions"].as_u64();
+        let deletions = file["deletions"].as_u64();
+        // Each ancestor directory aggregates the file's stats.
+        let mut dir = &mut root;
+        dir.additions += additions.unwrap_or(0);
+        dir.deletions += deletions.unwrap_or(0);
+        for segment in &segments[..segments.len().saturating_sub(1)] {
+            dir = dir.dirs.entry(segment.clone()).or_default();
+            dir.additions += additions.unwrap_or(0);
+            dir.deletions += deletions.unwrap_or(0);
+        }
+        dir.files.push(FileTreeNode::File {
+            name: name.clone(),
+            additions,
+            deletions,
+        });
+    }
+    root.into_nodes("")
+}
+
 fn request_kind_label(kind: &str) -> &'static str {
     match kind {
         "command" => "Command approval",
@@ -1028,7 +1333,7 @@ impl AppView {
             .max_w(px(theme::CHAT_MAX_W))
             .flex()
             .flex_col();
-        let list = || {
+        let list = |lane: gpui::Div| {
             div()
                 .id("messages")
                 .flex()
@@ -1038,46 +1343,89 @@ impl AppView {
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll_handle)
                 .px(px(48.))
+                .child(lane)
         };
         // Top/bottom spacers ≈ chat-list-header/footer (h-3 / h-4).
         lane = lane.child(div().h(px(12.)).flex_shrink_0());
 
-        let empty_state = |lane: gpui::Div| {
-            lane.child(
-                div()
-                    .flex_1()
-                    .min_h(px(120.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(theme::fg_muted())
-                    .text_sm()
-                    .child("Send a message to start the conversation."),
-            )
+        // The web's empty-thread placeholder is a standalone `h-full` flex
+        // that centers the text in the viewport (with bottom padding for the
+        // composer inset), not a row inside the scroll lane.
+        let empty_state = || -> gpui::Stateful<gpui::Div> {
+            div()
+                .id("messages-empty")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .pb(px(90.))
+                .text_color(theme::fg_muted())
+                .text_sm()
+                .child("Send a message to start the conversation. ")
         };
 
         if self.state.connection != ConnectionStatus::Mock {
             if self.thread_items.is_empty() {
                 if self.turn_started_at.is_some() {
                     lane = lane.child(self.render_working_row());
-                    return list().child(lane);
+                    return list(lane);
                 }
-                return list().child(empty_state(lane));
+                return empty_state();
             }
-            for (i, item) in self.thread_items.iter().enumerate() {
+            // Turn folds: settled work between two user messages collapses
+            // behind a "Worked for …" row; expanding it unhides the items in
+            // their original positions.
+            let (fold_anchors, fold_hidden) = derive_turn_folds(&self.thread_items);
+            let mut rows: Vec<TimelineRow> = Vec::new();
+            for i in 0..self.thread_items.len() {
+                if let Some(fold) = fold_anchors.get(&i) {
+                    let open = self.timeline_state.expanded.contains(&fold.key);
+                    rows.push(TimelineRow::Fold {
+                        key: fold.key.clone(),
+                        label: fold.label.clone(),
+                        anchor: i,
+                        open,
+                    });
+                    if !open {
+                        continue;
+                    }
+                } else if let Some(key) = fold_hidden.get(&i) {
+                    if !self.timeline_state.expanded.contains(key) {
+                        continue;
+                    }
+                }
+                rows.push(TimelineRow::Item(i));
+            }
+            for (ri, row) in rows.iter().enumerate() {
+                let next_is_work = match rows.get(ri + 1) {
+                    Some(TimelineRow::Item(j)) => is_work_kind(&self.thread_items[*j].kind),
+                    _ => false,
+                };
                 // Row rhythm: pb-4 under messages/plans, pb-2 under work-log
                 // entries and events; consecutive work entries touch (the
                 // web groups them at py-0 inside group-content).
-                let next = self.thread_items.get(i + 1);
-                let pad = if matches!(
-                    item.kind.as_str(),
-                    "user_message" | "assistant_message" | "proposed_plan"
-                ) {
-                    16.
-                } else if is_work_kind(&item.kind) && next.is_some_and(|n| is_work_kind(&n.kind)) {
-                    0.
-                } else {
-                    8.
+                let (pad, element) = match row {
+                    TimelineRow::Fold {
+                        key,
+                        label,
+                        anchor,
+                        open,
+                    } => (8., self.turn_fold_row(key, label, *anchor, *open)),
+                    TimelineRow::Item(i) => {
+                        let item = &self.thread_items[*i];
+                        let pad = if matches!(
+                            item.kind.as_str(),
+                            "user_message" | "assistant_message" | "proposed_plan" | "checkpoint"
+                        ) {
+                            16.
+                        } else if is_work_kind(&item.kind) && next_is_work {
+                            0.
+                        } else {
+                            8.
+                        };
+                        (pad, self.render_turn_item(*i, item))
+                    }
                 };
                 lane = lane.child(
                     div()
@@ -1085,18 +1433,18 @@ impl AppView {
                         .flex_col()
                         .max_w_full()
                         .pb(px(pad))
-                        .child(self.render_turn_item(i, item)),
+                        .child(element),
                 );
             }
             if self.turn_started_at.is_some() {
                 lane = lane.child(self.render_working_row());
             }
             lane = lane.child(div().h(px(16.)).flex_shrink_0());
-            return list().child(lane);
+            return list(lane);
         }
 
         if self.state.messages.is_empty() {
-            return list().child(empty_state(lane));
+            return empty_state();
         }
 
         for (i, message) in self.state.messages.iter().enumerate() {
@@ -1149,7 +1497,7 @@ impl AppView {
             lane = lane.child(div().id(("msg", i)).pb_4().child(row));
         }
         lane = lane.child(div().h(px(16.)).flex_shrink_0());
-        list().child(lane)
+        list(lane)
     }
 
     /// `WorkingTimelineRow`: `border-b border-border/60 pb-2 pt-1` around a
@@ -1160,22 +1508,7 @@ impl AppView {
             .turn_started_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        // `formatWorkingTimer` → `formatDuration`: "Ns" under a minute, then
-        // "Hm Ss" / "Hh Mm Ss" with zero parts dropped (never zero-padded).
-        let (h, m, s) = (elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
-        let mut parts = Vec::new();
-        if elapsed >= 60 {
-            if h > 0 {
-                parts.push(format!("{h}h"));
-            }
-            if m > 0 {
-                parts.push(format!("{m}m"));
-            }
-        }
-        if elapsed < 60 || s > 0 || m > 0 {
-            parts.push(format!("{s}s"));
-        }
-        let label = parts.join(" ");
+        let label = format_work_duration(elapsed);
         div()
             .border_b_1()
             .border_color(theme::hairline())
@@ -1197,6 +1530,77 @@ impl AppView {
             )
     }
 
+    /// `TurnFoldRow` — the same `border-b pb-2 pt-1` row as the working
+    /// timer, but a button: "Worked for 1m 17s" plus a `size-3.5` chevron
+    /// that toggles the turn's hidden work entries.
+    fn turn_fold_row(&self, key: &str, label: &str, anchor: usize, open: bool) -> AnyElement {
+        div()
+            .id(("fold", anchor))
+            .group("timeline-row")
+            .border_b_1()
+            .border_color(theme::hairline())
+            .pb_2()
+            .pt_1()
+            .cursor_pointer()
+            .on_click(toggle_expanded(key.to_string()))
+            .child(
+                div()
+                    .flex()
+                    .h(px(24.))
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .text_sm()
+                    .line_height(px(22.75))
+                    .font_features(tabular_nums())
+                    .text_color(theme::fg_muted())
+                    .child(label.to_string())
+                    .child(
+                        div().flex_shrink_0().child(
+                            icons::icon(
+                                if open {
+                                    Icon::ChevronDown
+                                } else {
+                                    Icon::ChevronRight
+                                },
+                                14.,
+                            )
+                            .text_color(theme::fg_muted()),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Per-code-block state + click wiring for `render_markdown_ctx` —
+    /// wrap toggle and copy are stored on `timeline_state` keyed by the
+    /// block's content hash so they survive re-renders.
+    fn markdown_code_ui(&self, key: u64) -> crate::markdown::CodeBlockUi {
+        crate::markdown::CodeBlockUi {
+            wrapped: !self.timeline_state.code_unwrapped.contains(&key),
+            copied: self.timeline_state.code_copied == Some(key),
+            on_toggle_wrap: Some(Rc::new(move |_event, window, cx| {
+                update_view(window, cx, move |this, cx| {
+                    if !this.timeline_state.code_unwrapped.remove(&key) {
+                        this.timeline_state.code_unwrapped.insert(key);
+                    }
+                    cx.notify();
+                });
+            })),
+            on_copied: Some(Rc::new(move |_event, window, cx| {
+                update_view(window, cx, move |this, cx| {
+                    this.timeline_state.code_copied = Some(key);
+                    cx.notify();
+                });
+            })),
+        }
+    }
+
+    fn render_md(&self, text: &str) -> Vec<AnyElement> {
+        crate::markdown::render_markdown_ctx(text, &mut |key| self.markdown_code_ui(key))
+    }
+
     fn render_turn_item(&self, index: usize, item: &TurnItemView) -> AnyElement {
         match item.kind.as_str() {
             "user_message" => self.user_message_row(index, item),
@@ -1214,6 +1618,7 @@ impl AppView {
             "subagent" => self.subagent_row(index, item),
             "web_search" | "file_search" => self.search_row(index, item),
             "compaction" | "context_compaction" => self.compaction_row(item),
+            "checkpoint" => self.checkpoint_row(index, item),
             _ => self.fallback_row(item),
         }
     }
@@ -1237,7 +1642,7 @@ impl AppView {
             .line_height(px(22.75))
             .bg(theme::user_bubble())
             .text_color(theme::fg())
-            .children(crate::markdown::render_markdown(&text));
+            .children(self.render_md(&text));
         if !citations.is_empty() {
             let mut chips = div().flex().flex_wrap().gap_1().pt_1();
             for (ci, citation) in citations.iter().enumerate() {
@@ -1326,7 +1731,7 @@ impl AppView {
             .min_w_0()
             .px_1()
             .py_0p5()
-            .children(crate::markdown::render_markdown(&text));
+            .children(self.render_md(&text));
         if show_empty {
             col = col.child(
                 div()
@@ -2855,7 +3260,7 @@ impl AppView {
                     .mt_4()
                     .flex()
                     .flex_col()
-                    .children(crate::markdown::render_markdown(markdown)),
+                    .children(self.render_md(markdown)),
             );
         if actionable {
             card = card.child(
@@ -3135,5 +3540,446 @@ impl AppView {
         }
         row = row.child(div().flex_1().h(px(1.)).bg(theme::hairline()));
         row.into_any_element()
+    }
+
+    /// `checkpoint` turn item — the web's `ChangedFilesCard`: an `mt-4
+    /// rounded-lg` card with a "N changed files +A -D" header, an
+    /// expand-all toggle, an "Open diff" action (fetches
+    /// `orchestration.getTurnDiff` and shows the patch inline), and the
+    /// file tree (`h-7` mono rows, directories collapsible).
+    fn checkpoint_row(&self, index: usize, item: &TurnItemView) -> AnyElement {
+        let files: &[Value] = item.raw["files"].as_array().map_or(&[], Vec::as_slice);
+        let totals = &item.raw["filesTotal"];
+        let count = totals["count"].as_u64().unwrap_or(files.len() as u64);
+        let sum = |key: &str| -> u64 { files.iter().filter_map(|f| f[key].as_u64()).sum() };
+        let total_adds = totals["additions"]
+            .as_u64()
+            .unwrap_or_else(|| sum("additions"));
+        let total_dels = totals["deletions"]
+            .as_u64()
+            .unwrap_or_else(|| sum("deletions"));
+
+        let tree = build_file_tree(files);
+        let has_dirs = tree.iter().any(|n| matches!(n, FileTreeNode::Dir { .. }));
+        let all_expanded = self
+            .timeline_state
+            .checkpoint_dirs
+            .get(&item.id)
+            .is_some_and(|s| s.all_expanded);
+
+        // "Open diff" needs the turn range — the checkpoint's own turn
+        // count is approximated by the number of turn-start user messages
+        // up to this item (each starts an app run).
+        let mut run_ids: HashSet<String> = HashSet::new();
+        let mut unrun_boundaries = 0u64;
+        for it in &self.thread_items[..=index.min(self.thread_items.len().saturating_sub(1))] {
+            if it.kind != "user_message" {
+                continue;
+            }
+            if matches!(
+                raw_str(it, "inputIntent"),
+                Some("steer" | "promoted_queued_to_steer")
+            ) {
+                continue;
+            }
+            match raw_str(it, "runId") {
+                Some(run) => {
+                    run_ids.insert(run.to_string());
+                }
+                None => unrun_boundaries += 1,
+            }
+        }
+        let to_turn = run_ids.len() as u64 + unrun_boundaries;
+        let from_turn = to_turn.saturating_sub(1);
+        let thread_id = raw_str(item, "threadId")
+            .map(str::to_owned)
+            .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()));
+        let diff_open = self
+            .timeline_state
+            .expanded
+            .contains(&format!("cdiff:{}", item.id));
+
+        // Header: "2 changed files" + inline DiffStatLabel, then the
+        // expand-all icon and the "Open diff" ghost button.
+        let mut title = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .min_w_0()
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme::fg())
+            .child(format!(
+                "{count} changed file{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        if total_adds > 0 {
+            title = title.child(
+                div()
+                    .text_xs()
+                    .text_color(success())
+                    .child(format!("+{total_adds}")),
+            );
+        }
+        if total_dels > 0 {
+            title = title.child(
+                div()
+                    .text_xs()
+                    .text_color(danger())
+                    .child(format!("-{total_dels}")),
+            );
+        }
+
+        let mut actions = div().flex().items_center().gap_1().flex_shrink_0();
+        if has_dirs {
+            let item_id = item.id.clone();
+            actions = actions.child(
+                div()
+                    .id(("cpdirs", index))
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::accent()))
+                    .on_click(move |_event, window, cx| {
+                        let item_id = item_id.clone();
+                        update_view(window, cx, move |this, cx| {
+                            let state = this
+                                .timeline_state
+                                .checkpoint_dirs
+                                .entry(item_id)
+                                .or_default();
+                            state.all_expanded = !state.all_expanded;
+                            state.overrides.clear();
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        icons::icon(
+                            if all_expanded {
+                                Icon::ChevronsDownUp
+                            } else {
+                                Icon::ChevronsUpDown
+                            },
+                            12.,
+                        )
+                        .text_color(theme::fg_muted()),
+                    ),
+            );
+        }
+        if let Some(tid) = thread_id.clone()
+            && to_turn > 0
+        {
+            let item_id = item.id.clone();
+            actions = actions.child(
+                div()
+                    .id(("cpdiff-btn", index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .h(px(24.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .on_click(move |_event, window, cx| {
+                        let item_id = item_id.clone();
+                        let tid = tid.clone();
+                        update_view(window, cx, move |this, cx| {
+                            this.open_checkpoint_diff(item_id, tid, from_turn, to_turn, cx);
+                        });
+                    })
+                    .child(icons::icon(Icon::FileDiff, 12.).text_color(theme::fg_muted()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("Open diff"),
+                    ),
+            );
+        }
+
+        let mut card = div()
+            .mt(px(16.))
+            .rounded_lg()
+            .bg(theme::changed_files_bg())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(title)
+                    .child(actions),
+            );
+
+        // File tree rows — `h-7 gap-2 pr-2`, `paddingLeft: 8 + depth*14`.
+        let dir_state = self.timeline_state.checkpoint_dirs.get(&item.id);
+        let mut rows = div().flex().flex_col().p_2();
+        fn stat_spans(additions: Option<u64>, deletions: Option<u64>) -> gpui::Div {
+            let mut d = div()
+                .ml_auto()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .font_family(theme::FONT_MONO)
+                .text_size(theme::text_size::XS_3)
+                .font_features(tabular_nums());
+            if let Some(a) = additions
+                && a > 0
+            {
+                d = d.child(div().text_color(success()).child(format!("+{a}")));
+            }
+            if let Some(dels) = deletions
+                && dels > 0
+            {
+                d = d.child(div().text_color(danger()).child(format!("-{dels}")));
+            }
+            d
+        }
+        fn file_rows<'a>(
+            nodes: &'a [FileTreeNode],
+            depth: usize,
+            dir_state: Option<&'a CheckpointDirState>,
+            has_dirs: bool,
+            item_id: &'a str,
+            index: usize,
+            rows: gpui::Div,
+        ) -> gpui::Div {
+            let mut rows = rows;
+            for node in nodes {
+                match node {
+                    FileTreeNode::Dir {
+                        name,
+                        path,
+                        additions,
+                        deletions,
+                        children,
+                    } => {
+                        let expanded = dir_state.is_some_and(|s| s.is_expanded(path));
+                        let row_id = ("cpdir", fnv_node(&format!("{index}:{path}")));
+                        let item_id_c = item_id.to_string();
+                        let path_c = path.clone();
+                        rows = rows.child(
+                            div()
+                                .id(row_id)
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .h(px(28.))
+                                .pl(px(8. + 14. * depth as f32))
+                                .pr_2()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::accent()))
+                                .on_click(move |_event, window, cx| {
+                                    let item_id = item_id_c.clone();
+                                    let path = path_c.clone();
+                                    update_view(window, cx, move |this, cx| {
+                                        let state = this
+                                            .timeline_state
+                                            .checkpoint_dirs
+                                            .entry(item_id)
+                                            .or_default();
+                                        if !state.overrides.remove(&path) {
+                                            state.overrides.insert(path);
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    div().w(px(14.)).flex_shrink_0().child(
+                                        icons::icon(
+                                            if expanded {
+                                                Icon::ChevronDown
+                                            } else {
+                                                Icon::ChevronRight
+                                            },
+                                            14.,
+                                        )
+                                        .text_color(theme::icon_muted()),
+                                    ),
+                                )
+                                .child(
+                                    div().w(px(14.)).flex_shrink_0().child(
+                                        icons::icon(
+                                            if expanded {
+                                                Icon::FolderOpen
+                                            } else {
+                                                Icon::Folder
+                                            },
+                                            14.,
+                                        )
+                                        .text_color(theme::icon_muted()),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(theme::FONT_MONO)
+                                        .text_size(theme::text_size::XS_2)
+                                        .text_color(theme::fg_muted())
+                                        .child(name.clone()),
+                                )
+                                .child(stat_spans(Some(*additions), Some(*deletions))),
+                        );
+                        if expanded {
+                            rows = file_rows(
+                                children,
+                                depth + 1,
+                                dir_state,
+                                has_dirs,
+                                item_id,
+                                index,
+                                rows,
+                            );
+                        }
+                    }
+                    FileTreeNode::File {
+                        name,
+                        additions,
+                        deletions,
+                    } => {
+                        rows = rows.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .h(px(28.))
+                                .pl(px(8. + 14. * depth as f32))
+                                .pr_2()
+                                .rounded_md()
+                                .when(has_dirs || depth > 0, |d| {
+                                    d.child(div().w(px(14.)).flex_shrink_0())
+                                })
+                                .child(div().w(px(14.)).flex_shrink_0().child(
+                                    icons::icon(Icon::File, 14.).text_color(theme::icon_muted()),
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(theme::FONT_MONO)
+                                        .text_xs()
+                                        .text_color(theme::chat_fg())
+                                        .child(name.clone()),
+                                )
+                                .child(stat_spans(*additions, *deletions)),
+                        );
+                    }
+                }
+            }
+            rows
+        }
+        rows = file_rows(&tree, 0, dir_state, has_dirs, &item.id, index, rows);
+        card = card.child(rows);
+
+        // "N more files in the full diff" when `files` is a wire prefix.
+        let hidden_files = count.saturating_sub(files.len() as u64);
+        if hidden_files > 0 {
+            card = card.child(div().px_3().pb_2().child(
+                div().text_xs().text_color(theme::fg_muted()).child(format!(
+                    "{hidden_files} more file{} in the full diff",
+                    if hidden_files == 1 { "" } else { "s" }
+                )),
+            ));
+        }
+
+        // The expanded inline patch below the tree (`detail_panel` mono).
+        if diff_open {
+            let state = self.timeline_state.checkpoint_diffs.get(&item.id);
+            let mut panel = detail_panel("cpdiff", index);
+            match state {
+                Some(CheckpointDiff::Loaded(diff)) if !diff.is_empty() => {
+                    for line in diff.lines().take(2000) {
+                        panel = panel.child(
+                            div()
+                                .text_color(diff_line_color(line))
+                                .child(line.to_string()),
+                        );
+                    }
+                }
+                Some(CheckpointDiff::Loaded(_)) => {
+                    panel = panel.child(div().italic().child("Empty diff."));
+                }
+                Some(CheckpointDiff::Error(e)) => {
+                    panel = panel.child(div().text_color(danger()).child(e.clone()));
+                }
+                _ => {
+                    panel = panel.child(div().italic().child("Loading diff…"));
+                }
+            }
+            card = card.child(div().px_2().pb_2().child(panel));
+        }
+        card.into_any_element()
+    }
+
+    /// Toggle the checkpoint card's inline turn diff; fetches
+    /// `orchestration.getTurnDiff` on first open.
+    fn open_checkpoint_diff(
+        &mut self,
+        item_id: String,
+        thread_id: String,
+        from_turn: u64,
+        to_turn: u64,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let key = format!("cdiff:{item_id}");
+        if self.timeline_state.expanded.remove(&key) {
+            cx.notify();
+            return;
+        }
+        self.timeline_state.expanded.insert(key);
+        if self.timeline_state.checkpoint_diffs.contains_key(&item_id) {
+            cx.notify();
+            return;
+        }
+        let Some(rx) = self.send_query(
+            "orchestration.getTurnDiff",
+            json!({
+                "threadId": thread_id,
+                "fromTurnCount": from_turn,
+                "toTurnCount": to_turn,
+            }),
+        ) else {
+            self.timeline_state.checkpoint_diffs.insert(
+                item_id,
+                CheckpointDiff::Error("Not connected to a server.".to_string()),
+            );
+            cx.notify();
+            return;
+        };
+        self.timeline_state
+            .checkpoint_diffs
+            .insert(item_id.clone(), CheckpointDiff::Loading);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let state = if exit["_tag"].as_str() == Some("Success") {
+                    CheckpointDiff::Loaded(
+                        exit["value"]["diff"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                } else {
+                    CheckpointDiff::Error(rpc_error_text(&exit))
+                };
+                this.timeline_state.checkpoint_diffs.insert(item_id, state);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

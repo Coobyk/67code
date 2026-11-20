@@ -14,6 +14,10 @@ pub enum Icon {
     Archive,
     /// `arrow-left`
     ArrowLeft,
+    /// `app-window`
+    AppWindow,
+    /// `arrow-down`
+    ArrowDown,
     /// `arrow-up`
     ArrowUp,
     /// `at-sign`
@@ -22,6 +26,16 @@ pub enum Icon {
     Bell,
     /// `bookmark`
     Bookmark,
+    /// `book-plus`
+    BookPlus,
+    /// `bot`
+    Bot,
+    /// `bug`
+    Bug,
+    /// `calendar-clock`
+    CalendarClock,
+    /// `chart-no-axes-column`
+    ChartNoAxesColumn,
     /// `check`
     Check,
     /// `chevron-down`
@@ -32,12 +46,20 @@ pub enum Icon {
     ChevronRight,
     /// `chevron-up`
     ChevronUp,
+    /// `chevrons-down-up`
+    ChevronsDownUp,
     /// `chevrons-up-down`
     ChevronsUpDown,
     /// `circle`
     Circle,
+    /// `circle-stop`
+    CircleStop,
     /// `circle-alert`
     CircleAlert,
+    /// `circle-check`
+    CircleCheck,
+    /// `circle-dashed`
+    CircleDashed,
     /// `circle-dot`
     CircleDot,
     /// `circle-help`
@@ -62,14 +84,24 @@ pub enum Icon {
     File,
     /// `file-code`
     FileCode,
+    /// `file-diff`
+    FileDiff,
+    /// `file-search`
+    FileSearch,
     /// `file-text`
     FileText,
+    /// `flask-conical`
+    FlaskConical,
     /// `folder`
     Folder,
     /// `folder-git-2`
     FolderGit2,
     /// `folder-open`
     FolderOpen,
+    /// `folder-plus`
+    FolderPlus,
+    /// `folder-tree`
+    FolderTree,
     /// `git-branch`
     GitBranch,
     /// `git-compare`
@@ -86,8 +118,12 @@ pub enum Icon {
     Info,
     /// `keyboard`
     Keyboard,
+    /// `key-round`
+    KeyRound,
     /// `link`
     Link,
+    /// `list-filter`
+    ListFilter,
     /// `list-todo`
     ListTodo,
     /// `loader-circle`
@@ -98,6 +134,10 @@ pub enum Icon {
     Maximize2,
     /// `message-square`
     MessageSquare,
+    /// `message-square-text`
+    MessageSquareText,
+    /// `messages-square`
+    MessagesSquare,
     /// `mic`
     Mic,
     /// `minus`
@@ -106,20 +146,34 @@ pub enum Icon {
     Monitor,
     /// `moon`
     Moon,
+    /// `palette`
+    Palette,
     /// `panel-bottom`
     PanelBottom,
+    /// `paperclip`
+    Paperclip,
     /// `panel-right`
     PanelRight,
+    /// `panels-top-left`
+    PanelsTopLeft,
     /// `pause`
     Pause,
+    /// `pen-line`
+    PenLine,
     /// `pencil`
     Pencil,
     /// `pin`
     Pin,
     /// `play`
     Play,
+    /// `plug`
+    Plug,
     /// `plus`
     Plus,
+    /// `provider-claude` — Claude star (brand mark from apps/web Icons.tsx).
+    ProviderClaude,
+    /// `provider-openai` — OpenAI knot (brand mark from apps/web Icons.tsx).
+    ProviderOpenAi,
     /// `quote`
     Quote,
     /// `refresh-cw`
@@ -128,16 +182,28 @@ pub enum Icon {
     ScrollText,
     /// `search`
     Search,
+    /// `server`
+    Server,
     /// `settings`
     Settings,
+    /// `settings-2`
+    Settings2,
     /// `shield`
     Shield,
+    /// `shield-check`
+    ShieldCheck,
+    /// `shield-off`
+    ShieldOff,
     /// `smartphone`
     Smartphone,
     /// `sparkles`
     Sparkles,
     /// `square`
     Square,
+    /// `square-menu`
+    SquareMenu,
+    /// `square-pen`
+    SquarePen,
     /// `star`
     Star,
     /// `tag`
@@ -152,12 +218,16 @@ pub enum Icon {
     Trash2,
     /// `triangle-alert`
     TriangleAlert,
+    /// `undo-2`
+    Undo2,
     /// `unlink`
     Unlink,
     /// `upload`
     Upload,
     /// `users`
     Users,
+    /// `wrap-text`
+    WrapText,
     /// `wrench`
     Wrench,
     /// `x`
@@ -172,22 +242,35 @@ impl Icon {
     pub fn data(self) -> &'static [u8] {
         match self {
             Icon::Activity => include_bytes!("../icons/activity.svg").as_slice(),
+            Icon::AppWindow => include_bytes!("../icons/app-window.svg").as_slice(),
             Icon::Archive => include_bytes!("../icons/archive.svg").as_slice(),
+            Icon::ArrowDown => include_bytes!("../icons/arrow-down.svg").as_slice(),
             Icon::ArrowLeft => include_bytes!("../icons/arrow-left.svg").as_slice(),
             Icon::ArrowUp => include_bytes!("../icons/arrow-up.svg").as_slice(),
             Icon::AtSign => include_bytes!("../icons/at-sign.svg").as_slice(),
             Icon::Bell => include_bytes!("../icons/bell.svg").as_slice(),
             Icon::Bookmark => include_bytes!("../icons/bookmark.svg").as_slice(),
+            Icon::BookPlus => include_bytes!("../icons/book-plus.svg").as_slice(),
+            Icon::Bot => include_bytes!("../icons/bot.svg").as_slice(),
+            Icon::Bug => include_bytes!("../icons/bug.svg").as_slice(),
+            Icon::CalendarClock => include_bytes!("../icons/calendar-clock.svg").as_slice(),
+            Icon::ChartNoAxesColumn => {
+                include_bytes!("../icons/chart-no-axes-column.svg").as_slice()
+            }
             Icon::Check => include_bytes!("../icons/check.svg").as_slice(),
             Icon::ChevronDown => include_bytes!("../icons/chevron-down.svg").as_slice(),
             Icon::ChevronLeft => include_bytes!("../icons/chevron-left.svg").as_slice(),
             Icon::ChevronRight => include_bytes!("../icons/chevron-right.svg").as_slice(),
             Icon::ChevronUp => include_bytes!("../icons/chevron-up.svg").as_slice(),
+            Icon::ChevronsDownUp => include_bytes!("../icons/chevrons-down-up.svg").as_slice(),
             Icon::ChevronsUpDown => include_bytes!("../icons/chevrons-up-down.svg").as_slice(),
             Icon::Circle => include_bytes!("../icons/circle.svg").as_slice(),
             Icon::CircleAlert => include_bytes!("../icons/circle-alert.svg").as_slice(),
+            Icon::CircleCheck => include_bytes!("../icons/circle-check.svg").as_slice(),
+            Icon::CircleDashed => include_bytes!("../icons/circle-dashed.svg").as_slice(),
             Icon::CircleDot => include_bytes!("../icons/circle-dot.svg").as_slice(),
             Icon::CircleHelp => include_bytes!("../icons/circle-help.svg").as_slice(),
+            Icon::CircleStop => include_bytes!("../icons/circle-stop.svg").as_slice(),
             Icon::Clock => include_bytes!("../icons/clock.svg").as_slice(),
             Icon::Copy => include_bytes!("../icons/copy.svg").as_slice(),
             Icon::CornerDownLeft => include_bytes!("../icons/corner-down-left.svg").as_slice(),
@@ -198,10 +281,15 @@ impl Icon {
             Icon::Eye => include_bytes!("../icons/eye.svg").as_slice(),
             Icon::File => include_bytes!("../icons/file.svg").as_slice(),
             Icon::FileCode => include_bytes!("../icons/file-code.svg").as_slice(),
+            Icon::FileDiff => include_bytes!("../icons/file-diff.svg").as_slice(),
+            Icon::FileSearch => include_bytes!("../icons/file-search.svg").as_slice(),
             Icon::FileText => include_bytes!("../icons/file-text.svg").as_slice(),
+            Icon::FlaskConical => include_bytes!("../icons/flask-conical.svg").as_slice(),
             Icon::Folder => include_bytes!("../icons/folder.svg").as_slice(),
             Icon::FolderGit2 => include_bytes!("../icons/folder-git-2.svg").as_slice(),
             Icon::FolderOpen => include_bytes!("../icons/folder-open.svg").as_slice(),
+            Icon::FolderPlus => include_bytes!("../icons/folder-plus.svg").as_slice(),
+            Icon::FolderTree => include_bytes!("../icons/folder-tree.svg").as_slice(),
             Icon::GitBranch => include_bytes!("../icons/git-branch.svg").as_slice(),
             Icon::GitCompare => include_bytes!("../icons/git-compare.svg").as_slice(),
             Icon::GitMerge => include_bytes!("../icons/git-merge.svg").as_slice(),
@@ -209,33 +297,52 @@ impl Icon {
             Icon::Globe => include_bytes!("../icons/globe.svg").as_slice(),
             Icon::Image => include_bytes!("../icons/image.svg").as_slice(),
             Icon::Info => include_bytes!("../icons/info.svg").as_slice(),
+            Icon::KeyRound => include_bytes!("../icons/key-round.svg").as_slice(),
             Icon::Keyboard => include_bytes!("../icons/keyboard.svg").as_slice(),
             Icon::Link => include_bytes!("../icons/link.svg").as_slice(),
+            Icon::ListFilter => include_bytes!("../icons/list-filter.svg").as_slice(),
             Icon::ListTodo => include_bytes!("../icons/list-todo.svg").as_slice(),
             Icon::LoaderCircle => include_bytes!("../icons/loader-circle.svg").as_slice(),
             Icon::Lock => include_bytes!("../icons/lock.svg").as_slice(),
             Icon::Maximize2 => include_bytes!("../icons/maximize-2.svg").as_slice(),
             Icon::MessageSquare => include_bytes!("../icons/message-square.svg").as_slice(),
+            Icon::MessageSquareText => {
+                include_bytes!("../icons/message-square-text.svg").as_slice()
+            }
+            Icon::MessagesSquare => include_bytes!("../icons/messages-square.svg").as_slice(),
             Icon::Mic => include_bytes!("../icons/mic.svg").as_slice(),
             Icon::Minus => include_bytes!("../icons/minus.svg").as_slice(),
             Icon::Monitor => include_bytes!("../icons/monitor.svg").as_slice(),
             Icon::Moon => include_bytes!("../icons/moon.svg").as_slice(),
+            Icon::Palette => include_bytes!("../icons/palette.svg").as_slice(),
             Icon::PanelBottom => include_bytes!("../icons/panel-bottom.svg").as_slice(),
+            Icon::Paperclip => include_bytes!("../icons/paperclip.svg").as_slice(),
             Icon::PanelRight => include_bytes!("../icons/panel-right.svg").as_slice(),
+            Icon::PanelsTopLeft => include_bytes!("../icons/panels-top-left.svg").as_slice(),
             Icon::Pause => include_bytes!("../icons/pause.svg").as_slice(),
+            Icon::PenLine => include_bytes!("../icons/pen-line.svg").as_slice(),
             Icon::Pencil => include_bytes!("../icons/pencil.svg").as_slice(),
             Icon::Pin => include_bytes!("../icons/pin.svg").as_slice(),
             Icon::Play => include_bytes!("../icons/play.svg").as_slice(),
+            Icon::Plug => include_bytes!("../icons/plug.svg").as_slice(),
             Icon::Plus => include_bytes!("../icons/plus.svg").as_slice(),
+            Icon::ProviderClaude => include_bytes!("../icons/provider-claude.svg").as_slice(),
+            Icon::ProviderOpenAi => include_bytes!("../icons/provider-openai.svg").as_slice(),
             Icon::Quote => include_bytes!("../icons/quote.svg").as_slice(),
             Icon::RefreshCw => include_bytes!("../icons/refresh-cw.svg").as_slice(),
             Icon::ScrollText => include_bytes!("../icons/scroll-text.svg").as_slice(),
             Icon::Search => include_bytes!("../icons/search.svg").as_slice(),
+            Icon::Server => include_bytes!("../icons/server.svg").as_slice(),
             Icon::Settings => include_bytes!("../icons/settings.svg").as_slice(),
+            Icon::Settings2 => include_bytes!("../icons/settings-2.svg").as_slice(),
             Icon::Shield => include_bytes!("../icons/shield.svg").as_slice(),
+            Icon::ShieldCheck => include_bytes!("../icons/shield-check.svg").as_slice(),
+            Icon::ShieldOff => include_bytes!("../icons/shield-off.svg").as_slice(),
             Icon::Smartphone => include_bytes!("../icons/smartphone.svg").as_slice(),
             Icon::Sparkles => include_bytes!("../icons/sparkles.svg").as_slice(),
             Icon::Square => include_bytes!("../icons/square.svg").as_slice(),
+            Icon::SquareMenu => include_bytes!("../icons/square-menu.svg").as_slice(),
+            Icon::SquarePen => include_bytes!("../icons/square-pen.svg").as_slice(),
             Icon::Star => include_bytes!("../icons/star.svg").as_slice(),
             Icon::Tag => include_bytes!("../icons/tag.svg").as_slice(),
             Icon::Terminal => include_bytes!("../icons/terminal.svg").as_slice(),
@@ -243,9 +350,11 @@ impl Icon {
             Icon::ThumbsUp => include_bytes!("../icons/thumbs-up.svg").as_slice(),
             Icon::Trash2 => include_bytes!("../icons/trash-2.svg").as_slice(),
             Icon::TriangleAlert => include_bytes!("../icons/triangle-alert.svg").as_slice(),
+            Icon::Undo2 => include_bytes!("../icons/undo-2.svg").as_slice(),
             Icon::Unlink => include_bytes!("../icons/unlink.svg").as_slice(),
             Icon::Upload => include_bytes!("../icons/upload.svg").as_slice(),
             Icon::Users => include_bytes!("../icons/users.svg").as_slice(),
+            Icon::WrapText => include_bytes!("../icons/wrap-text.svg").as_slice(),
             Icon::Wrench => include_bytes!("../icons/wrench.svg").as_slice(),
             Icon::X => include_bytes!("../icons/x.svg").as_slice(),
             Icon::Zap => include_bytes!("../icons/zap.svg").as_slice(),
@@ -256,22 +365,33 @@ impl Icon {
     pub fn name(self) -> &'static str {
         match self {
             Icon::Activity => "activity",
+            Icon::AppWindow => "app-window",
             Icon::Archive => "archive",
+            Icon::ArrowDown => "arrow-down",
             Icon::ArrowLeft => "arrow-left",
             Icon::ArrowUp => "arrow-up",
             Icon::AtSign => "at-sign",
             Icon::Bell => "bell",
             Icon::Bookmark => "bookmark",
+            Icon::BookPlus => "book-plus",
+            Icon::Bot => "bot",
+            Icon::Bug => "bug",
+            Icon::CalendarClock => "calendar-clock",
+            Icon::ChartNoAxesColumn => "chart-no-axes-column",
             Icon::Check => "check",
             Icon::ChevronDown => "chevron-down",
             Icon::ChevronLeft => "chevron-left",
             Icon::ChevronRight => "chevron-right",
             Icon::ChevronUp => "chevron-up",
+            Icon::ChevronsDownUp => "chevrons-down-up",
             Icon::ChevronsUpDown => "chevrons-up-down",
             Icon::Circle => "circle",
             Icon::CircleAlert => "circle-alert",
+            Icon::CircleCheck => "circle-check",
+            Icon::CircleDashed => "circle-dashed",
             Icon::CircleDot => "circle-dot",
             Icon::CircleHelp => "circle-help",
+            Icon::CircleStop => "circle-stop",
             Icon::Clock => "clock",
             Icon::Copy => "copy",
             Icon::CornerDownLeft => "corner-down-left",
@@ -282,10 +402,15 @@ impl Icon {
             Icon::Eye => "eye",
             Icon::File => "file",
             Icon::FileCode => "file-code",
+            Icon::FileDiff => "file-diff",
+            Icon::FileSearch => "file-search",
             Icon::FileText => "file-text",
+            Icon::FlaskConical => "flask-conical",
             Icon::Folder => "folder",
             Icon::FolderGit2 => "folder-git-2",
             Icon::FolderOpen => "folder-open",
+            Icon::FolderPlus => "folder-plus",
+            Icon::FolderTree => "folder-tree",
             Icon::GitBranch => "git-branch",
             Icon::GitCompare => "git-compare",
             Icon::GitMerge => "git-merge",
@@ -293,33 +418,50 @@ impl Icon {
             Icon::Globe => "globe",
             Icon::Image => "image",
             Icon::Info => "info",
+            Icon::KeyRound => "key-round",
             Icon::Keyboard => "keyboard",
             Icon::Link => "link",
+            Icon::ListFilter => "list-filter",
             Icon::ListTodo => "list-todo",
             Icon::LoaderCircle => "loader-circle",
             Icon::Lock => "lock",
             Icon::Maximize2 => "maximize-2",
             Icon::MessageSquare => "message-square",
+            Icon::MessageSquareText => "message-square-text",
+            Icon::MessagesSquare => "messages-square",
             Icon::Mic => "mic",
             Icon::Minus => "minus",
             Icon::Monitor => "monitor",
             Icon::Moon => "moon",
+            Icon::Palette => "palette",
             Icon::PanelBottom => "panel-bottom",
+            Icon::Paperclip => "paperclip",
             Icon::PanelRight => "panel-right",
+            Icon::PanelsTopLeft => "panels-top-left",
             Icon::Pause => "pause",
+            Icon::PenLine => "pen-line",
             Icon::Pencil => "pencil",
             Icon::Pin => "pin",
             Icon::Play => "play",
+            Icon::Plug => "plug",
             Icon::Plus => "plus",
+            Icon::ProviderClaude => "provider-claude",
+            Icon::ProviderOpenAi => "provider-openai",
             Icon::Quote => "quote",
             Icon::RefreshCw => "refresh-cw",
             Icon::ScrollText => "scroll-text",
             Icon::Search => "search",
+            Icon::Server => "server",
             Icon::Settings => "settings",
+            Icon::Settings2 => "settings-2",
             Icon::Shield => "shield",
+            Icon::ShieldCheck => "shield-check",
+            Icon::ShieldOff => "shield-off",
             Icon::Smartphone => "smartphone",
             Icon::Sparkles => "sparkles",
             Icon::Square => "square",
+            Icon::SquareMenu => "square-menu",
+            Icon::SquarePen => "square-pen",
             Icon::Star => "star",
             Icon::Tag => "tag",
             Icon::Terminal => "terminal",
@@ -327,9 +469,11 @@ impl Icon {
             Icon::ThumbsUp => "thumbs-up",
             Icon::Trash2 => "trash-2",
             Icon::TriangleAlert => "triangle-alert",
+            Icon::Undo2 => "undo-2",
             Icon::Unlink => "unlink",
             Icon::Upload => "upload",
             Icon::Users => "users",
+            Icon::WrapText => "wrap-text",
             Icon::Wrench => "wrench",
             Icon::X => "x",
             Icon::Zap => "zap",
