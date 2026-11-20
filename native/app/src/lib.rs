@@ -6,6 +6,7 @@ mod composer;
 mod config;
 mod envs;
 mod explorer;
+mod icons;
 mod integrations;
 mod markdown;
 mod model;
