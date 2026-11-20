@@ -8,14 +8,42 @@
 //! listener wiring is needed at the call site.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText,
-    SharedString, StrikethroughStyle, StyledText, TextAlign, div, prelude::*, px, rems, rgb,
+    AnyElement, ClickEvent, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla,
+    InteractiveText, SharedString, StrikethroughStyle, StyledText, TextAlign, div, prelude::*, px,
+    rems, rgb,
 };
 
 use crate::icons::{self, Icon};
 use crate::theme;
+
+/// Per-code-block interactive state, supplied by the caller for every fenced
+/// block (keyed by `key`). `None` handlers hide the matching header button,
+/// which is how read-only surfaces (the explorer preview) get a static card.
+pub struct CodeBlockUi {
+    /// Wrap long lines (`data-wrap`): the web persists this per block in
+    /// client settings and defaults it on.
+    pub wrapped: bool,
+    /// The copy button shows the primary check while the copied flag is set.
+    pub copied: bool,
+    /// Toggle `wrapped` for this block.
+    pub on_toggle_wrap: Option<Rc<dyn Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App)>>,
+    /// Called after markdown.rs writes the code to the clipboard.
+    pub on_copied: Option<Rc<dyn Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App)>>,
+}
+
+impl Default for CodeBlockUi {
+    fn default() -> Self {
+        Self {
+            wrapped: true,
+            copied: false,
+            on_toggle_wrap: None,
+            on_copied: None,
+        }
+    }
+}
 
 /// Render a markdown document into block-level elements.
 ///
@@ -29,47 +57,123 @@ use crate::theme;
 /// - tables render as a simple grid
 /// - blockquotes render with a left accent border
 pub fn render_markdown(text: &str) -> Vec<AnyElement> {
+    render_markdown_ctx(text, &mut |_| CodeBlockUi::default())
+}
+
+/// `render_markdown` with per-code-block state: `ui` is called once per
+/// fenced block with a stable key (hash of language + code) so the caller can
+/// hand back wrap/copy state and click handlers for the header actions.
+pub fn render_markdown_ctx(text: &str, ui: &mut dyn FnMut(u64) -> CodeBlockUi) -> Vec<AnyElement> {
     let blocks = parse_blocks(text);
     let mut ctx = RenderCtx {
         seed: fnv1a(text),
         count: 0,
+        ui,
     };
     render_blocks(&blocks, &mut ctx)
 }
 
 /// Render a fenced code block (used both standalone and inside markdown).
 ///
-/// Mirrors the web `MarkdownCodeBlock`: `rounded-lg` card on
-/// `--code-background` with a `--contrast-border` hairline, a mono `text-2xs`
-/// language header at 72% code-foreground (pt-1.5 pr-1.5 pl-3, no divider),
-/// and the `pre` body at `--font-size-code` (13px) with `leading-snug` and
-/// `.chat-markdown pre` padding (0.8rem × 0.9rem).
-pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
+/// Mirrors the web `MarkdownCodeBlock`: a `rounded-lg` card on `bg-secondary`
+/// (dark `bg-input/32`, `dark:border-transparent`), a header (`pt-1.5 pr-1.5
+/// pb-0 pl-3`) with the mono `text-2xs` language label at 72% code-foreground
+/// plus the wrap/copy action buttons, and the `pre` body at
+/// `--font-size-code` (13px) with `leading-snug` and `.chat-markdown pre`
+/// padding (0.8rem × 0.9rem).
+pub fn render_code_block(code: &str, language: Option<&str>, ui: &CodeBlockUi) -> AnyElement {
     let code = code.trim_end_matches('\n');
+    let dark = theme::effective_dark();
     let mut card = div()
         .w_full()
         .flex()
         .flex_col()
         .rounded_lg()
-        .border_1()
-        .border_color(theme::border())
-        .bg(theme::code_bg())
+        // `border border-border/70 … dark:border-transparent` — the card
+        // edge only shows on light themes.
+        .when(!dark, |d| d.border_1().border_color(theme::border()))
+        .bg(theme::code_block_bg())
         .overflow_hidden();
 
-    if let Some(lang) = language.filter(|l| !l.trim().is_empty()) {
-        card = card.child(
+    // The web always renders the header: the title slot falls back to the
+    // language id and the action toolbar carries wrap (+run, view) + copy.
+    let lang = language.filter(|l| !l.trim().is_empty()).unwrap_or("text");
+    let mut actions = div().flex().items_center().gap_0p5().flex_shrink_0();
+    if let Some(on_toggle_wrap) = &ui.on_toggle_wrap {
+        let on_toggle_wrap = on_toggle_wrap.clone();
+        // `icon-xs` ghost button (size-6, size-3 glyph); the pressed wrap
+        // state takes the `secondary` variant like the web.
+        let wrap_chip = div()
+            .id(("c67-md-wrap", (fnv1a(code) ^ 0x9e3779b9) as usize))
+            .w(px(24.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_lg()
+            .cursor_pointer()
+            .when(ui.wrapped, |d| {
+                d.bg(theme::secondary()).hover(|s| s.bg(theme::accent()))
+            })
+            .when(!ui.wrapped, |d| {
+                d.hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+            })
+            .child(icons::icon(Icon::WrapText, 12.).text_color(if ui.wrapped {
+                theme::fg()
+            } else {
+                theme::fg_muted()
+            }))
+            .on_click(move |event, window, cx| on_toggle_wrap(event, window, cx));
+        actions = actions.child(wrap_chip);
+    }
+    if let Some(on_copied) = &ui.on_copied {
+        let on_copied = on_copied.clone();
+        let copy_text = code.to_string();
+        let (icon, color, hover_color) = if ui.copied {
+            (Icon::Check, theme::primary(), theme::primary())
+        } else {
+            (Icon::Copy, theme::fg_muted(), theme::fg())
+        };
+        actions = actions.child(
             div()
+                .id(("c67-md-copy", fnv1a(code) as usize))
+                .w(px(24.))
+                .h(px(24.))
                 .flex()
-                .w_full()
-                .pt(px(6.))
-                .pr(px(6.))
-                .pl_3()
-                .font_family(theme::FONT_MONO)
-                .text_size(theme::text_size::XS_2)
-                .text_color(theme::code_header_fg())
-                .child(lang.to_string()),
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .cursor_pointer()
+                .hover(move |s| s.bg(theme::accent()).text_color(hover_color))
+                .child(icons::icon(icon, 12.).text_color(color))
+                .on_click(move |event, window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                    on_copied(event, window, cx);
+                }),
         );
     }
+    card = card.child(
+        div()
+            .flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pt(px(6.))
+            .pr(px(6.))
+            .pl_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme::FONT_MONO)
+                    .text_size(theme::text_size::XS_2)
+                    .text_color(theme::code_header_fg())
+                    .child(lang.to_string()),
+            )
+            .child(actions),
+    );
 
     let mut text = StyledText::new(code.to_string());
     let highlights = highlight_code(code, language.unwrap_or(""));
@@ -81,13 +185,14 @@ pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
         div()
             .id(("c67-md-code", fnv1a(code) as usize))
             .w_full()
-            .overflow_x_scroll()
+            .when(!ui.wrapped, |d| d.overflow_x_scroll())
             .px(px(14.4))
             .py(px(12.8))
             .font_family(theme::FONT_MONO)
             .text_size(theme::code_text_size())
-            .line_height(px(18.))
-            .whitespace_nowrap()
+            // `leading-snug` (1.375) at 13px.
+            .line_height(px(17.875))
+            .when(!ui.wrapped, |d| d.whitespace_nowrap())
             .text_color(theme::fg())
             .child(text),
     )
@@ -98,12 +203,13 @@ pub fn render_code_block(code: &str, language: Option<&str>) -> AnyElement {
 // Render context — hands out stable, unique ElementIds for interactive text.
 // ---------------------------------------------------------------------------
 
-struct RenderCtx {
+struct RenderCtx<'a> {
     seed: u64,
     count: usize,
+    ui: &'a mut dyn FnMut(u64) -> CodeBlockUi,
 }
 
-impl RenderCtx {
+impl RenderCtx<'_> {
     fn next_id(&mut self) -> ElementId {
         self.count += 1;
         ElementId::named_usize("c67-md-link", (self.seed as usize) ^ self.count)
@@ -529,10 +635,17 @@ fn render_block(block: &Block, first: bool, ctx: &mut RenderCtx) -> AnyElement {
             .text_color(theme::chat_fg())
             .child(inline_element(text, ctx))
             .into_any_element(),
-        Block::Code { language, code } => div()
-            .mt(gap)
-            .child(render_code_block(code, language.as_deref()))
-            .into_any_element(),
+        Block::Code { language, code } => {
+            // The block key tracks language + content so wrap/copy state
+            // survives re-renders and moves with the block.
+            let key =
+                fnv1a(language.as_deref().unwrap_or("")).wrapping_mul(0x100000001b3) ^ fnv1a(code);
+            let ui = (ctx.ui)(key);
+            div()
+                .mt(gap)
+                .child(render_code_block(code, language.as_deref(), &ui))
+                .into_any_element()
+        }
         Block::Quote(inner) => div()
             .mt(gap)
             .border_l_2()
@@ -565,6 +678,8 @@ fn render_list(items: &[ListItem], first: bool, ctx: &mut RenderCtx) -> AnyEleme
     let mut col = div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w_0()
         .mt(px(if first { 0. } else { 10.4 }))
         .gap_1()
         .text_sm()
@@ -616,9 +731,15 @@ fn render_list(items: &[ListItem], first: bool, ctx: &mut RenderCtx) -> AnyEleme
         col = col.child(
             div()
                 .flex()
+                .w_full()
                 .pl(px(20. * item.depth as f32))
                 .child(marker)
-                .child(div().flex_1().child(inline_element(&item.text, ctx))),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(inline_element(&item.text, ctx)),
+                ),
         );
     }
 
@@ -1047,21 +1168,48 @@ fn inline_element(src: &str, ctx: &mut RenderCtx) -> AnyElement {
 }
 
 // ---------------------------------------------------------------------------
-// Syntax highlighting — a small per-language tokenizer coloring keywords,
-// string literals, comments and numbers.
+// Syntax highlighting — a small per-language tokenizer. Colors follow the
+// web's pierre-dark shiki theme (apps/web syntaxHighlighting).
 // ---------------------------------------------------------------------------
 
 fn syn_keyword() -> Hsla {
-    rgb(0x82aaff).into()
+    rgb(0xff678d).into()
 }
 fn syn_string() -> Hsla {
-    rgb(0xc3e88d).into()
+    rgb(0x5ecc71).into()
 }
 fn syn_comment() -> Hsla {
-    rgb(0x5f6a8a).into()
+    rgb(0x737373).into()
 }
 fn syn_number() -> Hsla {
-    rgb(0xf78c6c).into()
+    rgb(0x68cdf2).into()
+}
+fn syn_function() -> Hsla {
+    rgb(0x9d6afb).into()
+}
+fn syn_type() -> Hsla {
+    rgb(0xd568ea).into()
+}
+fn syn_constant() -> Hsla {
+    rgb(0xffd452).into()
+}
+fn syn_var_lang() -> Hsla {
+    rgb(0xffa359).into()
+}
+fn syn_operator() -> Hsla {
+    rgb(0x08c0ef).into()
+}
+fn syn_punct() -> Hsla {
+    rgb(0x636363).into()
+}
+fn syn_json_key() -> Hsla {
+    rgb(0xff855e).into()
+}
+fn syn_diff_add() -> Hsla {
+    rgb(0x5ecc71).into()
+}
+fn syn_diff_del() -> Hsla {
+    rgb(0xff855e).into()
 }
 
 const RUST_KEYWORDS: &[&str] = &[
@@ -1162,6 +1310,10 @@ struct LangSpec {
     triple_strings: bool,
     /// `[section]` headers at line start (TOML).
     section_headers: bool,
+    /// `"key": value` — color object keys in JSON.
+    json_keys: bool,
+    /// `$var`/`${var}` expansions (shell).
+    shell_vars: bool,
     keywords: &'static [&'static str],
 }
 
@@ -1173,6 +1325,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"'],
             triple_strings: false,
             section_headers: false,
+            json_keys: false,
+            shell_vars: false,
             keywords: RUST_KEYWORDS,
         },
         "ts" | "tsx" | "typescript" | "js" | "jsx" | "javascript" | "mjs" | "cjs" | "mts"
@@ -1182,6 +1336,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\'', '`'],
             triple_strings: false,
             section_headers: false,
+            json_keys: false,
+            shell_vars: false,
             keywords: JS_KEYWORDS,
         },
         "json" => LangSpec {
@@ -1190,6 +1346,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"'],
             triple_strings: false,
             section_headers: false,
+            json_keys: true,
+            shell_vars: false,
             keywords: JSON_KEYWORDS,
         },
         "jsonc" | "json5" => LangSpec {
@@ -1198,6 +1356,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\''],
             triple_strings: false,
             section_headers: false,
+            json_keys: true,
+            shell_vars: false,
             keywords: JSON_KEYWORDS,
         },
         "bash" | "sh" | "shell" | "zsh" | "console" => LangSpec {
@@ -1206,6 +1366,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\''],
             triple_strings: false,
             section_headers: false,
+            json_keys: false,
+            shell_vars: true,
             keywords: SH_KEYWORDS,
         },
         "toml" => LangSpec {
@@ -1214,6 +1376,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\''],
             triple_strings: false,
             section_headers: true,
+            json_keys: false,
+            shell_vars: false,
             keywords: TOML_KEYWORDS,
         },
         "yaml" | "yml" => LangSpec {
@@ -1222,6 +1386,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\''],
             triple_strings: false,
             section_headers: false,
+            json_keys: false,
+            shell_vars: false,
             keywords: YAML_KEYWORDS,
         },
         "python" | "py" | "python3" => LangSpec {
@@ -1230,6 +1396,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &['"', '\''],
             triple_strings: true,
             section_headers: false,
+            json_keys: false,
+            shell_vars: false,
             keywords: PY_KEYWORDS,
         },
         _ => LangSpec {
@@ -1238,6 +1406,8 @@ fn lang_spec(lang: &str) -> LangSpec {
             string_delims: &[],
             triple_strings: false,
             section_headers: false,
+            json_keys: false,
+            shell_vars: false,
             keywords: &[],
         },
     }
@@ -1249,10 +1419,121 @@ enum TokenKind {
     Str,
     Comment,
     Number,
+    Function,
+    Type,
+    Constant,
+    VarLang,
+    Operator,
+    Punct,
+    JsonKey,
+    DiffAdd,
+    DiffDel,
 }
+
+/// `constant.language` — literal values share the numeric cyan in
+/// pierre-dark.
+const LANG_CONST_WORDS: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "None",
+    "True",
+    "False",
+    "undefined",
+    "nil",
+    "NaN",
+    "Infinity",
+];
+/// `variable.language` — receiver pseudo-variables take the variable orange.
+const VAR_LANG_WORDS: &[&str] = &["this", "self", "super", "cls"];
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `diff`/`patch` fences get the pierre addition/deletion colors line-wise —
+/// no language tokenizer needed.
+fn highlight_diff(code: &str, out: &mut Vec<(Range<usize>, HighlightStyle)>) {
+    let mut pos = 0;
+    for line in code.split_inclusive('\n') {
+        let kind = if line.starts_with('+') && !line.starts_with("+++") {
+            Some(TokenKind::DiffAdd)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Some(TokenKind::DiffDel)
+        } else if line.starts_with("@@") {
+            Some(TokenKind::Function)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            out.push((
+                pos..pos + line.len(),
+                HighlightStyle {
+                    color: Some(color_of(kind)),
+                    ..Default::default()
+                },
+            ));
+        }
+        pos += line.len();
+    }
+}
+
+fn color_of(kind: TokenKind) -> Hsla {
+    match kind {
+        TokenKind::Keyword => syn_keyword(),
+        TokenKind::Str => syn_string(),
+        TokenKind::Comment => syn_comment(),
+        TokenKind::Number => syn_number(),
+        TokenKind::Function => syn_function(),
+        TokenKind::Type => syn_type(),
+        TokenKind::Constant => syn_constant(),
+        TokenKind::VarLang => syn_var_lang(),
+        TokenKind::Operator => syn_operator(),
+        TokenKind::Punct => syn_punct(),
+        TokenKind::JsonKey => syn_json_key(),
+        TokenKind::DiffAdd => syn_diff_add(),
+        TokenKind::DiffDel => syn_diff_del(),
+    }
+}
+
+/// `ident` → the pierre scope a shiki grammar would most likely assign:
+/// language constants (cyan), receiver words (orange), SCREAMING_CASE
+/// constants (yellow), UpperCamel types (violet), `name(` calls (purple).
+fn ident_kind(code: &str, start: usize, end: usize, keywords: &[&str]) -> Option<TokenKind> {
+    let word = &code[start..end];
+    if keywords.contains(&word) {
+        return Some(TokenKind::Keyword);
+    }
+    if LANG_CONST_WORDS.contains(&word) {
+        return Some(TokenKind::Number);
+    }
+    if VAR_LANG_WORDS.contains(&word) {
+        return Some(TokenKind::VarLang);
+    }
+    let bytes = word.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_uppercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return Some(TokenKind::Constant);
+    }
+    if bytes[0].is_ascii_uppercase() {
+        return Some(TokenKind::Type);
+    }
+    // A call: identifier followed by `(` (allowing whitespace).
+    let after = &code.as_bytes()[end..];
+    let mut j = 0;
+    while j < after.len() && matches!(after[j], b' ' | b'\t') {
+        j += 1;
+    }
+    if after.get(j) == Some(&b'(') {
+        return Some(TokenKind::Function);
+    }
+    // Member access `x.foo` stays the foreground (pierre `variable` color is
+    // only applied where grammars mark a real variable scope).
+    None
 }
 
 /// Tokenize `code` and produce sorted, non-overlapping highlight ranges.
@@ -1264,19 +1545,14 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
         && spec.string_delims.is_empty()
         && spec.keywords.is_empty()
     {
-        return Vec::new();
+        let mut out = Vec::new();
+        if matches!(lang.trim().to_ascii_lowercase().as_str(), "diff" | "patch") {
+            highlight_diff(code, &mut out);
+        }
+        return out;
     }
     let bytes = code.as_bytes();
     let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-
-    fn color_of(kind: TokenKind) -> Hsla {
-        match kind {
-            TokenKind::Keyword => syn_keyword(),
-            TokenKind::Str => syn_string(),
-            TokenKind::Comment => syn_comment(),
-            TokenKind::Number => syn_number(),
-        }
-    }
 
     let mut push = |kind: TokenKind, range: Range<usize>| {
         if range.is_empty() {
@@ -1338,6 +1614,26 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
             continue;
         }
 
+        // Shell `$var` / `${var}`.
+        if spec.shell_vars && c == '$' {
+            let start = i;
+            i += 1;
+            if bytes.get(i) == Some(&b'{') {
+                i += 1;
+            }
+            while i < code.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'}') {
+                i += 1;
+            }
+            if i > start + 1 {
+                push(TokenKind::VarLang, start..i);
+                continue;
+            }
+            i = start;
+        }
+
         // Triple-quoted strings (Python docstrings).
         if spec.triple_strings && (rest.starts_with("\"\"\"") || rest.starts_with("'''")) {
             let delim = &rest[..3];
@@ -1351,7 +1647,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
         }
 
         // String literals — backtick templates may span lines, others stop
-        // at EOL when unterminated.
+        // at EOL when unterminated. JSON keys (`"k":`) take the key color.
         if spec.string_delims.contains(&c) {
             let delim = c as u8;
             let mut j = i + 1;
@@ -1370,8 +1666,19 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
                 }
                 j += 1;
             }
-            push(TokenKind::Str, i..j.min(code.len()));
-            i = j.min(code.len());
+            let end = j.min(code.len());
+            let is_json_key = spec.json_keys
+                && end < code.len()
+                && code[end..].trim_start_matches([' ', '\t']).starts_with(':');
+            push(
+                if is_json_key {
+                    TokenKind::JsonKey
+                } else {
+                    TokenKind::Str
+                },
+                i..end,
+            );
+            i = end;
             continue;
         }
 
@@ -1394,11 +1701,47 @@ fn highlight_code(code: &str, lang: &str) -> Vec<(Range<usize>, HighlightStyle)>
             while i < code.len() && is_ident_byte(bytes[i]) {
                 i += 1;
             }
-            let word = &code[start..i];
-            if spec.keywords.contains(&word) {
-                push(TokenKind::Keyword, start..i);
+            if let Some(kind) = ident_kind(code, start, i, spec.keywords) {
+                push(kind, start..i);
             }
             continue;
+        }
+
+        // Punctuation and operators — pierre colors both (dim gray / cyan).
+        match c {
+            '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '.' => {
+                push(TokenKind::Punct, i..i + 1);
+                i += 1;
+                continue;
+            }
+            '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&' | '|' | '^' | '~' => {
+                let start = i;
+                while i < code.len() {
+                    let b = bytes[i];
+                    if matches!(
+                        b,
+                        b'+' | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'='
+                            | b'!'
+                            | b'<'
+                            | b'>'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'~'
+                    ) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                push(TokenKind::Operator, start..i);
+                continue;
+            }
+            _ => {}
         }
 
         i += c.len_utf8();
