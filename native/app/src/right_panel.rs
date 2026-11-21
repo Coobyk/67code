@@ -66,7 +66,18 @@ pub struct State {
     /// Horizontal scroll position of the tab strip (overflow at the
     /// web-matching 280px width is real — the strip scrolls, like the web).
     pub tab_scroll: ScrollHandle,
+    /// Last measured window width — a deferred probe refreshes it after
+    /// each render (the Window itself is on the update stack mid-render,
+    /// so render can't read `viewport_size` directly). 0 = unmeasured.
+    pub viewport_w: f32,
 }
+
+/// Web `RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY` = `(max-width: 980px)`
+/// (apps/web/src/rightPanelLayout.ts): at or below 980px the web swaps the
+/// inline 280px column for a floating sheet. The native client has no sheet
+/// surface, so it auto-collapses the panel instead — the tab state persists
+/// and the column returns when the window widens again.
+const INLINE_PANEL_BREAKPOINT: f32 = 980.0;
 
 /// Reduce a `PreviewSessionSnapshot` to a display row.
 fn parse_preview_session(v: &Value) -> PreviewSession {
@@ -95,9 +106,37 @@ fn status_label(status: &str) -> &'static str {
 
 impl AppView {
     pub(crate) fn render_right_panel(&self, cx: &mut Context<Self>) -> Div {
+        // Viewport-width probe: `window.viewport_size()` is unreachable
+        // mid-render (the window sits on the update stack), so stash the
+        // width on panel state at the end of the effect cycle. Re-renders
+        // on resize pick the fresh value up; `cx.notify` only fires when
+        // it actually changed, so this doesn't loop.
+        cx.defer(|app| {
+            for handle in app.windows() {
+                let _ = handle.update(app, |root, window, app| {
+                    let width: f32 = window.viewport_size().width.into();
+                    if let Ok(view) = root.downcast::<AppView>() {
+                        let _ = view.update(app, |this, cx| {
+                            if this.panel_state.viewport_w != width {
+                                this.panel_state.viewport_w = width;
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            }
+        });
         let Some(tab) = self.panel_state.tab else {
             return div();
         };
+        // Below the web's 980px inline-layout breakpoint the panel hides
+        // (the web renders a floating sheet there — see narrow.png at
+        // 900px). 0 = width not measured yet → keep the column.
+        if self.panel_state.viewport_w > 0.
+            && self.panel_state.viewport_w <= INLINE_PANEL_BREAKPOINT
+        {
+            return div();
+        }
         let body = match tab {
             Tab::Files => self.render_explorer_pane(cx).into_any_element(),
             Tab::Terminals => self.render_terminal_pane(cx).into_any_element(),

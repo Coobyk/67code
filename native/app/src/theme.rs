@@ -105,6 +105,11 @@ pub fn card_border() -> Rgba {
 pub fn card_surface_40() -> Rgba {
     pick(rgba(0x11111166), rgba(0xffffff66))
 }
+/// `border-border/50` — the web SettingsGroup row divider (a shade lighter
+/// than the card's /60 outline).
+pub fn card_divider() -> Rgba {
+    pick(rgba(0xffffff0a), rgba(0xe4e4e780))
+}
 /// `--input`. dark white·11% · light zinc-300 #d4d4d8
 pub fn input() -> Rgba {
     pick(rgba(0xffffff1c), rgb(0xd4d4d8))
@@ -540,6 +545,11 @@ pub fn quote_border() -> Rgba {
 /// dark neutral-100·72% · light zinc-900·72%
 pub fn code_header_fg() -> Rgba {
     pick(rgba(0xf5f5f5b8), rgba(0x18181bb8))
+}
+/// `.chat-markdown pre` body ink — the syntax theme's plain foreground.
+/// pierre-dark #fafafa · pierre-light #0a0a0a (measured in the web refs).
+pub fn code_fg() -> Rgba {
+    pick(rgb(0xfafafa), rgb(0x0a0a0a))
 }
 /// `text-tool-error-icon/40` — failed tool-call icon / ✕ mark.
 /// dark red-300 #fca5a5·40% · light error #ef4444·40%

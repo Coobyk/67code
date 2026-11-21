@@ -43,6 +43,16 @@ const CONTENT_HIT_LIMIT: u64 = 8;
 /// Query → project-search RPC delay (same cadence as search_dialog.rs).
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Right-edge shortcut labels for the `cmd-*` bindings — gpui parses `cmd`
+/// to the `platform` modifier (⌘ on macOS, Super on X11/Linux), so the hint
+/// shows the key that actually triggers it on this build.
+mod hints {
+    #[cfg(target_os = "macos")]
+    pub const MOD_HINTS: (&str, &str, &str) = ("⌘U", "⌘N", "⌘,");
+    #[cfg(not(target_os = "macos"))]
+    pub const MOD_HINTS: (&str, &str, &str) = ("Super+U", "Super+N", "Super+,");
+}
+
 pub struct State {
     /// Palette overlay visible. Read by `on_close_overlay` in lib.rs.
     pub open: bool,
@@ -522,6 +532,10 @@ impl AppView {
         // Commands that act on a thread always target `state.selected` (the
         // "current thread"), like the web palette's thread commands.
         let connected = matches!(self.state.connection, ConnectionStatus::Connected);
+        // The keybindings are `cmd-*`; gpui parses `cmd` to the `platform`
+        // modifier — ⌘ on macOS, the Super key on Linux/X11 — so display
+        // accordingly (the web renders `Ctrl+…` for its own ctrl bindings).
+        let (usage_hint, new_hint, settings_hint) = hints::MOD_HINTS;
         let commands: [(CommandKind, &str, Option<&str>, Option<&str>, bool); 12] = [
             (
                 CommandKind::OpenInWindow,
@@ -534,7 +548,7 @@ impl AppView {
                 CommandKind::UsageView,
                 "Open usage view",
                 Some("Token totals per day, provider, and model"),
-                Some("⌘U"),
+                Some(usage_hint),
                 true,
             ),
             (
@@ -551,12 +565,12 @@ impl AppView {
                 None,
                 true,
             ),
-            (CommandKind::NewThread, "New thread", None, Some("⌘N"), true),
+            (CommandKind::NewThread, "New thread", None, Some(new_hint), true),
             (
                 CommandKind::OpenSettings,
                 "Open settings",
                 None,
-                Some("⌘,"),
+                Some(settings_hint),
                 true,
             ),
             (

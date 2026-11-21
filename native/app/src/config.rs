@@ -114,10 +114,40 @@ pub struct ClientConfig {
     /// falls back to Global.
     #[serde(default)]
     pub settings_scope_project: Option<String>,
+    /// Sidebar "Project grouping" — the web's
+    /// `ClientSettings.sidebarProjectGroupingMode` reduced to its toggle
+    /// (`separate` ⇄ enabled mode; default enabled like `repository`).
+    #[serde(default = "default_true")]
+    pub sidebar_project_grouping: bool,
+    /// Sidebar "Project order" — the web's
+    /// `ClientSettings.sidebarProjectSortOrder` ("updated_at" default).
+    #[serde(default = "default_project_sort_order")]
+    pub sidebar_project_sort_order: String,
+    /// Sidebar "Working section" — the web's
+    /// `ClientSettings.sidebarWorkingShelfEnabled` (default true).
+    #[serde(default = "default_true")]
+    pub sidebar_working_shelf: bool,
+    /// Confirmations — the web's `confirmThreadUnpin` (default false).
+    #[serde(default)]
+    pub confirm_thread_unpin: bool,
+    /// The web's `confirmThreadArchive` (default false).
+    #[serde(default)]
+    pub confirm_thread_archive: bool,
+    /// The web's `confirmThreadDelete` (default true).
+    #[serde(default = "default_true")]
+    pub confirm_thread_delete: bool,
+    /// Display "Time format" — the web's `ClientSettings.timestampFormat`
+    /// ("locale" | "12-hour" | "24-hour"; empty = locale default).
+    #[serde(default)]
+    pub timestamp_format: String,
 }
 
 fn default_in_app_notifications() -> bool {
     true
+}
+
+fn default_project_sort_order() -> String {
+    "updated_at".to_string()
 }
 
 fn default_diff_layout() -> String {

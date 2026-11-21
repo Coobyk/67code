@@ -1370,16 +1370,6 @@ impl AppView {
                 pane = pane.child(self.explorer_empty("No files match your search"));
             } else {
                 let truncated = self.explorer_state.search_results.len() >= 50;
-                if truncated {
-                    pane = pane.child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child("More matches available. Refine your search."),
-                    );
-                }
                 let mut list = div()
                     .id("explorer-search-results")
                     .flex()
@@ -1439,6 +1429,19 @@ impl AppView {
                     list = list.child(el);
                 }
                 pane = pane.child(list);
+                // Web FileBrowserPanel renders the truncated note *below*
+                // the results list (`px-3 py-1 text-xs text-muted-foreground`).
+                if truncated {
+                    pane = pane.child(
+                        div()
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("More matches available. Refine your search."),
+                    );
+                }
             }
         } else if !self.explorer_state.dirs.contains_key("") {
             pane = pane.child(self.explorer_empty("Loading…"));

@@ -172,18 +172,6 @@ fn connection_status(
     }
 }
 
-/// Section title shown at the top of the content column — web
-/// `SettingsSection` h2 (`text-base font-semibold`, min-h-7).
-fn section_heading(title: &'static str) -> gpui::Div {
-    div()
-        .pb_4()
-        .min_h(px(28.))
-        .text_base()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme::fg())
-        .child(title)
-}
-
 /// Small uppercase-ish caption above a group of rows.
 fn group_label(text: &'static str) -> gpui::Div {
     div()
@@ -770,7 +758,14 @@ impl AppView {
             || !self.client_config.diff_ignore_whitespace
             || !self.client_config.diff_files_collapsed
             || self.client_config.proactive_panels
-            || self.client_config.settings_scope_project.is_some();
+            || self.client_config.settings_scope_project.is_some()
+            || !self.client_config.sidebar_project_grouping
+            || self.client_config.sidebar_project_sort_order != "updated_at"
+            || !self.client_config.sidebar_working_shelf
+            || self.client_config.confirm_thread_unpin
+            || self.client_config.confirm_thread_archive
+            || !self.client_config.confirm_thread_delete
+            || !self.client_config.timestamp_format.is_empty();
         let close_btn = div()
             .id("settings-close")
             .w(px(28.))
@@ -829,6 +824,13 @@ impl AppView {
                             cfg.diff_files_collapsed = true;
                             cfg.proactive_panels = false;
                             cfg.settings_scope_project = None;
+                            cfg.sidebar_project_grouping = true;
+                            cfg.sidebar_project_sort_order = "updated_at".to_string();
+                            cfg.sidebar_working_shelf = true;
+                            cfg.confirm_thread_unpin = false;
+                            cfg.confirm_thread_archive = false;
+                            cfg.confirm_thread_delete = true;
+                            cfg.timestamp_format.clear();
                             cfg.save();
                             this.misc_settings_state.seed_from_config(cfg);
                             cx.notify();
@@ -875,22 +877,21 @@ impl AppView {
                     .overflow_y_scroll()
                     .child(
                         // Web `SettingsPageContainer` → `WorkspacePageContainer`:
-                        // `mx-auto w-full max-w-4xl gap-6 px-5 pt-6 pb-12`.
+                        // `mx-auto w-full max-w-4xl gap-6 px-5 sm:px-6 pt-6
+                        // pb-12`. The settings dialog only opens meaningfully
+                        // above the sm breakpoint, so px-6 is the common case.
                         div()
                             .w_full()
                             .max_w(px(896.))
                             .mx_auto()
                             .flex()
                             .flex_col()
-                            .px_5()
+                            .px_6()
                             .pt_6()
                             .pb_12()
-                            // The web General page's first visible heading is
-                            // its "Notifications" SettingsSection title, not
-                            // a page-level "General" h2 — skip it there.
-                            .when(self.settings_state.section != Section::General, |col| {
-                                col.child(section_heading(heading))
-                            })
+                            // Web pages carry the section name in the nav +
+                            // "Settings / <section>" breadcrumb — there is no
+                            // page-level h2 inside the content column.
                             .child(content),
                     ),
             )

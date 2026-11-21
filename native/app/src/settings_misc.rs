@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use gpui::{
     Context, Entity, EntityInputHandler, Focusable, MouseButton, SharedString, Subscription,
-    Window, div, prelude::*, px, rgb,
+    Window, deferred, div, prelude::*, px, rgb,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -49,6 +49,22 @@ const NOTIFICATION_MODES: &[(&str, &str)] = &[
     ("notifications", "Notifications only"),
     ("sound", "Sound only"),
     ("notifications-and-sound", "Notifications with sound"),
+];
+
+/// Sidebar "Project order" options — `SIDEBAR_PROJECT_SORT_ORDER_LABELS` in
+/// SettingsPanels.tsx.
+const PROJECT_SORT_ORDERS: &[(&str, &str)] = &[
+    ("updated_at", "Last user message"),
+    ("created_at", "Created at"),
+    ("manual", "Manual"),
+];
+
+/// Display "Time format" options — `TIMESTAMP_FORMAT_LABELS` in
+/// SettingsPanels.tsx.
+const TIME_FORMATS: &[(&str, &str)] = &[
+    ("locale", "System default"),
+    ("12-hour", "12-hour"),
+    ("24-hour", "24-hour"),
 ];
 
 /// `defaultRuntimeMode` options — labels/descriptions from
@@ -107,6 +123,10 @@ pub(crate) enum OpenList {
     NotificationMode,
     /// Global/Project scope selector rendered above the scoped sections.
     SettingsScope,
+    /// Sidebar "Project order" (client-local in the web).
+    ProjectOrder,
+    /// Display "Time format" (client-local in the web).
+    TimeFormat,
     DefaultModel,
     FallbackModel,
     RuntimeMode,
@@ -129,6 +149,13 @@ impl State {
         self.notification_mode = cfg.notification_mode.clone();
         self.in_app_notifications = cfg.in_app_notifications;
         self.scope_project = cfg.settings_scope_project.clone();
+        self.sidebar_project_grouping = cfg.sidebar_project_grouping;
+        self.sidebar_project_sort_order = cfg.sidebar_project_sort_order.clone();
+        self.sidebar_working_shelf = cfg.sidebar_working_shelf;
+        self.confirm_thread_unpin = cfg.confirm_thread_unpin;
+        self.confirm_thread_archive = cfg.confirm_thread_archive;
+        self.confirm_thread_delete = cfg.confirm_thread_delete;
+        self.timestamp_format = cfg.timestamp_format.clone();
     }
 }
 
@@ -138,6 +165,8 @@ impl OpenList {
         match self {
             OpenList::NotificationMode => "misc-notif-mode",
             OpenList::SettingsScope => "misc-settings-scope",
+            OpenList::ProjectOrder => "misc-project-order",
+            OpenList::TimeFormat => "misc-time-format",
             OpenList::DefaultModel => "misc-default-model",
             OpenList::FallbackModel => "misc-fallback-model",
             OpenList::RuntimeMode => "misc-runtime-mode",
@@ -204,6 +233,24 @@ pub struct State {
     // `notification_mode` drives `os_notify` (notify-send + sound, best-effort)
     // for settle/approval alerts in notifications.rs.
 
+    // ── Sidebar / Confirmations / Display prefs (client/device-local) ────
+    /// Sidebar "Project grouping" — combine matching repos across
+    /// environments (`ClientConfig.sidebar_project_grouping`; default on).
+    sidebar_project_grouping: bool,
+    /// Sidebar "Project order" (`ClientConfig.sidebar_project_sort_order`;
+    /// "updated_at" | "created_at" | "manual").
+    sidebar_project_sort_order: String,
+    /// Sidebar "Working section" (`ClientConfig.sidebar_working_shelf`;
+    /// default on).
+    sidebar_working_shelf: bool,
+    /// Confirmations (`ClientConfig.confirm_thread_*`).
+    confirm_thread_unpin: bool,
+    confirm_thread_archive: bool,
+    confirm_thread_delete: bool,
+    /// Display "Time format" (`ClientConfig.timestamp_format`;
+    /// "" = locale, "12-hour", "24-hour").
+    timestamp_format: String,
+
     // ── Projects section ────────────────────────────────────────────
     /// Add-project form visible.
     add_open: bool,
@@ -267,6 +314,7 @@ pub(crate) fn settings_section_title(text: &'static str) -> gpui::Div {
     div()
         .min_h(px(28.))
         .pb_2p5()
+        .px_4()
         .flex()
         .items_center()
         .text_base()
@@ -288,7 +336,7 @@ pub(crate) fn settings_card(rows: Vec<gpui::Div>) -> gpui::Div {
         .bg(theme::card_surface_40());
     for (index, row) in rows.into_iter().enumerate() {
         if index > 0 {
-            card = card.child(row.border_t_1().border_color(theme::card_border()));
+            card = card.child(row.border_t_1().border_color(theme::card_divider()));
         } else {
             card = card.child(row);
         }
@@ -302,7 +350,8 @@ pub(crate) fn danger() -> gpui::Rgba {
 }
 
 /// A settings row: title + muted description on the left, control on the
-/// right — the web `SettingsRow` (`px-3 py-3`, `text-sm font-medium` title,
+/// right — the web `SettingsRow` (`px-3 sm:px-4 py-3`, `gap-4 → gap-8`
+/// label/control gap, `text-sm font-medium` title,
 /// `text-xs text-muted-foreground` description).
 pub(crate) fn setting_row(
     title: &'static str,
@@ -312,8 +361,8 @@ pub(crate) fn setting_row(
     div()
         .flex()
         .items_center()
-        .gap_4()
-        .px_3()
+        .gap_8()
+        .px_4()
         .py_3()
         .child(
             div()
@@ -321,7 +370,7 @@ pub(crate) fn setting_row(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_0p5()
+                .gap_1()
                 .child(
                     div()
                         .text_sm()
@@ -779,15 +828,19 @@ impl AppView {
         if let Some(chip) = self.scope_chip(scoped_key, cx) {
             control = control.child(chip);
         }
-        control = control.child(self.select_trigger(list, current, cx));
-        let mut out = div()
+        control = control.child(
+            div()
+                .relative()
+                .flex_none()
+                .child(self.select_trigger(list, current, cx))
+                .when(open, |cell| {
+                    cell.child(self.floating_options(list, current_value, &options, cx))
+                }),
+        );
+        div()
             .flex()
             .flex_col()
-            .child(setting_row(title, description, control));
-        if open {
-            out = out.child(self.select_options_list(list, current_value, &options, cx));
-        }
-        out
+            .child(setting_row(title, description, control))
     }
 
     /// A boolean scoped row (switch + scope chip) — the same write path as
@@ -834,6 +887,16 @@ impl AppView {
                     if value.is_empty() { None } else { Some(value) };
                 self.client_config.settings_scope_project =
                     self.misc_settings_state.scope_project.clone();
+                self.client_config.save();
+            }
+            OpenList::ProjectOrder => {
+                self.misc_settings_state.sidebar_project_sort_order = value.clone();
+                self.client_config.sidebar_project_sort_order = value;
+                self.client_config.save();
+            }
+            OpenList::TimeFormat => {
+                self.misc_settings_state.timestamp_format = value.clone();
+                self.client_config.timestamp_format = value;
                 self.client_config.save();
             }
             OpenList::DefaultModel => {
@@ -1002,7 +1065,9 @@ impl AppView {
             )
     }
 
-    /// One select setting: row + (when open) the option list underneath.
+    /// One select setting: row + (when open) the option popup floating
+    /// below the trigger — web `SelectPopup align="end"
+    /// alignItemWithTrigger={false}` with `sideOffset={4}`.
     pub(crate) fn select_setting(
         &self,
         title: &'static str,
@@ -1014,21 +1079,47 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let open = self.misc_settings_state.open_list == Some(list);
-        let mut out = div().flex().flex_col().child(setting_row(
-            title,
-            description,
-            self.select_trigger(list, current, cx),
-        ));
-        if open {
-            out = out.child(self.select_options_list(list, current_value, &options, cx));
-        }
-        out
+        let trigger = div()
+            .relative()
+            .flex_none()
+            .child(self.select_trigger(list, current, cx))
+            .when(open, |cell| {
+                cell.child(self.floating_options(list, current_value, &options, cx))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .child(setting_row(title, description, trigger))
     }
 
-    /// The option list under an open select — the web `SelectContent`
-    /// popover: `rounded-lg border` popover surface, `p-1`, items
-    /// `min-h-7 rounded-sm px-2 py-1 text-sm`, selected `bg-foreground/[0.08]`,
-    /// hovered `bg-accent`.
+    /// The popup under an open select trigger. `deferred` so it paints
+    /// above the rows beneath it — the settings modal clips normal
+    /// children at `overflow_hidden`, and deferred draws bypass ancestor
+    /// clips (same mechanism as the toast layer).
+    fn floating_options(
+        &self,
+        list: OpenList,
+        current_value: &str,
+        options: &[(String, String, Option<String>)],
+        cx: &mut Context<Self>,
+    ) -> gpui::Deferred {
+        deferred(
+            div()
+                .absolute()
+                .top_full()
+                .right_0()
+                .pt_1()
+                .child(self.select_options_list(list, current_value, options, cx)),
+        )
+        .with_priority(2)
+    }
+
+    /// The option list inside an open select's popup — the web
+    /// `SelectContent`: `rounded-lg border` popover surface, `p-1`, items
+    /// `min-h-7 rounded-sm px-2 py-1 text-sm`, selected
+    /// `bg-foreground/[0.08]`, hovered `bg-accent`. The web `SelectItem`
+    /// renders no leading check (its `hideIndicator` prop is ignored), so
+    /// neither does this list.
     fn select_options_list(
         &self,
         list: OpenList,
@@ -1039,14 +1130,15 @@ impl AppView {
         let mut list_div = div()
             .flex()
             .flex_col()
-            .mt_1()
-            .mx_3()
+            // Web `min-w-[anchor-width + 1.25rem]` — the shared trigger is
+            // min-w 160 → 180 here; longer labels size the popup out.
+            .min_w(px(180.))
             .p_1()
             .rounded_lg()
             .border_1()
             .border_color(theme::border())
             .bg(theme::raised())
-            .shadow_lg();
+            .shadow_2xl();
         for (index, (value, label, detail)) in options.iter().enumerate() {
             let value = value.clone();
             let selected = value == current_value;
@@ -1063,23 +1155,13 @@ impl AppView {
                     .text_sm()
                     .cursor_pointer()
                     .text_color(theme::fg())
-                    .when(selected, |s| s.bg(theme::hover()))
+                    .when(selected, |s| s.bg(theme::selected()))
                     .when(!selected, |s| s.hover(|s| s.bg(theme::accent())))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
                             this.misc_pick(list, value.clone(), cx);
                         }),
-                    )
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .when(selected, |el| {
-                                el.child(icon(Icon::Check, 12.).text_color(theme::primary()))
-                            }),
                     )
                     .child(div().flex_none().child(label.clone()))
                     .when_some(detail.clone(), |s, detail| {
@@ -1130,32 +1212,191 @@ impl AppView {
         );
 
         let in_app = state.in_app_notifications;
-        let in_app_row = setting_row(
+        let in_app_row = self.client_switch_row(
             "In-app notifications",
             "Show a toast when another thread finishes, fails, or needs input or approval while this app has focus.",
+            "misc-inapp-switch",
+            in_app,
+            |this, on| {
+                this.misc_settings_state.in_app_notifications = on;
+                this.client_config.in_app_notifications = on;
+            },
+            cx,
+        );
+
+        // ── Sidebar section (GeneralSettingsPanel → SettingsSection
+        //    "Sidebar") — all three rows are client/device-local in the
+        //    web; they persist on `ClientConfig`. ──
+        let grouping_row = self.client_switch_row(
+            "Project grouping",
+            "Combine matching repositories across environments.",
+            "misc-project-grouping-switch",
+            state.sidebar_project_grouping,
+            |this, on| {
+                this.misc_settings_state.sidebar_project_grouping = on;
+                this.client_config.sidebar_project_grouping = on;
+            },
+            cx,
+        );
+
+        let order_value = PROJECT_SORT_ORDERS
+            .iter()
+            .map(|(value, _)| *value)
+            .find(|value| *value == state.sidebar_project_sort_order)
+            .unwrap_or("updated_at");
+        let order_label = PROJECT_SORT_ORDERS
+            .iter()
+            .find(|(value, _)| *value == order_value)
+            .map(|(_, label)| *label)
+            .unwrap_or("Last user message");
+        let order_row = self.select_setting(
+            "Project order",
+            "Order of projects in the sidebar project picker and command palette.",
+            OpenList::ProjectOrder,
+            order_label.into(),
+            order_value,
+            PROJECT_SORT_ORDERS
+                .iter()
+                .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                .collect(),
+            cx,
+        );
+
+        let shelf_row = self.client_switch_row(
+            "Working section",
+            "Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you. The boring sidebar in Labs has no Working section.",
+            "misc-working-shelf-switch",
+            state.sidebar_working_shelf,
+            |this, on| {
+                this.misc_settings_state.sidebar_working_shelf = on;
+                this.client_config.sidebar_working_shelf = on;
+            },
+            cx,
+        );
+
+        // ── Confirmations section ──
+        let unpin_row = self.client_switch_row(
+            "Unpin confirmation",
+            "Ask before unpinning a thread from the pinned section.",
+            "misc-unpin-confirm-switch",
+            state.confirm_thread_unpin,
+            |this, on| {
+                this.misc_settings_state.confirm_thread_unpin = on;
+                this.client_config.confirm_thread_unpin = on;
+            },
+            cx,
+        );
+        let archive_row = self.client_switch_row(
+            "Archive confirmation",
+            "Require a second click on the inline archive action before a thread is archived.",
+            "misc-archive-confirm-switch",
+            state.confirm_thread_archive,
+            |this, on| {
+                this.misc_settings_state.confirm_thread_archive = on;
+                this.client_config.confirm_thread_archive = on;
+            },
+            cx,
+        );
+        let delete_row = self.client_switch_row(
+            "Delete confirmation",
+            "Ask before deleting a thread and its chat history.",
+            "misc-delete-confirm-switch",
+            state.confirm_thread_delete,
+            |this, on| {
+                this.misc_settings_state.confirm_thread_delete = on;
+                this.client_config.confirm_thread_delete = on;
+            },
+            cx,
+        );
+
+        // ── Display section ──
+        let format_value = TIME_FORMATS
+            .iter()
+            .map(|(value, _)| *value)
+            .find(|value| *value == state.timestamp_format)
+            .unwrap_or("locale");
+        let format_label = TIME_FORMATS
+            .iter()
+            .find(|(value, _)| *value == format_value)
+            .map(|(_, label)| *label)
+            .unwrap_or("System default");
+        let format_row = self.select_setting(
+            "Time format",
+            "System default follows your browser or OS clock preference.",
+            OpenList::TimeFormat,
+            format_label.into(),
+            format_value,
+            TIME_FORMATS
+                .iter()
+                .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                .collect(),
+            cx,
+        );
+
+        // Web `GeneralSettingsPanel` — four `SettingsSection`s separated by
+        // `gap-8` on the page container.
+        div()
+            .flex()
+            .flex_col()
+            .gap_8()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("Notifications"))
+                    .child(settings_card(vec![mode_row, in_app_row])),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("Sidebar"))
+                    .child(settings_card(vec![grouping_row, order_row, shelf_row])),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("Confirmations"))
+                    .child(settings_card(vec![unpin_row, archive_row, delete_row])),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("Display"))
+                    .child(settings_card(vec![format_row])),
+            )
+    }
+
+    /// A device-local toggle row — flips misc state and mirrors the new
+    /// value to `ClientConfig`, then saves (same write path as the
+    /// in-app-notifications switch).
+    fn client_switch_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        element_id: &'static str,
+        on: bool,
+        write: fn(&mut AppView, bool),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        setting_row(
+            title,
+            description,
             div()
-                .id("misc-inapp-switch")
+                .id(element_id)
                 .cursor_pointer()
-                .child(switch_control(in_app))
+                .child(switch_control(on))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _ev, _window, cx| {
-                        let state = &mut this.misc_settings_state;
-                        state.in_app_notifications = !state.in_app_notifications;
-                        this.client_config.in_app_notifications = state.in_app_notifications;
+                    cx.listener(move |this, _ev, _window, cx| {
+                        write(this, !on);
                         this.client_config.save();
                         cx.notify();
                     }),
                 ),
-        );
-
-        // Web `GeneralSettingsPanel` → `SettingsSection "Notifications"`:
-        // section title + a single bordered card around the two rows.
-        div()
-            .flex()
-            .flex_col()
-            .child(settings_section_title("Notifications"))
-            .child(settings_card(vec![mode_row, in_app_row]))
+        )
     }
 
     // ─── Chat defaults ────────────────────────────────────────────────────
