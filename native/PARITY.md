@@ -166,28 +166,66 @@ rows, checkpoint changed-files card, Pierre-dark code blocks with
 wrap/copy, centered empty state, right panel resized to the web's
 280px with tab scroll controls, palette row fixes, explorer search.
 
-Deliberate divergences:
+Pixel-diff pass 4 (live web + computed styles, dark + light, three
+widths): sidebar rebuilt to the web's default flat card mode
+(chip/project/time line, title line, branch meta, hover snooze+Settle,
+pin indicator), real prerendered `assets/aurora-{dark,light}.png`
+backdrop, `Svg::group_hover` icon brightening, GPUI native tooltips,
+`orchestration.getTurnDiff`/`getFullThreadDiff` + `Open diff`,
+bounded-snapshot + `GET /api/orchestration/threads/:id/history`
+pagination with the "Load earlier turns" control, scratch singleton
+groups, palette measured rows (32/48px), composer picker footer +
+Shift+Enter, light syntax palette, hover-reveal timestamps, right
+panel auto-collapse at 980px, full light theme on every surface.
 
-- The brand aurora approximates the web's backdrop with layered
-  linear gradients — GPUI has no radial gradients or blur.
-- "Load earlier turns" is not rendered: the Rust server always
-  reports `hasMoreHistory: false` and the client never paginates.
-- Turn diffs show an inline error — the Rust server does not
-  implement `orchestration.getTurnDiff`.
-- Palette two-line rows render ~44px vs the web's ~56px (GPUI text
-  metrics); readable and consistent.
-- The web splits scratch "No project" threads into per-family
-  header groups; native keeps one group per project.
-- Client decorations are enabled only where the compositor supports
-  them (Wayland/GNOME etc.); bare X11 falls back to server
-  decorations, so under Xvfb the window keeps the system frame. The
-  in-app topbar drag area and min/max/close controls render only in
-  client mode.
-- Icon hover-brighten (`hover:[&>svg]:text-sidebar-foreground`) is a
-  no-op: GPUI `Svg` has no hover state styling; icons hold resting ink
-  while the button background still highlights.
-- GPUI has no native tooltip or context-menu-popup primitive; composer
-  chips/buttons carry a custom tooltip layer (`show_tooltip`), and all
-  menus are custom popovers.
+Remaining divergences (all evidence-based):
+
+- The brand aurora is the web's `DevBlueprintArt` SVG prerendered to
+  `assets/aurora-{dark,light}.png` (including the
+  `sidebar-stage-backdrop` mask + `--stage-fade` overlay) — GPUI has
+  no SVG patterns/gradient transforms, so the baked image is the
+  primitive. The nightly variant and stage-label gating are not
+  ported: the dev blueprint renders unconditionally.
+- "Load earlier turns" is implemented: `orchestration.subscribeThread`
+  honors `acceptBoundedSnapshot` (newest 10-user-turn window,
+  `hasMoreHistory` + opaque `historyCursor` on the snapshot) and
+  `GET /api/orchestration/threads/:id/history?cursor=…` serves older
+  pages (20-user-turn window) from the same visible-item set — the
+  `environmentHttp.ts` `threadHistoryPage` contract. Deferred-work
+  cursors (`inclusive`), `throughEntryId`, `view`, `deferWork`, and
+  `compactIds` are not ported; the client always asks for the default
+  conversation page.
+- Turn diffs resolve checkpoint git refs against the scope's worktree
+  (`orchestration.getTurnDiff`/`getFullThreadDiff` are implemented);
+  threads whose captured worktree no longer exists still show the
+  inline error.
+- Palette active row uses `bg-accent` like the web's `aria-selected`
+  style, not the `data-highlighted` hover tint.
+- Scratch "No project" threads render one singleton group per thread
+  like the web's per-family groups, with per-thread collapse state
+  (`Project.expanded` is shared across the scratch workspace, so a
+  `scratch_collapsed` set keys off the thread id instead).
+- Under bare X11/Xvfb (no WM) the window renders borderless — GPUI's
+  X11 backend sets Motif hints for server decorations and no WM draws
+  them; the in-app topbar drag area and min/max/close controls render
+  only when `window_decorations()` reports `Client` (Wayland/GNOME).
+- Icon hover-brighten is applied via `Svg::group_hover` to all icon
+  buttons; decorative (non-button) row glyphs keep resting ink.
+- Tooltips use GPUI's built-in `tooltip` (500ms, cursor-anchored,
+  window-clamped) styled like the web's `TooltipPopup` — cursor-anchored
+  rather than element-anchored with an arrow.
 - Sidebar "Searching thread messages…" pending state is unreachable —
   native search is synchronous local filtering.
+- Sidebar cards: line-2 right glyph is the status icon (web renders a
+  provider badge — no provider artwork bundled); "No project" uses a
+  solid `message-square` (no dashed variant bundled); unpin keeps the
+  Pin glyph brightened (no `pin-off` asset); snooze applies the first
+  preset instantly instead of opening the preset menu; pinned
+  drag-reorder is not implemented; "Working Nm" live-status line is
+  not rendered (no live-status thread in the wire model).
+- Composer send uses a simplified 2-stop gradient vs the web's
+  stage-backdrop art; the footer does not collapse to an ellipsis at
+  narrow widths.
+- A few semantic colors (destructive reds, warning ambers) in
+  settings/archived/notifications are literal hex rather than theme
+  tokens — visually identical in both themes, just not token-driven.
