@@ -14,7 +14,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Local};
 use gpui::{
     AnyElement, ClipboardItem, Entity, EntityInputHandler, Focusable, FontFeatures, Rgba,
-    Subscription, div, prelude::*, px, rgba,
+    Subscription, div, prelude::*, px,
 };
 use serde_json::{Value, json};
 
@@ -286,18 +286,42 @@ fn day_aware_label(dt: &DateTime<Local>) -> String {
     }
 }
 
+/// `formatUpcomingTimestamp` — the forward-looking twin: `h:mm AM` today,
+/// `tomorrow at h:mm AM`, `M/D h:mm AM` / `M/D/YYYY h:mm AM` further out;
+/// past stamps fall back to `day_aware_label`. The usage-limit row appends
+/// the local zone name (`(UTC)`), like the web's `Intl` `timeZone` output.
+fn upcoming_label(iso: &str) -> Option<String> {
+    let dt = DateTime::parse_from_rfc3339(iso).ok()?.with_timezone(&Local);
+    let now = Local::now();
+    let hhmm = hhmm_ampm(&dt);
+    let days = dt.date_naive() - now.date_naive();
+    let label = match days.num_days() {
+        d if d < 0 => day_aware_label(&dt),
+        0 => hhmm,
+        1 => format!("tomorrow at {hhmm}"),
+        _ if dt.year() == now.year() => format!("{} {hhmm}", dt.format("%-m/%-d")),
+        _ => format!("{} {hhmm}", dt.format("%-m/%-d/%Y")),
+    };
+    let tz = Local::now().format("%Z").to_string();
+    Some(if tz.is_empty() {
+        label
+    } else {
+        format!("{label} ({tz})")
+    })
+}
+
 /// `TimelineRowTimestamp` — `text-xs text-muted-foreground tabular-nums`,
 /// `opacity-0` until the `.group("timeline-row")` ancestor is hovered unless
 /// `always_visible` (the web's `alwaysVisible`, used on error rows and the
 /// under-bubble meta).
-fn item_timestamp(item: &TurnItemView, always_visible: bool) -> Option<gpui::Div> {
-    let iso = raw_str(item, "updatedAt")?;
+fn timestamp_div(iso: &str, always_visible: bool, hover_group: &'static str) -> Option<gpui::Div> {
     let dt = DateTime::parse_from_rfc3339(iso)
         .ok()?
         .with_timezone(&Local);
     let label = day_aware_label(&dt);
-    // Both ancestors gate the reveal: "timeline-row" on work rows,
-    // "msg" on the under-bubble meta rows of user/assistant messages.
+    // The enclosing row's `.group(...)` gates the reveal: "timeline-row" on
+    // work/fold rows, "msg" on the under-bubble meta rows. A div holds only
+    // one group-hover style, so the caller names its ancestor.
     Some(
         div()
             .flex_shrink_0()
@@ -305,12 +329,20 @@ fn item_timestamp(item: &TurnItemView, always_visible: bool) -> Option<gpui::Div
             .font_features(tabular_nums())
             .text_color(theme::fg_muted())
             .when(!always_visible, |d| {
-                d.opacity(0.)
-                    .group_hover("timeline-row", |s| s.opacity(1.))
-                    .group_hover("msg", |s| s.opacity(1.))
+                d.opacity(0.).group_hover(hover_group, |s| s.opacity(1.))
             })
             .child(label),
     )
+}
+
+/// Item timestamps read `updatedAt` (the web passes `createdAt`, which the
+/// wire carries as `updatedAt` on our `TurnItemView`s).
+fn item_timestamp(
+    item: &TurnItemView,
+    always_visible: bool,
+    hover_group: &'static str,
+) -> Option<gpui::Div> {
+    timestamp_div(raw_str(item, "updatedAt")?, always_visible, hover_group)
 }
 
 /// Row shell: `group/timeline-row … rounded-md px-0.5 py-0(.5)` over a
@@ -444,6 +476,8 @@ struct TurnFold {
     /// `expanded` key — `fold:{boundary user_message id}`.
     key: String,
     label: String,
+    /// The boundary message's `createdAt` — the fold row's hover timestamp.
+    created_at: Option<String>,
 }
 
 /// One row in the rendered timeline after fold collapsing.
@@ -452,6 +486,7 @@ enum TimelineRow {
     Fold {
         key: String,
         label: String,
+        created_at: Option<String>,
         anchor: usize,
         open: bool,
     },
@@ -537,7 +572,14 @@ fn derive_turn_folds(items: &[TurnItemView]) -> (HashMap<usize, TurnFold>, HashM
         for &i in &members {
             hidden.insert(i, key.clone());
         }
-        anchors.insert(members[0], TurnFold { key, label });
+        anchors.insert(
+            members[0],
+            TurnFold {
+                key,
+                label,
+                created_at: iso(&items[b], ["createdAt", "updatedAt"]).map(str::to_owned),
+            },
+        );
     }
     (anchors, hidden)
 }
@@ -966,7 +1008,7 @@ fn checkbox_mark(checked: bool) -> gpui::Div {
         });
     box_ = if checked {
         box_.bg(theme::primary())
-            .child(icons::icon(Icon::Check, 12.).text_color(gpui::white()))
+            .child(icons::icon(Icon::Check, 12.).text_color(theme::primary_fg()))
     } else {
         box_.bg(theme::field_surface())
     };
@@ -996,7 +1038,7 @@ fn radio_mark(checked: bool) -> gpui::Div {
                 .justify_center()
                 .rounded_full()
                 .bg(theme::primary())
-                .child(div().size(px(6.)).rounded_full().bg(gpui::white())),
+                .child(div().size(px(6.)).rounded_full().bg(theme::primary_fg())),
         );
     }
     ring
@@ -1441,6 +1483,7 @@ impl AppView {
                     rows.push(TimelineRow::Fold {
                         key: fold.key.clone(),
                         label: fold.label.clone(),
+                        created_at: fold.created_at.clone(),
                         anchor: i,
                         open,
                     });
@@ -1466,9 +1509,13 @@ impl AppView {
                     TimelineRow::Fold {
                         key,
                         label,
+                        created_at,
                         anchor,
                         open,
-                    } => (8., self.turn_fold_row(key, label, *anchor, *open)),
+                    } => (
+                        6.,
+                        self.turn_fold_row(key, label, created_at.as_deref(), *anchor, *open),
+                    ),
                     TimelineRow::Item(i) => {
                         let item = &self.thread_items[*i];
                         let pad = if matches!(
@@ -1568,7 +1615,7 @@ impl AppView {
         let label = format_work_duration(elapsed);
         div()
             .border_b_1()
-            .border_color(theme::hairline())
+            .border_color(theme::table_rule())
             .pb_2()
             .pt_1()
             .child(
@@ -1587,45 +1634,64 @@ impl AppView {
             )
     }
 
-    /// `TurnFoldRow` — the same `border-b pb-2 pt-1` row as the working
-    /// timer, but a button: "Worked for 1m 17s" plus a `size-3.5` chevron
-    /// that toggles the turn's hidden work entries.
-    fn turn_fold_row(&self, key: &str, label: &str, anchor: usize, open: bool) -> AnyElement {
+    /// `TurnFoldRow` — the same `border-b border-border/60 pb-2 pt-1` row as
+    /// the working timer, but a button: "Worked for 1m 17s" plus a
+    /// `size-3.5` chevron that toggles the turn's hidden work entries; a
+    /// `ms-auto` `TimelineRowTimestamp` reveals on row hover.
+    fn turn_fold_row(
+        &self,
+        key: &str,
+        label: &str,
+        created_at: Option<&str>,
+        anchor: usize,
+        open: bool,
+    ) -> AnyElement {
         div()
             .id(("fold", anchor))
             .group("timeline-row")
             .border_b_1()
-            .border_color(theme::hairline())
+            .border_color(theme::table_rule())
             .pb_2()
+            .pr(px(2.))
             .pt_1()
             .cursor_pointer()
+            .text_color(theme::fg_muted())
+            .hover(|s| s.text_color(theme::fg()))
             .on_click(toggle_expanded(key.to_string()))
             .child(
                 div()
                     .flex()
-                    .h(px(24.))
                     .min_w_0()
                     .items_center()
                     .gap_1()
-                    .px_1()
                     .text_sm()
                     .line_height(px(22.75))
                     .font_features(tabular_nums())
-                    .text_color(theme::fg_muted())
-                    .child(label.to_string())
                     .child(
-                        div().flex_shrink_0().child(
-                            icons::icon(
-                                if open {
-                                    Icon::ChevronDown
-                                } else {
-                                    Icon::ChevronRight
-                                },
-                                14.,
-                            )
-                            .text_color(theme::fg_muted()),
-                        ),
-                    ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .rounded_md()
+                            .child(label.to_string())
+                            .child(
+                                div().flex_shrink_0().child(
+                                    icons::icon(
+                                        if open {
+                                            Icon::ChevronDown
+                                        } else {
+                                            Icon::ChevronRight
+                                        },
+                                        14.,
+                                    )
+                                    .text_color(theme::fg_muted()),
+                                ),
+                            ),
+                    )
+                    .when_some(created_at.and_then(|iso| timestamp_div(iso, false, "timeline-row")), |d, ts| {
+                        d.child(ts.ml_auto())
+                    }),
             )
             .into_any_element()
     }
@@ -1748,7 +1814,7 @@ impl AppView {
                     .child("queued"),
             );
         }
-        if let Some(ts) = item_timestamp(item, false) {
+        if let Some(ts) = item_timestamp(item, false, "msg") {
             meta = meta.child(ts);
         }
         meta = meta.child(copy_chip(
@@ -1848,18 +1914,59 @@ impl AppView {
             item.id.clone(),
             raw_text,
         ));
+        // The item's own threadId is canonical; fall back to the selected
+        // thread (this row only renders in it anyway).
+        let thread_id = raw_str(item, "threadId")
+            .map(str::to_owned)
+            .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()))
+            .unwrap_or_default();
+        // `AssistantForkButton` — a ghost GitFork chip on every completed
+        // assistant message with a runId (web `canForkProjectedAssistantItem`
+        // keeps it whenever capability evidence is absent).
+        if !item.streaming
+            && item.status == "completed"
+            && let Some(run_id) = raw_str(item, "runId").map(str::to_owned)
+        {
+            let source = thread_id.clone();
+            let title = self
+                .state
+                .selected_thread()
+                .map(|t| format!("{} fork", t.title));
+            buttons = buttons.child(
+                ghost_icon_chip(("fork", index), Icon::GitFork).on_click(
+                    move |_event, window, cx| {
+                        let source = source.clone();
+                        let run_id = run_id.clone();
+                        let title = title.clone();
+                        update_view(window, cx, move |this, cx| {
+                            let target = uuid::Uuid::new_v4().to_string();
+                            // Same payload as the web's `forkThreadFromRun`
+                            // (`commands.ts`), then navigate to the new shell.
+                            let mut command = json!({
+                                "type": "thread.fork",
+                                "commandId": uuid::Uuid::new_v4().to_string(),
+                                "createdBy": "user",
+                                "creationSource": "web",
+                                "sourceThreadId": source,
+                                "targetThreadId": target,
+                                "sourcePoint": {"type": "run", "runId": run_id},
+                            });
+                            if let Some(title) = &title {
+                                command["title"] = json!(title);
+                            }
+                            this.dispatch(command);
+                            this.select_thread(target.into(), cx);
+                        });
+                    },
+                ),
+            );
+        }
         // Hover feedback thumbs on every settled assistant message; a click
         // on a non-Codex thread explains provider.uploadFeedback isn't
         // available there (same message as the web's /feedback gate).
         if !item.streaming {
             let sent = self.timeline_state.feedback_sent.contains(&item.id);
             let busy = self.timeline_state.feedback_in_flight.contains(&item.id);
-            // The item's own threadId is canonical; fall back to the
-            // selected thread (this row only renders in it anyway).
-            let thread_id = raw_str(item, "threadId")
-                .map(str::to_owned)
-                .or_else(|| self.state.selected.as_ref().map(|s| s.to_string()))
-                .unwrap_or_default();
             for (up, icon, eid) in [
                 (true, Icon::ThumbsUp, 0usize),
                 (false, Icon::ThumbsDown, 1usize),
@@ -1894,7 +2001,7 @@ impl AppView {
         }
         meta = meta.child(buttons);
         if !item.streaming {
-            if let Some(ts) = item_timestamp(item, false) {
+            if let Some(ts) = item_timestamp(item, false, "msg") {
                 meta = meta.child(ts);
             }
         }
@@ -1973,7 +2080,7 @@ impl AppView {
                     .text_xs()
                     .cursor_pointer()
                     .bg(theme::primary())
-                    .text_color(gpui::white())
+                    .text_color(theme::primary_fg())
                     .hover(|s| s.opacity(0.9))
                     .on_click(move |_event, window, cx| {
                         let comment = f.update(cx, |field, cx| {
@@ -2174,7 +2281,7 @@ impl AppView {
                 .child(label_text),
         );
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
         let mut col = div().flex().flex_col().child(header);
         if expanded && !text.is_empty() {
@@ -2228,7 +2335,7 @@ impl AppView {
             header = header.child(failed_x());
         }
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -2304,7 +2411,7 @@ impl AppView {
             header = header.child(failed_x());
         }
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -2402,7 +2509,7 @@ impl AppView {
         );
         header = header
             .child(stats)
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
 
         let mut col = div().flex().flex_col().child(header);
@@ -2502,7 +2609,7 @@ impl AppView {
                             .unwrap_or_else(|| request_kind_label(kind).to_string()),
                     ),
             );
-        header = header.when_some(item_timestamp(item, false), |d, ts| d.child(ts));
+        header = header.when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts));
         col = col.child(header);
 
         // `ms-7.5 flex flex-col gap-1 pb-1 text-xs`
@@ -2895,7 +3002,7 @@ impl AppView {
                         .text_xs()
                         .cursor_pointer()
                         .bg(theme::primary())
-                        .text_color(gpui::white())
+                        .text_color(theme::primary_fg())
                         .hover(|s| s.opacity(0.9))
                         .on_click(move |_event, window, cx| {
                             let payload = payload.clone();
@@ -3067,7 +3174,7 @@ impl AppView {
             div().text_color(self.live_label_color(live)).child(label),
         );
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {
@@ -3167,107 +3274,82 @@ impl AppView {
                     })
                     .child(text),
             )
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .into_any_element()
     }
 
     fn error_row(&self, item: &TurnItemView) -> AnyElement {
         let failure = &item.raw["failure"];
         // Provider usage-limit failures (`failure.class: "usage_limit"`)
-        // render as the web's usage-limit banner — warning tone, not error.
+        // render as a warning-toned WorkLogRow — `text-warning` icon +
+        // `text-sm font-medium` "Usage limit reached. Retry after …"
+        // label, no card chrome, and no detail paragraph.
         let usage_limit =
             item.status != "completed" && failure["class"].as_str() == Some("usage_limit");
-        let title = if usage_limit {
-            "Usage limit reached".to_string()
-        } else {
-            raw_str(item, "title")
-                .map(str::to_owned)
-                .or_else(|| failure["class"].as_str().map(str::to_owned))
-                .unwrap_or_else(|| "Error".to_string())
-        };
-        let mut message = failure["message"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| item.body.clone())
-            .unwrap_or_else(|| title.clone());
         if usage_limit {
-            if let Some(reset_at) = failure["resetAt"].as_str() {
-                // "2026-11-17T20:22:33.666Z" → "2026-11-17 20:22 UTC".
-                let short = reset_at.get(..16).unwrap_or(reset_at).replace('T', " ");
-                message = format!("{message} Retry after {short} UTC.");
-            }
-        }
-        let code = failure["code"].as_str().map(str::to_owned);
-        if !usage_limit {
-            // Plain provider errors are work entries with the destructive
-            // row style — ⚠ icon + `text-destructive` heading, no card.
+            let reset = failure["resetAt"]
+                .as_str()
+                .and_then(upcoming_label)
+                .map(|t| format!(" Retry after {t}."))
+                .unwrap_or_default();
             return work_row_line()
                 .group("timeline-row")
-                .child(work_icon(Icon::CircleAlert, true))
+                .child(glyph_slot(Icon::CircleAlert, warning(), true))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .flex()
-                        .items_baseline()
-                        .gap_2()
-                        .child(
-                            div()
-                                .truncate()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(danger())
-                                .child(if message.is_empty() {
-                                    title.clone()
-                                } else {
-                                    format!("{title}: {message}")
-                                }),
-                        )
-                        .when_some(code, |d, code| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .flex_shrink_0()
-                                    .text_color(theme::fg_muted())
-                                    .child(code),
-                            )
-                        }),
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(warning())
+                        .child(format!("Usage limit reached.{reset}")),
                 )
-                .when_some(item_timestamp(item, true), |d, ts| d.child(ts))
+                .when_some(item_timestamp(item, true, "timeline-row"), |d, ts| d.child(ts))
                 .into_any_element();
         }
-        // Usage-limit failures keep the warning-toned banner.
-        div()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::warning_border())
-            .bg(rgba(0xe8b45a14))
-            .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_1()
+        let title = raw_str(item, "title")
+            .map(str::to_owned)
+            .or_else(|| failure["class"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "Error".to_string());
+        let message = failure["message"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| item.body.clone())
+            .unwrap_or_else(|| title.clone());
+        let code = failure["code"].as_str().map(str::to_owned);
+        // Plain provider errors are work entries with the destructive
+        // row style — ⚠ icon + `text-destructive` heading, no card.
+        work_row_line()
+            .group("timeline-row")
+            .child(work_icon(Icon::CircleAlert, true))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
+                    .items_baseline()
                     .gap_2()
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .child(icons::icon(Icon::TriangleAlert, 14.).text_color(warning())),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(warning())
-                            .child(title),
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(danger())
+                            .child(if message.is_empty() {
+                                title.clone()
+                            } else {
+                                format!("{title}: {message}")
+                            }),
                     )
                     .when_some(code, |d, code| {
-                        d.child(div().text_xs().text_color(theme::fg_muted()).child(code))
+                        d.child(
+                            div()
+                                .text_xs()
+                                .flex_shrink_0()
+                                .text_color(theme::fg_muted())
+                                .child(code),
+                        )
                     }),
             )
-            .child(div().text_xs().text_color(theme::fg()).child(message))
+            .when_some(item_timestamp(item, true, "timeline-row"), |d, ts| d.child(ts))
             .into_any_element()
     }
 
@@ -3373,7 +3455,7 @@ impl AppView {
                 }),
         );
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(work_chevron(expanded));
 
         let mut col = div().flex().flex_col().child(header);
@@ -3477,7 +3559,7 @@ impl AppView {
             div().text_color(self.live_label_color(live)).child(text),
         );
         header = header
-            .when_some(item_timestamp(item, false), |d, ts| d.child(ts))
+            .when_some(item_timestamp(item, false, "timeline-row"), |d, ts| d.child(ts))
             .child(if can_expand {
                 work_chevron(expanded)
             } else {

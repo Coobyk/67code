@@ -91,7 +91,7 @@ pub fn render_code_block(code: &str, language: Option<&str>, ui: &CodeBlockUi) -
         .rounded_lg()
         // `border border-border/70 … dark:border-transparent` — the card
         // edge only shows on light themes.
-        .when(!dark, |d| d.border_1().border_color(theme::border()))
+        .when(!dark, |d| d.border_1().border_color(theme::hairline()))
         .bg(theme::code_block_bg())
         .overflow_hidden();
 
@@ -193,7 +193,7 @@ pub fn render_code_block(code: &str, language: Option<&str>, ui: &CodeBlockUi) -
             // `leading-snug` (1.375) at 13px.
             .line_height(px(17.875))
             .when(!ui.wrapped, |d| d.whitespace_nowrap())
-            .text_color(theme::fg())
+            .text_color(theme::code_fg())
             .child(text),
     )
     .into_any_element()
@@ -757,17 +757,19 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
     /// top`, `text-align: start`, `max-width: 24rem`; the first/last cells
     /// drop their outer horizontal padding so the columns sit flush with the
     /// surrounding prose. `thead th` adds weight 600 and a taller 0.55rem
-    /// block padding.
+    /// block padding. `grow` is the column's proportional share.
     fn cell(
         text: &str,
         ix: usize,
         last: usize,
         align: Align,
         header: bool,
+        grow: f32,
         ctx: &mut RenderCtx,
     ) -> AnyElement {
         let mut d = div()
-            .flex_1()
+            .flex_basis(px(0.))
+            .flex_grow(grow)
             .min_w_0()
             .max_w(px(384.)) // 24rem
             .py(px(if header { 8.8 } else { 7.2 }))
@@ -786,6 +788,18 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
 
     let align_at = |ix: usize| table.aligns.get(ix).copied().unwrap_or(Align::Left);
     let last = cols - 1;
+
+    // `table-layout: auto` sizes each column to its widest cell, then
+    // distributes the lane's leftover width proportionally. A per-column
+    // max char count at ~7.4px/char (Inter 14px) plus the 0.75rem padding
+    // drives a matching flex-grow ratio.
+    let mut est = vec![0usize; cols];
+    for row in std::iter::once(&table.header).chain(table.rows.iter()) {
+        for (ix, text) in row.iter().enumerate().take(cols) {
+            est[ix] = est[ix].max(layout_inline(text).text.chars().count());
+        }
+    }
+    let grow = |ix: usize| est[ix] as f32 * 7.4 + 24.;
 
     // Diagnostics-style table: no card chrome — a 100%-width row of `border-
     // bottom: contrast-border/60` separators, one step under 15px prose.
@@ -814,6 +828,7 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
             last,
             align_at(ix),
             true,
+            grow(ix),
             ctx,
         ));
     }
@@ -834,6 +849,7 @@ fn render_table(table: &Table, first: bool, ctx: &mut RenderCtx) -> AnyElement {
                 last,
                 align_at(ix),
                 false,
+                grow(ix),
                 ctx,
             ));
         }
@@ -862,8 +878,16 @@ fn inline_highlight(st: &InlineStyle) -> HighlightStyle {
     HighlightStyle {
         // `.chat-markdown a` — `--info-foreground`, `text-decoration: none`
         // (the dotted underline only appears on hover/focus, which styled
-        // spans can't express).
-        color: st.link.is_some().then(|| theme::info_fg().into()),
+        // spans can't express). Inline code keeps the full
+        // `--contrast-foreground` rather than the body's 90% (the code rule
+        // outranks `a` on specificity when both apply).
+        color: if st.code {
+            Some(theme::fg().into())
+        } else if st.link.is_some() {
+            Some(theme::info_fg().into())
+        } else {
+            None
+        },
         font_weight: st.bold.then_some(FontWeight::BOLD),
         font_style: st.italic.then_some(FontStyle::Italic),
         // `:not(pre) > code` — fg·10% fill, 4px radius (radius/padding aren't
@@ -1168,48 +1192,54 @@ fn inline_element(src: &str, ctx: &mut RenderCtx) -> AnyElement {
 }
 
 // ---------------------------------------------------------------------------
-// Syntax highlighting — a small per-language tokenizer. Colors follow the
-// web's pierre-dark shiki theme (apps/web syntaxHighlighting).
+// Syntax highlighting — a small per-language tokenizer. Dark values are the
+// web's pierre-dark shiki theme; light values are the pierre-light palette
+// after the web's `readableSyntaxTheme` contrast-darkening (measured on the
+// light reference: function #693acf, punct #4b4b4b, number #0b5267,
+// comment #5c5c5c).
 // ---------------------------------------------------------------------------
 
+fn syn(dark: u32, light: u32) -> Hsla {
+    rgb(if theme::effective_dark() { dark } else { light }).into()
+}
 fn syn_keyword() -> Hsla {
-    rgb(0xff678d).into()
+    syn(0xff678d, 0xb12251)
 }
 fn syn_string() -> Hsla {
-    rgb(0x5ecc71).into()
+    syn(0x5ecc71, 0x106a2b)
 }
 fn syn_comment() -> Hsla {
-    rgb(0x737373).into()
+    syn(0x737373, 0x5c5c5c)
 }
 fn syn_number() -> Hsla {
-    rgb(0x68cdf2).into()
+    syn(0x68cdf2, 0x0b5267)
 }
 fn syn_function() -> Hsla {
-    rgb(0x9d6afb).into()
+    syn(0x9d6afb, 0x693acf)
 }
 fn syn_type() -> Hsla {
-    rgb(0xd568ea).into()
+    syn(0xd568ea, 0x912ba7)
 }
 fn syn_constant() -> Hsla {
-    rgb(0xffd452).into()
+    syn(0xffd452, 0x735b02)
 }
 fn syn_var_lang() -> Hsla {
-    rgb(0xffa359).into()
+    syn(0xffa359, 0x8f4e17)
 }
 fn syn_operator() -> Hsla {
-    rgb(0x08c0ef).into()
+    syn(0x08c0ef, 0x006781)
 }
 fn syn_punct() -> Hsla {
-    rgb(0x636363).into()
+    syn(0x636363, 0x4b4b4b)
 }
 fn syn_json_key() -> Hsla {
-    rgb(0xff855e).into()
+    syn(0xff855e, 0xa43d23)
 }
 fn syn_diff_add() -> Hsla {
-    rgb(0x5ecc71).into()
+    syn(0x5ecc71, 0x106a2b)
 }
 fn syn_diff_del() -> Hsla {
-    rgb(0xff855e).into()
+    syn(0xff855e, 0xa43d23)
 }
 
 const RUST_KEYWORDS: &[&str] = &[

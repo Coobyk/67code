@@ -106,6 +106,8 @@ pub enum Icon {
     GitBranch,
     /// `git-compare`
     GitCompare,
+    /// `git-fork`
+    GitFork,
     /// `git-merge`
     GitMerge,
     /// `git-pull-request`
@@ -292,6 +294,7 @@ impl Icon {
             Icon::FolderTree => include_bytes!("../icons/folder-tree.svg").as_slice(),
             Icon::GitBranch => include_bytes!("../icons/git-branch.svg").as_slice(),
             Icon::GitCompare => include_bytes!("../icons/git-compare.svg").as_slice(),
+            Icon::GitFork => include_bytes!("../icons/git-fork.svg").as_slice(),
             Icon::GitMerge => include_bytes!("../icons/git-merge.svg").as_slice(),
             Icon::GitPullRequest => include_bytes!("../icons/git-pull-request.svg").as_slice(),
             Icon::Globe => include_bytes!("../icons/globe.svg").as_slice(),
@@ -413,6 +416,7 @@ impl Icon {
             Icon::FolderTree => "folder-tree",
             Icon::GitBranch => "git-branch",
             Icon::GitCompare => "git-compare",
+            Icon::GitFork => "git-fork",
             Icon::GitMerge => "git-merge",
             Icon::GitPullRequest => "git-pull-request",
             Icon::Globe => "globe",
