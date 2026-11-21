@@ -178,6 +178,10 @@ pub async fn run(
             post(auth::revoke_other_clients),
         )
         .route("/api/assets/{*key}", get(rpc_assets::serve_asset))
+        .route(
+            "/api/orchestration/threads/{thread_id}/history",
+            get(handlers::thread_history_http),
+        )
         .route("/ws", get(ws_rpc::ws_upgrade))
         .with_state(state);
 

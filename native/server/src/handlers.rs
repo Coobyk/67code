@@ -93,6 +93,10 @@ pub async fn handle_request(state: Arc<AppState>, tag: &str, payload: Value) -> 
             "_tag": "OrchestrationV2GetTurnItemError",
             "message": "not implemented",
         })),
+        "orchestration.getTurnDiff" => crate::rpc_vcs::get_turn_diff(state, &payload).await,
+        "orchestration.getFullThreadDiff" => {
+            crate::rpc_vcs::get_full_thread_diff(state, &payload).await
+        }
         "orchestration.getArchivedShellSnapshot" => {
             RpcResult::ok(state.store.archived_shell_snapshot().await)
         }
@@ -521,7 +525,7 @@ async fn thread_stream(
         let snapshot_seq = state.store.latest_sequence().await;
         match state.store.thread_projection(&thread_id).await {
             Some(projection) => {
-                let wire = domain::project_projection_for_wire(&projection);
+                let mut wire = domain::project_projection_for_wire(&projection);
                 // `computeLatestLocalTurnOrdinal`: max ordinal across turn items.
                 let latest_local_turn_ordinal = wire
                     .get("turnItems")
@@ -534,12 +538,33 @@ async fn thread_stream(
                     })
                     .map(Value::from)
                     .unwrap_or(Value::Null);
+                // `acceptBoundedSnapshot` opt-in: bound `visibleTurnItems` to
+                // the newest history window (`buildBoundedThreadProjection`);
+                // "Load earlier turns" continues from `historyCursor` through
+                // the HTTP history-page endpoint.
+                let accept_bounded =
+                    payload.get("acceptBoundedSnapshot").and_then(Value::as_bool) == Some(true);
+                let (history_cursor, has_more_history) = if accept_bounded {
+                    let visible = wire
+                        .get("visibleTurnItems")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (window, cursor, has_more) =
+                        domain::bound_visible_items(&visible, snapshot_seq);
+                    if let Some(o) = wire.as_object_mut() {
+                        o.insert("visibleTurnItems".into(), Value::Array(window));
+                    }
+                    (cursor, has_more)
+                } else {
+                    (Value::Null, false)
+                };
                 let item = json!({
                     "kind": "snapshot",
                     "snapshotSequence": snapshot_seq,
                     "projection": wire,
-                    "historyCursor": Value::Null,
-                    "hasMoreHistory": false,
+                    "historyCursor": history_cursor,
+                    "hasMoreHistory": has_more_history,
                     "latestLocalTurnOrdinal": latest_local_turn_ordinal,
                 });
                 if !window.send_chunk(&out, request_id, vec![item]).await {
@@ -1007,5 +1032,54 @@ async fn delete_acp_session(state: Arc<AppState>, payload: Value) -> RpcResult {
             "session_delete_failed",
             format!("devin rm failed to spawn: {e}"),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP surface (axum) — the orchestration endpoints the web fetches outside
+// the WS stream (`environmentHttp.ts`).
+// ---------------------------------------------------------------------------
+
+/// `GET /api/orchestration/threads/:threadId/history?cursor=<opaque>` →
+/// `OrchestrationV2ThreadHistoryPage`. Bearer auth mirrors `serve_asset`
+/// (open when no dev token is configured).
+pub async fn thread_history_http(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(expected) = &state.auth_token {
+        let credential = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let ok = credential
+            .map(|c| c == expected.as_str() || state.auth_access.pairing_token_valid(c))
+            .unwrap_or(false);
+        if !ok {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    let Some(cursor) = query.get("cursor") else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "reason": "invalid_history_cursor" })),
+        )
+            .into_response();
+    };
+    match state.store.thread_history_page(&thread_id, cursor).await {
+        Ok(page) => axum::Json(page).into_response(),
+        Err("not_found") => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({ "reason": "thread_not_found" })),
+        )
+            .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "reason": "invalid_history_cursor" })),
+        )
+            .into_response(),
     }
 }

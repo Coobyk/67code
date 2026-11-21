@@ -70,6 +70,19 @@ enum StoreCmd {
         thread_id: String,
         reply: Reply<Option<Value>>,
     },
+    /// `getThreadHistoryPage` — older visible items before an opaque cursor;
+    /// `Err("not_found")` for unknown threads, `Err("invalid_cursor")` for a
+    /// cursor that does not decode.
+    ThreadHistoryPage {
+        thread_id: String,
+        cursor: String,
+        reply: Reply<Result<Value, &'static str>>,
+    },
+    /// `getCheckpointContext` — light checkpoint/run columns for turn diffs.
+    CheckpointContext {
+        thread_id: String,
+        reply: Reply<Option<Value>>,
+    },
     EventsForThread {
         thread_id: String,
         after: i64,
@@ -197,6 +210,34 @@ impl StoreHandle {
     pub async fn thread_projection(&self, thread_id: &str) -> Option<Value> {
         let (tx, rx) = oneshot::channel();
         self.send(StoreCmd::ThreadProjection {
+            thread_id: thread_id.into(),
+            reply: tx,
+        });
+        rx.await.ok().flatten()
+    }
+
+    /// `OrchestrationV2ThreadHistoryPage` for
+    /// `GET /api/orchestration/threads/:id/history`.
+    pub async fn thread_history_page(
+        &self,
+        thread_id: &str,
+        cursor: &str,
+    ) -> Result<Value, &'static str> {
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCmd::ThreadHistoryPage {
+            thread_id: thread_id.into(),
+            cursor: cursor.into(),
+            reply: tx,
+        });
+        rx.await.unwrap_or(Err("store actor died"))
+    }
+
+    /// `ProjectionStoreV2.getCheckpointContext` — `{runs, checkpointScopes,
+    /// checkpoints}` with only the columns turn diffs read. `None` when the
+    /// thread does not exist.
+    pub async fn checkpoint_context(&self, thread_id: &str) -> Option<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCmd::CheckpointContext {
             thread_id: thread_id.into(),
             reply: tx,
         });
@@ -712,6 +753,16 @@ fn actor_loop(conn: Connection, rx: std_mpsc::Receiver<StoreCmd>) {
             }
             StoreCmd::ThreadProjection { thread_id, reply } => {
                 let _ = reply.send(thread_projection(&conn, &thread_id));
+            }
+            StoreCmd::ThreadHistoryPage {
+                thread_id,
+                cursor,
+                reply,
+            } => {
+                let _ = reply.send(thread_history_page(&conn, &thread_id, &cursor));
+            }
+            StoreCmd::CheckpointContext { thread_id, reply } => {
+                let _ = reply.send(checkpoint_context(&conn, &thread_id));
             }
             StoreCmd::EventsForThread {
                 thread_id,
@@ -1515,6 +1566,131 @@ fn thread_projection(conn: &Connection, thread_id: &str) -> Option<Value> {
         "contextTransfers": transfers,
         "visibleTurnItems": visible,
         "updatedAt": updated_at,
+    }))
+}
+
+/// `ThreadManagementService.getThreadHistoryPage`: the page of visible items
+/// strictly older than `cursor`, newest-first capped by `OLDER_PAGE` — same
+/// visible-item set the projection serves, sliced by `cursor_end_index`.
+fn thread_history_page(
+    conn: &Connection,
+    thread_id: &str,
+    cursor: &str,
+) -> Result<Value, &'static str> {
+    if get_thread_row(conn, thread_id).is_none() {
+        return Err("not_found");
+    }
+    let (_, st, si, p) = domain::decode_history_cursor(cursor).ok_or("invalid_cursor")?;
+    let col = |sql: &str| column_json(conn, sql, &[&thread_id]);
+    let runs = col(
+        "SELECT payload_json FROM orchestration_v2_projection_runs WHERE thread_id = ?1",
+    );
+    let attempts = col(
+        "SELECT payload_json FROM orchestration_v2_projection_run_attempts WHERE thread_id = ?1",
+    );
+    let turn_items = col(
+        "SELECT t.payload_json FROM orchestration_v2_projection_turn_items t \
+         LEFT JOIN orchestration_v2_turn_item_positions p \
+           ON p.thread_id = t.thread_id AND p.turn_item_id = t.turn_item_id \
+         WHERE t.thread_id = ?1 ORDER BY COALESCE(p.ordinal, t.ordinal) ASC, t.turn_item_id ASC",
+    );
+    let visible = visible_turn_items(&runs, &attempts, &turn_items);
+    let end = domain::cursor_end_index(&visible, &st, &si, p);
+    let snapshot_sequence = latest_sequence(conn);
+    let (items, next_cursor, has_more) =
+        domain::select_older_page(&visible, end, snapshot_sequence, &domain::OLDER_PAGE);
+    Ok(json!({
+        "snapshotSequence": snapshot_sequence,
+        "items": items,
+        "nextCursor": next_cursor.map_or(Value::Null, Value::String),
+        "hasMoreHistory": has_more,
+    }))
+}
+
+/// `ProjectionStoreV2.getCheckpointContext` — only the columns
+/// `CheckpointDiffQuery` reads (TS selects the same fields, same order).
+fn checkpoint_context(conn: &Connection, thread_id: &str) -> Option<Value> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ?1 LIMIT 1",
+            [thread_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return None;
+    }
+    let runs = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, ordinal, status FROM orchestration_v2_projection_runs \
+                 WHERE thread_id = ?1 ORDER BY ordinal ASC",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([thread_id], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "ordinal": r.get::<_, i64>(1)?,
+                    "status": r.get::<_, String>(2)?,
+                }))
+            })
+            .ok()?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    let checkpoint_scopes = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT scope_id, run_id, kind, json_extract(payload_json, '$.cwd') \
+                 FROM orchestration_v2_projection_checkpoint_scopes \
+                 WHERE thread_id = ?1 ORDER BY ordinal_within_parent ASC, scope_id ASC",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([thread_id], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "runId": r.get::<_, Option<String>>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "cwd": r.get::<_, Option<String>>(3)?,
+                }))
+            })
+            .ok()?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    let checkpoints = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT scope_id, run_id, ordinal_within_scope, app_run_ordinal, status, \
+                 json_extract(payload_json, '$.ref') \
+                 FROM orchestration_v2_projection_checkpoints \
+                 WHERE thread_id = ?1 ORDER BY scope_id ASC, ordinal_within_scope ASC",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([thread_id], |r| {
+                Ok(json!({
+                    "scopeId": r.get::<_, String>(0)?,
+                    "runId": r.get::<_, Option<String>>(1)?,
+                    "ordinalWithinScope": r.get::<_, i64>(2)?,
+                    "appRunOrdinal": r.get::<_, Option<i64>>(3)?,
+                    "status": r.get::<_, String>(4)?,
+                    "ref": r.get::<_, Option<String>>(5)?,
+                }))
+            })
+            .ok()?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    Some(json!({
+        "runs": runs,
+        "checkpointScopes": checkpoint_scopes,
+        "checkpoints": checkpoints,
     }))
 }
 

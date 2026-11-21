@@ -619,3 +619,229 @@ pub fn app_thread_from_create(cmd: &Value, now: &str) -> Value {
     }
     app
 }
+
+// ---------------------------------------------------------------------------
+// Thread history paging (`apps/server/.../threadHistoryPaging.ts`)
+// ---------------------------------------------------------------------------
+//
+// The bounded `orchestration.subscribeThread` snapshot and the
+// `GET /api/orchestration/threads/:id/history` page share one selection:
+// keep the newest window of visible turn items bounded by user turns, item
+// count and encoded bytes, then hand back an opaque cursor that pages
+// strictly-older items (`selectOlderTimelinePage`). Cursors are base64url
+// JSON `{v,seq,st,si,p}` — the payload shape the TS server emits — so pages
+// interop in both directions.
+
+use base64::Engine;
+
+/// `THREAD_HISTORY_PAGE_POLICY` — the subscribeThread snapshot window keeps
+/// the newest ~10 user turns.
+pub const SNAPSHOT_PAGE: PagePolicy = PagePolicy {
+    max_user_turns: 10,
+    max_items: 75,
+    max_turn_items: 500,
+    max_encoded_bytes: 1_048_576,
+};
+
+/// `olderHistoryPagePolicy` — "Load earlier turns" pages allow 20 turns.
+pub const OLDER_PAGE: PagePolicy = PagePolicy {
+    max_user_turns: 20,
+    max_items: 75,
+    max_turn_items: 500,
+    max_encoded_bytes: 1_048_576,
+};
+
+/// `THREAD_HISTORY_MAX_RAW_TURNS` — run-starts cap inside a turn window.
+const MAX_RAW_TURNS: usize = 150;
+
+pub struct PagePolicy {
+    pub max_user_turns: usize,
+    pub max_items: usize,
+    /// `maxTurnItems` — the item cap once the window holds a user turn.
+    pub max_turn_items: usize,
+    pub max_encoded_bytes: usize,
+}
+
+/// `isThreadHistoryTurnStart`: a user message that opens a turn.
+fn is_history_turn_start(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("user_message")
+        && matches!(
+            item.get("inputIntent").and_then(Value::as_str),
+            Some("turn_start") | Some("queued_turn")
+        )
+}
+
+/// `isThreadHistoryUserTurn`: a turn start authored by the user.
+fn is_user_turn(item: &Value) -> bool {
+    is_history_turn_start(item)
+        && item.get("createdBy").and_then(Value::as_str) == Some("user")
+}
+
+/// `threadHistoryTurnStarts`: notifications can start a turn when they are
+/// the run's first input; matches the `ProjectionStore` run_starts logic.
+fn history_turn_starts(rows: &[Value]) -> Vec<bool> {
+    let mut started_runs: std::collections::HashSet<&str> = Default::default();
+    rows.iter()
+        .map(|row| {
+            let item = &row["item"];
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind != "user_message" && kind != "notification" {
+                return false;
+            }
+            let run_id = item.get("runId").and_then(Value::as_str);
+            let first_input = run_id.is_some_and(|r| !started_runs.contains(r));
+            if let Some(r) = run_id {
+                started_runs.insert(r);
+            }
+            if kind == "notification" {
+                first_input
+            } else {
+                is_history_turn_start(item)
+            }
+        })
+        .collect()
+}
+
+/// `encodeThreadHistoryCursor` — opaque `{v:1,seq,st,si,p}` base64url JSON.
+fn encode_history_cursor(snapshot_sequence: i64, row: &Value) -> Option<String> {
+    let payload = json!({
+        "v": 1,
+        "seq": snapshot_sequence,
+        "st": row.get("sourceThreadId").and_then(Value::as_str)?,
+        "si": row.get("sourceItemId").and_then(Value::as_str)?,
+        "p": row.get("position").and_then(Value::as_i64).unwrap_or(0),
+    });
+    Some(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(payload.to_string().as_bytes()),
+    )
+}
+
+/// `decodeThreadHistoryCursor`; `None` mirrors `InvalidThreadHistoryCursorError`.
+pub fn decode_history_cursor(cursor: &str) -> Option<(i64, String, String, i64)> {
+    if cursor.is_empty() || cursor.len() > 1024 {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .ok()?;
+    let payload: Value = serde_json::from_slice(&raw).ok()?;
+    if payload.get("v").and_then(Value::as_i64) != Some(1) {
+        return None;
+    }
+    let seq = payload.get("seq").and_then(Value::as_i64)?;
+    let st = payload
+        .get("st")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let si = payload
+        .get("si")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let p = payload.get("p").and_then(Value::as_i64)?;
+    if seq < 0 || p < 0 {
+        return None;
+    }
+    Some((seq, st, si, p))
+}
+
+/// `findCursorEndIndex` — the exclusive slice end the cursor points at:
+/// the row carrying the cursor's identity, else the first row at/after its
+/// position.
+pub fn cursor_end_index(items: &[Value], st: &str, si: &str, p: i64) -> usize {
+    if let Some(index) = items.iter().position(|row| {
+        row.get("sourceThreadId").and_then(Value::as_str) == Some(st)
+            && row.get("sourceItemId").and_then(Value::as_str) == Some(si)
+    }) {
+        return index;
+    }
+    items
+        .iter()
+        .position(|row| row.get("position").and_then(Value::as_i64).unwrap_or(0) >= p)
+        .unwrap_or(items.len())
+}
+
+/// `renumberPositions` — positions restart at 0 inside each page/window.
+fn renumber_positions(items: &mut [Value]) {
+    for (position, row) in items.iter_mut().enumerate() {
+        if let Some(o) = row.as_object_mut() {
+            o.insert("position".into(), json!(position));
+        }
+    }
+}
+
+/// `selectOlderTimelinePage`: the newest `items[..end]` window bounded by
+/// the policy. `hasMore`/`next_cursor` describe the remaining older rows.
+pub fn select_older_page(
+    items: &[Value],
+    exclusive_end: usize,
+    snapshot_sequence: i64,
+    policy: &PagePolicy,
+) -> (Vec<Value>, Option<String>, bool) {
+    let end = exclusive_end.min(items.len());
+    if end == 0 {
+        return (Vec::new(), None, false);
+    }
+    let candidates = &items[..end];
+    let turn_starts = history_turn_starts(candidates);
+    let turn_limit = candidates.iter().any(|row| is_user_turn(&row["item"]));
+    let max_items = if turn_limit {
+        policy.max_turn_items
+    } else {
+        policy.max_items
+    };
+    // Indices walk newest → oldest.
+    let mut picked: Vec<usize> = Vec::new();
+    let mut encoded_bytes = 0usize;
+    let mut user_turns = 0usize;
+    let mut raw_turns = 0usize;
+    for index in (0..end).rev() {
+        if !picked.is_empty()
+            && (picked.len() >= max_items
+                || (turn_limit
+                    && (user_turns >= policy.max_user_turns || raw_turns >= MAX_RAW_TURNS)))
+        {
+            break;
+        }
+        let row_bytes = items[index].to_string().len();
+        if !picked.is_empty() && encoded_bytes + row_bytes > policy.max_encoded_bytes {
+            break;
+        }
+        picked.push(index);
+        encoded_bytes += row_bytes;
+        if is_user_turn(&items[index]["item"]) {
+            user_turns += 1;
+        }
+        if turn_starts[index] {
+            raw_turns += 1;
+        }
+    }
+    // Inside one long turn no row starts a user turn; this page then uses
+    // `maxItems`, like later pages and the snapshot query do.
+    if user_turns == 0 {
+        picked.truncate(policy.max_items);
+    }
+    picked.reverse();
+    let oldest_index = picked.first().copied();
+    let next_cursor = oldest_index.and_then(|i| encode_history_cursor(snapshot_sequence, &items[i]));
+    let has_more = oldest_index.is_some_and(|i| i > 0);
+    let next_cursor = if has_more { next_cursor } else { None };
+    let mut selected: Vec<Value> = picked.iter().map(|&i| items[i].clone()).collect();
+    renumber_positions(&mut selected);
+    (selected, next_cursor, has_more)
+}
+
+/// `selectRecentTimelineWindow` — bound a subscribeThread snapshot's
+/// `visibleTurnItems` to the newest window when the client opted in. Returns
+/// `(kept rows renumbered, historyCursor, hasMoreHistory)`; an empty bound
+/// keeps everything.
+pub fn bound_visible_items(
+    visible: &[Value],
+    snapshot_sequence: i64,
+) -> (Vec<Value>, Value, bool) {
+    let (items, next_cursor, has_more) =
+        select_older_page(visible, visible.len(), snapshot_sequence, &SNAPSHOT_PAGE);
+    (items, next_cursor.map_or(Value::Null, Value::String), has_more)
+}

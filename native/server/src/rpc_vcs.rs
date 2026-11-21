@@ -1767,6 +1767,589 @@ async fn remove_worktree(state: &AppState, payload: &Value) -> Result<Value, Val
 }
 
 // ---------------------------------------------------------------------------
+// Checkpoint turn diffs — `orchestration.getTurnDiff` /
+// `orchestration.getFullThreadDiff`, a port of
+// `apps/server/src/checkpointing/CheckpointDiffQuery.ts` +
+// `GitVcsDriver.checkpoints.{diffCheckpoints,listAuthoredPaths}`.
+// ---------------------------------------------------------------------------
+
+const CHECKPOINT_REFS_PREFIX: &str = "refs/t3/orchestration-v2/checkpoints";
+const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES: usize = 10_000_000;
+const DIFF_TRUNCATED_MARKER: &str = "\n\n[truncated]";
+// Windows limits a command line to 32,767 chars (TS MAX_PATHSPEC_CHARS).
+const MAX_PATHSPEC_CHARS: usize = 24_000;
+
+/// `checkpointRefForScopeOrdinal`: the ref name a checkpoint capture writes is
+/// derived from the scope id, so `fromTurnCount == 0` can name the baseline
+/// ref even before reading a checkpoint row.
+fn checkpoint_ref_for_scope_ordinal(scope_id: &str, ordinal_within_scope: i64) -> String {
+    use base64::Engine;
+    let hex = crate::rpc_assets::sha256_hex(scope_id.as_bytes());
+    // TS: Hex.encode(digest).slice(0, 32) then Base64Url.encode of that text.
+    let scope_key =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hex.as_bytes()[..32]);
+    format!("{CHECKPOINT_REFS_PREFIX}/{scope_key}/ordinal/{ordinal_within_scope}")
+}
+
+/// One `parseTurnDiffFilesFromNumstat` record (`additions`/`deletions` are
+/// unused by the diff path; only the paths matter for import filtering).
+#[derive(Debug)]
+struct TurnDiffFile {
+    path: String,
+    previous_path: Option<String>,
+}
+
+/// `parseTurnDiffFilesFromNumstat` — NUL-separated `git diff --numstat -z`.
+fn parse_turn_diff_files_from_numstat(numstat: &str) -> Vec<TurnDiffFile> {
+    let records: Vec<&str> = numstat.split('\0').collect();
+    let mut files = Vec::new();
+    let mut index = 0usize;
+    while index < records.len() {
+        let record = records[index];
+        index += 1;
+        // ^(\d+|-)\t(\d+|-)\t — counts then the path remainder.
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let is_count = |s: &str| s == "-" || s.bytes().all(|b| b.is_ascii_digit());
+        if !is_count(added) || !is_count(deleted) {
+            continue;
+        }
+        let mut path = path.to_string();
+        let mut previous_path = None;
+        if path.is_empty() {
+            // Rename record: the two following NUL fields hold old and new path.
+            previous_path = records.get(index).map(|s| (*s).to_string());
+            path = records.get(index + 1).map(|s| (*s).to_string()).unwrap_or_default();
+            index += 2;
+        }
+        if path.is_empty() {
+            continue;
+        }
+        files.push(TurnDiffFile {
+            path,
+            previous_path,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// `isGitImport` — a path is authored when it (or its rename source) appears
+/// in the authored-paths set.
+fn is_git_import(file: &TurnDiffFile, authored_paths: &HashSet<String>) -> bool {
+    !authored_paths.contains(&file.path)
+        && file
+            .previous_path
+            .as_ref()
+            .is_none_or(|p| !authored_paths.contains(p))
+}
+
+/// `batchFilePaths` — group retained paths under the pathspec budget.
+fn batch_file_paths(files: &[TurnDiffFile]) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut batch: Vec<String> = Vec::new();
+    let mut length = 0usize;
+    for file in files {
+        let paths: Vec<String> = match &file.previous_path {
+            None => vec![file.path.clone()],
+            Some(prev) => vec![prev.clone(), file.path.clone()],
+        };
+        let size: usize = paths.iter().map(|p| p.len() + 16).sum();
+        if !batch.is_empty() && length + size > MAX_PATHSPEC_CHARS {
+            batches.push(std::mem::take(&mut batch));
+            length = 0;
+        }
+        batch.extend(paths);
+        length += size;
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// `GitVcsDriver.checkpoints.diffCheckpoints` — `git diff` between two
+/// checkpoint commit refs (`fallbackFromToHead: false` throughout the turn
+/// diff path).
+async fn checkpoint_diff(
+    cwd: &Path,
+    from_ref: &str,
+    to_ref: &str,
+    ignore_whitespace: bool,
+    numstat: bool,
+    file_paths: Option<&[String]>,
+) -> Result<String, Value> {
+    let op = "GitVcsDriver.checkpoints.diffCheckpoints";
+    if file_paths.is_some_and(|p| p.is_empty()) {
+        return Ok(String::new());
+    }
+    let mut args = sargs(&[
+        "-c",
+        "diff.relative=false",
+        "-c",
+        "diff.suppressBlankEmpty=false",
+        "diff",
+    ]);
+    if numstat {
+        args.extend(sargs(&["--numstat", "-z"]));
+    } else {
+        args.push("--patch".into());
+    }
+    args.extend(sargs(&[
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]));
+    if ignore_whitespace {
+        args.push("--ignore-all-space".into());
+    }
+    args.push(format!("{from_ref}^{{commit}}"));
+    args.push(format!("{to_ref}^{{commit}}"));
+    if let Some(paths) = file_paths {
+        args.push("--".into());
+        for p in paths {
+            args.push(format!(":(top,literal){p}"));
+        }
+    }
+    let out = git(op, cwd, &args, GIT_TIMEOUT).await?;
+    if out.exit_code != Some(0) {
+        return Err(git_error(
+            op,
+            cwd,
+            &args,
+            if out.stderr.trim().is_empty() {
+                "Checkpoint ref is unavailable for diff operation."
+            } else {
+                out.stderr.trim()
+            },
+            Some(&out),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// `GitVcsDriver.checkpoints.listAuthoredPaths` — `None` when HEAD was
+/// unchanged between the two captures (or anything fails), meaning every
+/// changed path belongs to the turn.
+async fn list_authored_paths(
+    cwd: &Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Option<HashSet<String>> {
+    let op = "GitVcsDriver.checkpoints.listAuthoredPaths";
+    let heads_args = sargs(&[
+        "log",
+        "--no-walk=unsorted",
+        "--format=%P %ct",
+        &format!("{from_ref}^{{commit}}"),
+        &format!("{to_ref}^{{commit}}"),
+    ]);
+    let heads = git(op, cwd, &heads_args, GIT_TIMEOUT).await.ok()?;
+    if heads.exit_code != Some(0) {
+        return None;
+    }
+    let mut lines = heads.stdout.trim_end().split('\n');
+    let from_line = lines.next().unwrap_or("");
+    let to_line = lines.next().unwrap_or("");
+    let mut from_parts = from_line.split(' ');
+    let start_head = from_parts.next().unwrap_or("");
+    let captured_at = from_parts.next().unwrap_or("");
+    let end_head = to_line.split(' ').next().unwrap_or("");
+    if start_head.is_empty() || end_head.is_empty() || start_head == end_head {
+        return None;
+    }
+
+    let list_paths = |args: Vec<String>| async move {
+        let mut full = sargs(&[
+            "-c",
+            "diff.relative=false",
+            "-c",
+            "log.showSignature=false",
+        ]);
+        full.extend(args);
+        full.extend(sargs(&["--name-only", "-z", "--no-renames", "--no-ext-diff"]));
+        match git(op, cwd, &full, GIT_TIMEOUT).await {
+            Ok(r) if r.exit_code == Some(0) => r
+                .stdout
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>(),
+            _ => Vec::new(),
+        }
+    };
+    let from_commit = format!("{from_ref}^{{commit}}");
+    let to_commit = format!("{to_ref}^{{commit}}");
+    // Remerge diffs retain merge conflict fixes while excluding clean
+    // upstream changes.
+    let (a, b, c, d) = tokio::join!(
+        list_paths(sargs(&["diff", start_head, &from_commit])),
+        list_paths(sargs(&["diff", end_head, &to_commit])),
+        list_paths(sargs(&[
+            "log",
+            "--format=",
+            "--diff-merges=remerge",
+            &format!("{end_head}..{start_head}"),
+        ])),
+        list_paths(sargs(&[
+            "log",
+            "--format=",
+            "--diff-merges=remerge",
+            &format!("--since=@{captured_at}"),
+            &format!("{start_head}..{end_head}"),
+        ])),
+    );
+    Some(a.into_iter().chain(b).chain(c).chain(d).collect())
+}
+
+/// Tagged checkpoint-diff errors, mirroring `apps/server/src/checkpointing/Errors.ts`.
+fn checkpoint_error(operation: &str, tag: &str, fields: Value) -> Value {
+    let mut e = json!({ "_tag": tag, "operation": operation });
+    if let Value::Object(extra) = fields {
+        for (k, v) in extra {
+            e[k] = v;
+        }
+    }
+    e
+}
+
+fn turn_diff_error(operation: &str, cause: Value) -> Value {
+    let tag = if operation.contains("getFullThreadDiff") {
+        "OrchestrationGetFullThreadDiffError"
+    } else {
+        "OrchestrationGetTurnDiffError"
+    };
+    let message = if operation.contains("getFullThreadDiff") {
+        "Failed to load full thread diff"
+    } else {
+        "Failed to load turn diff"
+    };
+    json!({ "_tag": tag, "message": message, "cause": cause })
+}
+
+/// `CheckpointDiffQuery.getTurnDiff` core: resolve from/to checkpoint refs
+/// from the checkpoint context, diff them in the scope's working directory,
+/// and strip changes a moved HEAD imported between captures.
+async fn turn_diff(
+    operation: &str,
+    thread_id: &str,
+    from_turn: i64,
+    to_turn: i64,
+    ignore_whitespace: bool,
+    ctx: &Value,
+) -> Result<String, Value> {
+    let err = |tag: &str, fields: Value| turn_diff_error(operation, checkpoint_error(operation, tag, fields));
+    let runs = ctx.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let scopes = ctx
+        .get("checkpointScopes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let checkpoints = ctx
+        .get("checkpoints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let completed_run_ids: HashSet<&str> = runs
+        .iter()
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("completed"))
+        .filter_map(|r| r.get("id").and_then(Value::as_str))
+        .collect();
+    let ready: Vec<&Value> = checkpoints
+        .iter()
+        .filter(|c| {
+            c.get("status").and_then(Value::as_str) == Some("ready")
+                && c.get("appRunOrdinal").and_then(Value::as_i64).is_some()
+                && c.get("runId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| completed_run_ids.contains(id))
+        })
+        .collect();
+    let max_turn = ready
+        .iter()
+        .filter_map(|c| c.get("appRunOrdinal").and_then(Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    if to_turn > max_turn {
+        return Err(err(
+            "CheckpointTurnRangeUnavailableError",
+            json!({
+                "threadId": thread_id,
+                "requestedTurnCount": to_turn,
+                "availableTurnCount": max_turn,
+            }),
+        ));
+    }
+    let to_checkpoint = ready
+        .iter()
+        .find(|c| c.get("appRunOrdinal").and_then(Value::as_i64) == Some(to_turn))
+        .ok_or_else(|| {
+            err(
+                "CheckpointRefUnavailableError",
+                json!({ "threadId": thread_id, "turnCount": to_turn, "checkpoint": "to" }),
+            )
+        })?;
+    let to_scope_id = to_checkpoint
+        .get("scopeId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let to_scope = scopes
+        .iter()
+        .find(|s| s.get("id").and_then(Value::as_str) == Some(to_scope_id))
+        .ok_or_else(|| {
+            err(
+                "CheckpointWorkspacePathMissingError",
+                json!({ "threadId": thread_id }),
+            )
+        })?;
+    let cwd_str = to_scope.get("cwd").and_then(Value::as_str).ok_or_else(|| {
+        err(
+            "CheckpointWorkspacePathMissingError",
+            json!({ "threadId": thread_id }),
+        )
+    })?;
+    let cwd = Path::new(cwd_str);
+    let to_ref = to_checkpoint
+        .get("ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            err(
+                "CheckpointRefUnavailableError",
+                json!({ "threadId": thread_id, "turnCount": to_turn, "checkpoint": "to" }),
+            )
+        })?;
+
+    // Capture compares against the preceding scope ordinal, even when that
+    // checkpoint belongs to a stopped run or has no run.
+    let from_ref: String = if from_turn == 0 {
+        match scopes
+            .iter()
+            .find(|s| s.get("kind").and_then(Value::as_str) == Some("root_run"))
+            .and_then(|s| s.get("id").and_then(Value::as_str))
+        {
+            Some(scope_id) => checkpoint_ref_for_scope_ordinal(scope_id, 0),
+            None => {
+                return Err(err(
+                    "CheckpointRefUnavailableError",
+                    json!({ "threadId": thread_id, "turnCount": from_turn, "checkpoint": "from" }),
+                ))
+            }
+        }
+    } else {
+        let parent = if from_turn == to_turn - 1 {
+            checkpoints.iter().find(|c| {
+                c.get("status").and_then(Value::as_str) == Some("ready")
+                    && c.get("scopeId").and_then(Value::as_str) == Some(to_scope_id)
+                    && c.get("ordinalWithinScope").and_then(Value::as_i64)
+                        == to_checkpoint
+                            .get("ordinalWithinScope")
+                            .and_then(Value::as_i64)
+                            .map(|o| o - 1)
+            })
+        } else {
+            None
+        };
+        let source = parent
+            .or_else(|| {
+                ready
+                    .iter()
+                    .find(|c| {
+                        c.get("appRunOrdinal").and_then(Value::as_i64) == Some(from_turn)
+                    })
+                    .copied()
+            })
+            .and_then(|c| c.get("ref").and_then(Value::as_str));
+        match source {
+            Some(r) => r.to_string(),
+            None => {
+                return Err(err(
+                    "CheckpointRefUnavailableError",
+                    json!({ "threadId": thread_id, "turnCount": from_turn, "checkpoint": "from" }),
+                ))
+            }
+        }
+    };
+
+    // A pull or rebase between captures imports changes the turn did not
+    // author; exclude those paths from the patch (TS `isGitImport` filter).
+    let authored_paths = list_authored_paths(cwd, &from_ref, to_ref).await;
+    let files = match &authored_paths {
+        None => Vec::new(),
+        Some(_) => {
+            let numstat = checkpoint_diff(cwd, &from_ref, to_ref, ignore_whitespace, true, None)
+                .await
+                .unwrap_or_default();
+            parse_turn_diff_files_from_numstat(&numstat)
+        }
+    };
+    let retained: Vec<&TurnDiffFile> = match &authored_paths {
+        None => Vec::new(),
+        Some(set) => files.iter().filter(|f| !is_git_import(f, set)).collect(),
+    };
+    let retained_files: Vec<TurnDiffFile> = retained
+        .into_iter()
+        .map(|f| TurnDiffFile {
+            path: f.path.clone(),
+            previous_path: f.previous_path.clone(),
+        })
+        .collect();
+    // Select retained paths before generating a patch, so imported bulk
+    // cannot exhaust its output limit.
+    let path_batches: Vec<Option<Vec<String>>> = if retained_files.len() == files.len() {
+        vec![None]
+    } else {
+        batch_file_paths(&retained_files).into_iter().map(Some).collect()
+    };
+
+    let mut diff = String::new();
+    let mut remaining = CHECKPOINT_DIFF_MAX_OUTPUT_BYTES;
+    for file_paths in path_batches {
+        let patch = checkpoint_diff(
+            cwd,
+            &from_ref,
+            to_ref,
+            ignore_whitespace,
+            false,
+            file_paths.as_deref(),
+        )
+        .await
+        .map_err(|cause| turn_diff_error(operation, cause))?;
+        let patch_bytes = patch.len();
+        diff.push_str(&patch);
+        if patch_bytes > remaining {
+            // One extra byte distinguishes an exact fit from a truncated
+            // patch; reserve marker space only on overflow.
+            let cut = CHECKPOINT_DIFF_MAX_OUTPUT_BYTES - DIFF_TRUNCATED_MARKER.len();
+            let mut end = cut.min(diff.len());
+            while !diff.is_char_boundary(end) {
+                end -= 1;
+            }
+            diff.truncate(end);
+            diff.push_str(DIFF_TRUNCATED_MARKER);
+            break;
+        }
+        remaining -= patch_bytes;
+    }
+    Ok(diff)
+}
+
+/// `orchestration.getTurnDiff` — `{threadId, fromTurnCount, toTurnCount,
+/// ignoreWhitespace?}` → `{threadId, fromTurnCount, toTurnCount, diff}`.
+pub async fn get_turn_diff(state: Arc<AppState>, payload: &Value) -> RpcResult {
+    const OP: &str = "CheckpointDiffQuery.getTurnDiff";
+    let thread_id = payload.get("threadId").and_then(Value::as_str).unwrap_or("");
+    let from_turn = payload
+        .get("fromTurnCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let to_turn = payload
+        .get("toTurnCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let ignore_whitespace = payload
+        .get("ignoreWhitespace")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let result = |diff: String| {
+        RpcResult::ok(json!({
+            "threadId": thread_id,
+            "fromTurnCount": from_turn,
+            "toTurnCount": to_turn,
+            "diff": diff,
+        }))
+    };
+
+    if thread_id.is_empty() || from_turn < 0 || to_turn < 0 || from_turn > to_turn {
+        return RpcResult::err(turn_diff_error(
+            OP,
+            checkpoint_error(
+                OP,
+                "CheckpointDiffResultInvalidError",
+                json!({ "threadId": thread_id }),
+            ),
+        ));
+    }
+    if from_turn == to_turn {
+        return result(String::new());
+    }
+    let Some(ctx) = state.store.checkpoint_context(thread_id).await else {
+        return RpcResult::err(turn_diff_error(
+            OP,
+            checkpoint_error(
+                OP,
+                "CheckpointThreadNotFoundError",
+                json!({ "threadId": thread_id }),
+            ),
+        ));
+    };
+    match turn_diff(OP, thread_id, from_turn, to_turn, ignore_whitespace, &ctx).await {
+        Ok(diff) => result(diff),
+        Err(e) => RpcResult::err(e),
+    }
+}
+
+/// `orchestration.getFullThreadDiff` — `{threadId, toTurnCount,
+/// ignoreWhitespace?}`; `getTurnDiff` with `fromTurnCount = 0`.
+pub async fn get_full_thread_diff(state: Arc<AppState>, payload: &Value) -> RpcResult {
+    const OP: &str = "CheckpointDiffQuery.getFullThreadDiff";
+    let thread_id = payload.get("threadId").and_then(Value::as_str).unwrap_or("");
+    let to_turn = payload
+        .get("toTurnCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let ignore_whitespace = payload
+        .get("ignoreWhitespace")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let result = |diff: String| {
+        RpcResult::ok(json!({
+            "threadId": thread_id,
+            "fromTurnCount": 0,
+            "toTurnCount": to_turn,
+            "diff": diff,
+        }))
+    };
+
+    if thread_id.is_empty() || to_turn < 0 {
+        return RpcResult::err(turn_diff_error(
+            OP,
+            checkpoint_error(
+                OP,
+                "CheckpointDiffResultInvalidError",
+                json!({ "threadId": thread_id }),
+            ),
+        ));
+    }
+    if to_turn == 0 {
+        return result(String::new());
+    }
+    let Some(ctx) = state.store.checkpoint_context(thread_id).await else {
+        return RpcResult::err(turn_diff_error(
+            OP,
+            checkpoint_error(
+                OP,
+                "CheckpointThreadNotFoundError",
+                json!({ "threadId": thread_id }),
+            ),
+        ));
+    };
+    match turn_diff(OP, thread_id, 0, to_turn, ignore_whitespace, &ctx).await {
+        Ok(diff) => result(diff),
+        Err(e) => RpcResult::err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
 
@@ -1980,5 +2563,351 @@ async fn vcs_branch_stream(
                 return;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Run git in `cwd`, returning trimmed stdout; panics on nonzero exit.
+    fn tgit(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("c67-turn-diff-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `commit-tree` a tree built from `files` ((path, content) pairs) with an
+    /// optional parent commit and fixed committer date.
+    fn commit_tree(
+        cwd: &Path,
+        files: &[(&str, &str)],
+        parent: Option<&str>,
+        when: &str,
+    ) -> String {
+        // Build a flat tree; paths stay single-level in these fixtures.
+        let mut entries = String::new();
+        for (path, content) in files {
+            let blob = {
+                let mut child = Command::new("git")
+                    .args(["hash-object", "-w", "--stdin"])
+                    .current_dir(cwd)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(content.as_bytes())
+                    .unwrap();
+                let out = child.wait_with_output().unwrap();
+                assert!(out.status.success());
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            entries.push_str(&format!("100644 blob {blob}\t{path}\n"));
+        }
+        let tree = {
+            let mut child = Command::new("git")
+                .args(["mktree"])
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(entries.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut args: Vec<String> = vec!["commit-tree".into(), tree];
+        if let Some(p) = parent {
+            args.extend(["-p".into(), p.to_string()]);
+        }
+        args.extend(["-m".into(), "checkpoint".into()]);
+        let envs = [
+            ("GIT_AUTHOR_DATE", when),
+            ("GIT_COMMITTER_DATE", when),
+            ("GIT_AUTHOR_NAME", "test"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "test"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ];
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        tgit(cwd, &arg_refs, &envs)
+    }
+
+    fn checkpoint_ctx(cwd: &Path, scope_id: &str, checkpoints: Vec<Value>) -> Value {
+        json!({
+            "runs": [{ "id": "r1", "ordinal": 1, "status": "completed" }],
+            "checkpointScopes": [{
+                "id": scope_id,
+                "runId": "r1",
+                "kind": "root_run",
+                "cwd": cwd.to_string_lossy(),
+            }],
+            "checkpoints": checkpoints,
+        })
+    }
+
+    fn checkpoint_row(
+        scope_id: &str,
+        run_id: Option<&str>,
+        ordinal: i64,
+        app_run_ordinal: Option<i64>,
+        ref_name: &str,
+    ) -> Value {
+        json!({
+            "scopeId": scope_id,
+            "runId": run_id,
+            "ordinalWithinScope": ordinal,
+            "appRunOrdinal": app_run_ordinal,
+            "status": "ready",
+            "ref": ref_name,
+        })
+    }
+
+    #[test]
+    fn checkpoint_ref_matches_ts_derivation() {
+        // Seeded data: scope id → stored checkpoint ref (see
+        // orchestration_v2_projection_checkpoint_scopes/.t3 test data).
+        let scope_id = "checkpoint-scope:thread:9ead6dd9-11e4-45df-be46-b1c07674ff5a:name:root";
+        assert_eq!(
+            checkpoint_ref_for_scope_ordinal(scope_id, 0),
+            "refs/t3/orchestration-v2/checkpoints/\
+             N2ZlMjBmODM0YzhkZTFkNWVkNTViMjU0ZTg4NTM1Zjk/ordinal/0"
+        );
+    }
+
+    #[test]
+    fn numstat_parse_handles_plain_and_rename_records() {
+        let files = parse_turn_diff_files_from_numstat("3\t1\ta.txt\0-\t-\tbin.png\0");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].previous_path.is_none());
+        assert_eq!(files[1].path, "bin.png");
+
+        // Rename: counts record carries an empty path, followed by old/new.
+        let renamed = parse_turn_diff_files_from_numstat("2\t2\t\0old.txt\0new.txt\0");
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].previous_path.as_deref(), Some("old.txt"));
+        assert_eq!(renamed[0].path, "new.txt");
+    }
+
+    /// HEAD unchanged between captures: every path in the checkpoint range is
+    /// retained (authored paths is `None`).
+    #[tokio::test]
+    async fn turn_diff_returns_patch_between_checkpoint_refs() {
+        let dir = test_dir("basic");
+        tgit(&dir, &["init", "-q"], &[]);
+        let scope_id = "checkpoint-scope:thread:test:name:root";
+        let base = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("gone.txt", "stale\n")],
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let from_ref = checkpoint_ref_for_scope_ordinal(scope_id, 0);
+        let to_ref = checkpoint_ref_for_scope_ordinal(scope_id, 1);
+        // Checkpoint commits parent on the same HEAD, like captureCheckpoint.
+        let c0 = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("gone.txt", "stale\n")],
+            Some(&base),
+            "2026-01-02T00:00:00Z",
+        );
+        let c1 = commit_tree(
+            &dir,
+            &[("a.txt", "one\ntwo\n"), ("new.txt", "added\n")],
+            Some(&base),
+            "2026-01-03T00:00:00Z",
+        );
+        tgit(&dir, &["update-ref", &from_ref, &c0], &[]);
+        tgit(&dir, &["update-ref", &to_ref, &c1], &[]);
+
+        let ctx = checkpoint_ctx(
+            &dir,
+            scope_id,
+            vec![
+                checkpoint_row(scope_id, None, 0, None, &from_ref),
+                checkpoint_row(scope_id, Some("r1"), 1, Some(1), &to_ref),
+            ],
+        );
+        let diff = turn_diff(
+            "CheckpointDiffQuery.getTurnDiff",
+            "thread:test",
+            0,
+            1,
+            true,
+            &ctx,
+        )
+        .await
+        .expect("turn diff");
+        assert!(diff.contains("diff --git a/a.txt b/a.txt"), "{diff}");
+        assert!(diff.contains("+two"), "{diff}");
+        assert!(diff.contains("new file mode"), "{diff}");
+        assert!(diff.contains("deleted file mode"), "{diff}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HEAD moved between captures (a pull): paths the move imported are
+    /// excluded from the patch.
+    #[tokio::test]
+    async fn turn_diff_filters_head_move_imports() {
+        let dir = test_dir("import");
+        tgit(&dir, &["init", "-q"], &[]);
+        let scope_id = "checkpoint-scope:thread:test:name:root";
+        let from_ref = checkpoint_ref_for_scope_ordinal(scope_id, 0);
+        let to_ref = checkpoint_ref_for_scope_ordinal(scope_id, 1);
+
+        // HEAD at capture 0: C0 on top of an identical base.
+        let base = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("up.txt", "v0\n")],
+            None,
+            "2025-01-01T00:00:00Z",
+        );
+        let c0_head = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("up.txt", "v0\n")],
+            Some(&base),
+            "2025-06-01T00:00:00Z",
+        );
+        // The pulled-in HEAD: old committer date so `--since` drops it.
+        let c1_head = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("up.txt", "v1\n")],
+            Some(&base),
+            "2025-07-01T00:00:00Z",
+        );
+        // Checkpoint commits parent on their capture-time HEAD.
+        let k0 = commit_tree(
+            &dir,
+            &[("a.txt", "one\n"), ("up.txt", "v0\n")],
+            Some(&c0_head),
+            "2026-01-02T00:00:00Z",
+        );
+        let k1 = commit_tree(
+            &dir,
+            &[("a.txt", "two\n"), ("up.txt", "v1\n")],
+            Some(&c1_head),
+            "2026-01-03T00:00:00Z",
+        );
+        tgit(&dir, &["update-ref", &from_ref, &k0], &[]);
+        tgit(&dir, &["update-ref", &to_ref, &k1], &[]);
+
+        let ctx = checkpoint_ctx(
+            &dir,
+            scope_id,
+            vec![
+                checkpoint_row(scope_id, None, 0, None, &from_ref),
+                checkpoint_row(scope_id, Some("r1"), 1, Some(1), &to_ref),
+            ],
+        );
+        let diff = turn_diff(
+            "CheckpointDiffQuery.getTurnDiff",
+            "thread:test",
+            0,
+            1,
+            true,
+            &ctx,
+        )
+        .await
+        .expect("turn diff");
+        assert!(diff.contains("a.txt"), "{diff}");
+        assert!(
+            !diff.contains("up.txt"),
+            "imported upstream change must be filtered: {diff}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `toTurnCount` beyond the last ready checkpoint reports the TS
+    /// `CheckpointTurnRangeUnavailableError` inside the RPC error tag.
+    #[tokio::test]
+    async fn turn_diff_rejects_unavailable_range() {
+        let dir = test_dir("range");
+        let scope_id = "checkpoint-scope:thread:test:name:root";
+        let ctx = checkpoint_ctx(&dir, scope_id, vec![]);
+        let err = turn_diff(
+            "CheckpointDiffQuery.getTurnDiff",
+            "thread:test",
+            0,
+            3,
+            true,
+            &ctx,
+        )
+        .await
+        .expect_err("range error");
+        assert_eq!(err["_tag"], "OrchestrationGetTurnDiffError");
+        assert_eq!(
+            err["cause"]["_tag"], "CheckpointTurnRangeUnavailableError",
+            "{err}"
+        );
+        assert_eq!(err["cause"]["availableTurnCount"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scope whose directory is not a git repo surfaces the ref-unavailable
+    /// failure instead of a panic (seeded data points at absent repos).
+    #[tokio::test]
+    async fn turn_diff_missing_repo_errors() {
+        let dir = test_dir("norepo");
+        let scope_id = "checkpoint-scope:thread:test:name:root";
+        let from_ref = checkpoint_ref_for_scope_ordinal(scope_id, 0);
+        let ctx = checkpoint_ctx(
+            &dir,
+            scope_id,
+            vec![
+                checkpoint_row(scope_id, None, 0, None, &from_ref),
+                checkpoint_row(scope_id, Some("r1"), 1, Some(1), "refs/t3/x/ordinal/1"),
+            ],
+        );
+        let err = turn_diff(
+            "CheckpointDiffQuery.getTurnDiff",
+            "thread:test",
+            0,
+            1,
+            true,
+            &ctx,
+        )
+        .await
+        .expect_err("git failure");
+        assert_eq!(err["_tag"], "OrchestrationGetTurnDiffError");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -93,7 +93,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&sha256::hash(data))
 }
 
