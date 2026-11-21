@@ -280,10 +280,6 @@ pub enum PickerKind {
     Terminals,
     /// Guest-share link + hosted prompt link.
     Share,
-    /// The `…` overflow menu — web `CompactComposerControlsMenu`: footer
-    /// controls with no resting slot (interaction mode, permissions, effort,
-    /// terminal context, share).
-    Overflow,
 }
 
 /// A staged terminal context — serialized as a `TerminalContextRecord` inside
@@ -722,6 +718,26 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
         return;
     };
 
+    // Shift+Enter inserts a hard newline in the web composer; GPUI delivers
+    // no `key_char` for a modified Return, so it never reaches the input
+    // handler. Insert it here, only while the composer field itself holds
+    // focus — the attach/branch fields stay single-line.
+    if event.keystroke.key == "enter" && event.keystroke.modifiers.shift {
+        let composer_focused = window
+            .focused(cx)
+            .is_some_and(|handle| view.read(cx).composer.read(cx).focus_handle(cx) == handle);
+        if composer_focused {
+            view.update(cx, |this, cx| {
+                this.composer.update(cx, |field, cx| {
+                    field.replace_text_in_range(None, "\n", window, cx);
+                });
+                this.sync_composer_draft(window, cx);
+            });
+            cx.stop_propagation();
+        }
+        return;
+    }
+
     // `composer.dictation` — the shared default is mod+shift+d with
     // `when: "!terminalFocus"` (packages/shared/src/keybindings.ts), so a
     // focused terminal keeps the chord for itself (splitVertical there).
@@ -755,6 +771,7 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
         mention_open,
         ctx_staged,
         feedback_draft,
+        draft_multiline,
     ) = {
         let this = view.read(cx);
         let state = &this.composer_state;
@@ -769,6 +786,7 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
             state.mention_open,
             this.staged_ctx_count() > 0,
             state.draft == "/feedback" || state.draft.starts_with("/feedback "),
+            this.composer.read(cx).display_rows() > 1,
         )
     };
     if !(slash_open
@@ -780,7 +798,8 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
         || draft_empty
         || mention_open
         || ctx_staged
-        || feedback_draft)
+        || feedback_draft
+        || draft_multiline)
     {
         return;
     }
@@ -932,6 +951,17 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
             });
             cx.stop_propagation();
         }
+        // Vertical caret motion once the draft paints more than one row —
+        // the field's own keymap only binds horizontal movement.
+        key @ ("up" | "down") if draft_multiline => {
+            let select = event.keystroke.modifiers.shift;
+            view.update(cx, |this, cx| {
+                this.composer.update(cx, |field, cx| {
+                    field.move_vertical(key == "up", select, window, cx)
+                });
+            });
+            cx.stop_propagation();
+        }
         _ => {}
     }
 }
@@ -975,18 +1005,32 @@ fn runtime_mode_label(mode: &str) -> &'static str {
         .unwrap_or("Full access")
 }
 
-/// The composer card's drop shadow in dark mode
-/// (`--shadow-composer-dark: 0 14px 32px -18px black·75%`).
-fn composer_shadow() -> BoxShadow {
-    BoxShadow::new(px(0.), px(14.), rgba(0x000000bf).into())
-        .blur_radius(px(32.))
-        .spread_radius(px(-18.))
+/// The attached banner's (mention/slash drawer) drop shadow
+/// (`--shadow-composer-dark: 0 14px 32px -18px black·75%` in dark;
+/// `--shadow-composer: 0 1px 2px black·5%` in light).
+fn attached_shadow() -> BoxShadow {
+    if theme::effective_dark() {
+        BoxShadow::new(px(0.), px(14.), rgba(0x000000bf).into())
+            .blur_radius(px(32.))
+            .spread_radius(px(-18.))
+    } else {
+        BoxShadow::new(px(0.), px(1.), rgba(0x0000000d).into()).blur_radius(px(2.))
+    }
 }
 
-/// The card's inset top-edge highlight
-/// (`inset 0 1px 0 var(--composer-highlight)`).
-fn composer_highlight_shadow() -> BoxShadow {
-    BoxShadow::new(px(0.), px(1.), theme::composer_highlight().into()).inset()
+/// The composer card's drop shadow — web `shadow-composer` applies in light
+/// only (`0 1px 2px black·5%`); the dark host is `dark:shadow-none`.
+fn composer_shadow() -> Option<BoxShadow> {
+    (!theme::effective_dark()).then(|| {
+        BoxShadow::new(px(0.), px(1.), rgba(0x0000000d).into()).blur_radius(px(2.))
+    })
+}
+
+/// The card's inset top-edge highlight — also dark-only in the web
+/// (`dark:after:inset-shadow-2xs`).
+fn composer_highlight_shadow() -> Option<BoxShadow> {
+    theme::effective_dark()
+        .then(|| BoxShadow::new(px(0.), px(1.), theme::composer_highlight().into()).inset())
 }
 
 /// The send/stop buttons' inset top-edge highlight
@@ -995,11 +1039,47 @@ fn control_highlight_shadow() -> BoxShadow {
     BoxShadow::new(px(0.), px(1.), theme::control_highlight().into()).inset()
 }
 
-/// The dropdown popup's shadow (`0 18px 44px -18px black·80%`).
+/// The send button's stage-backdrop art — the dev-environment blueprint
+/// gradient (`--stage-art-*`) running top-left → bottom-right. Stops are the
+/// sampled art colors for the 32px circle; `hover` applies the web's
+/// `hover:brightness-110`.
+fn send_art(hover: bool) -> gpui::Background {
+    let (from, to) = if theme::effective_dark() {
+        if hover {
+            (rgb(0x213b82), rgb(0x2e6bcc))
+        } else {
+            (rgb(0x1e3576), rgb(0x2a61b9))
+        }
+    } else if hover {
+        (rgb(0x2461f8), rgb(0x3985ff))
+    } else {
+        (rgb(0x2158e1), rgb(0x3479f2))
+    };
+    gpui::linear_gradient(
+        112.,
+        gpui::linear_color_stop(from, 0.),
+        gpui::linear_color_stop(to, 1.),
+    )
+}
+
+/// The enabled send button's drop shadow (`shadow-xs shadow-black/24` →
+/// `0 1px 2px black·24%`); the stop button shares it in destructive red.
+fn send_shadow() -> BoxShadow {
+    BoxShadow::new(px(0.), px(1.), rgba(0x0000003d).into()).blur_radius(px(2.))
+}
+
+/// The dropdown popup's shadow (`0 18px 44px -18px black·80%` dark,
+/// `0 16px 40px -18px black·55%` light).
 fn popup_shadow() -> BoxShadow {
-    BoxShadow::new(px(0.), px(18.), rgba(0x000000cc).into())
-        .blur_radius(px(44.))
-        .spread_radius(px(-18.))
+    if theme::effective_dark() {
+        BoxShadow::new(px(0.), px(18.), rgba(0x000000cc).into())
+            .blur_radius(px(44.))
+            .spread_radius(px(-18.))
+    } else {
+        BoxShadow::new(px(0.), px(16.), rgba(0x0000008c).into())
+            .blur_radius(px(40.))
+            .spread_radius(px(-18.))
+    }
 }
 
 /// Picker popups above the composer — web `dropdown-glass`: popover fill,
@@ -1019,8 +1099,6 @@ fn menu_panel() -> gpui::Div {
         .border_color(theme::popup_border())
         .shadow(vec![popup_shadow()])
         .p_1()
-        .max_h(px(280.))
-        .overflow_y_hidden()
         .occlude()
 }
 
@@ -1040,7 +1118,7 @@ fn drawer_panel() -> gpui::Div {
         .bg(theme::composer_surface())
         .border_1()
         .border_color(theme::composer_outline())
-        .shadow(vec![composer_shadow()])
+        .shadow(vec![attached_shadow()])
         .p_2()
         .max_h(px(288.))
         .overflow_y_hidden()
@@ -3097,12 +3175,22 @@ impl AppView {
     }
 
     fn render_picker(&self, kind: PickerKind) -> impl IntoElement {
-        let mut panel = menu_panel();
+        // The model picker caps only its rows so the `ComposerPickerFooter`
+        // controls below the list stay pinned and visible; every other
+        // picker caps the whole panel as before.
+        let mut panel = menu_panel().when(kind != PickerKind::Model, |s| {
+            s.max_h(px(280.)).overflow_y_hidden()
+        });
         match kind {
             PickerKind::Model => {
+                let mut rows = div()
+                    .flex()
+                    .flex_col()
+                    .max_h(px(280.))
+                    .overflow_y_hidden();
                 for (index, (instance, model, label)) in MODEL_CATALOG.iter().enumerate() {
                     let active = self.provider == *instance && self.model == *model;
-                    panel = panel.child(
+                    rows = rows.child(
                         menu_row(
                             ("model", index),
                             *label,
@@ -3126,6 +3214,12 @@ impl AppView {
                         ),
                     );
                 }
+                // `ComposerPickerFooter` — the compact controls (mode,
+                // permissions, effort, …) live at the bottom of the model
+                // picker in the web, not behind a footer ellipsis.
+                panel = panel.child(rows);
+                panel = panel.child(div().h(px(1.)).mx_1().bg(theme::border()));
+                panel = self.overflow_rows(panel);
             }
             PickerKind::InteractionMode => {
                 for (index, (value, label)) in INTERACTION_MODES.iter().enumerate() {
@@ -3595,114 +3689,115 @@ impl AppView {
                     ),
                 );
             }
-            PickerKind::Overflow => {
-                // Web `CompactComposerControlsMenu`: the controls that don't
-                // fit the resting footer live behind the ellipsis — here the
-                // interaction mode, permissions, effort cycle, terminal
-                // context, and share rows.
-                let s = &self.composer_state;
-                panel = panel.child(
-                    menu_row(
-                        "ov-mode",
-                        "Interaction mode",
-                        Some(interaction_mode_label(&s.interaction_mode).into()),
-                        false,
-                    )
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+        }
+        panel
+    }
+
+    /// `CompactComposerControlsMenu` rows — the controls that don't fit the
+    /// resting footer: interaction mode, permissions, effort cycle, terminal
+    /// context, and share.
+    fn overflow_rows(&self, mut panel: gpui::Div) -> gpui::Div {
+        let s = &self.composer_state;
+        panel = panel.child(
+            menu_row(
+                "ov-mode",
+                "Interaction mode",
+                Some(interaction_mode_label(&s.interaction_mode).into()),
+                false,
+            )
+            .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    this.toggle_composer_picker(PickerKind::InteractionMode, cx)
+                });
+            }),
+        );
+        panel = panel.child(
+            menu_row(
+                "ov-permissions",
+                "Permissions",
+                Some(runtime_mode_label(&s.runtime_mode).into()),
+                false,
+            )
+            .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
+                });
+            }),
+        );
+        // Same Default → low → medium → high cycle as the model
+        // picker's effort column; the row's detail shows the pick.
+        panel = panel.child(
+            menu_row(
+                "ov-effort",
+                "Effort",
+                Some(effort_label(&s.effort).into()),
+                false,
+            )
+            .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    let current = EFFORT_LEVELS
+                        .iter()
+                        .position(|level| *level == this.composer_state.effort)
+                        .unwrap_or(0);
+                    this.composer_state.effort =
+                        EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
+                    this.composer_state.picker = None;
+                    cx.notify();
+                });
+            }),
+        );
+        if self.state.selected_thread().is_some()
+            && self.state.connection == ConnectionStatus::Connected
+        {
+            panel = panel.child(
+                menu_row(
+                    "ov-ctx",
+                    "Attach terminal context",
+                    Some("Running terminals on this thread".into()),
+                    false,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    |_event, window, cx| {
                         let Some(view) = app_view(window) else {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::InteractionMode, cx)
+                            this.toggle_composer_picker(PickerKind::Terminals, cx)
                         });
-                    }),
-                );
-                panel = panel.child(
-                    menu_row(
-                        "ov-permissions",
-                        "Permissions",
-                        Some(runtime_mode_label(&s.runtime_mode).into()),
-                        false,
-                    )
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    },
+                ),
+            );
+        }
+        if self.state.connection == ConnectionStatus::Connected {
+            panel = panel.child(
+                menu_row(
+                    "ov-share",
+                    "Share…",
+                    Some("Guest link or hosted prompt link".into()),
+                    false,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    |_event, window, cx| {
                         let Some(view) = app_view(window) else {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
+                            this.toggle_composer_picker(PickerKind::Share, cx)
                         });
-                    }),
-                );
-                // Same Default → low → medium → high cycle as the model
-                // picker's effort column; the row's detail shows the pick.
-                panel = panel.child(
-                    menu_row(
-                        "ov-effort",
-                        "Effort",
-                        Some(effort_label(&s.effort).into()),
-                        false,
-                    )
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| {
-                            let current = EFFORT_LEVELS
-                                .iter()
-                                .position(|level| *level == this.composer_state.effort)
-                                .unwrap_or(0);
-                            this.composer_state.effort =
-                                EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
-                            this.composer_state.picker = None;
-                            cx.notify();
-                        });
-                    }),
-                );
-                if self.state.selected_thread().is_some()
-                    && self.state.connection == ConnectionStatus::Connected
-                {
-                    panel = panel.child(
-                        menu_row(
-                            "ov-ctx",
-                            "Attach terminal context",
-                            Some("Running terminals on this thread".into()),
-                            false,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            |_event, window, cx| {
-                                let Some(view) = app_view(window) else {
-                                    return;
-                                };
-                                view.update(cx, |this, cx| {
-                                    this.toggle_composer_picker(PickerKind::Terminals, cx)
-                                });
-                            },
-                        ),
-                    );
-                }
-                if self.state.connection == ConnectionStatus::Connected {
-                    panel = panel.child(
-                        menu_row(
-                            "ov-share",
-                            "Share…",
-                            Some("Guest link or hosted prompt link".into()),
-                            false,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            |_event, window, cx| {
-                                let Some(view) = app_view(window) else {
-                                    return;
-                                };
-                                view.update(cx, |this, cx| {
-                                    this.toggle_composer_picker(PickerKind::Share, cx)
-                                });
-                            },
-                        ),
-                    );
-                }
-            }
+                    },
+                ),
+            );
         }
         panel
     }
@@ -3987,10 +4082,16 @@ impl AppView {
         // card's top edge (its bottom corners tuck under the card outline).
         lane = lane.child(self.render_usage_banner());
 
-        // `ComposerSurface.Main`: rounded-2xl glass card, 5%-white outline,
-        // the composer drop shadow plus the inset top-edge highlight.
+        // `ComposerSurface.Main`: rounded-2xl glass card, 5%-white outline.
+        // Both the drop shadow (`shadow-composer`) and the inset top-edge
+        // highlight are dark-/light-conditional in the web — light gets only
+        // the 2px soft shadow, dark only the 3%-white inset highlight.
         // The footer lives inside the card. File drops tint the surface,
         // matching the web drop target's `bg-accent/45` ring.
+        let card_shadows: Vec<BoxShadow> = [composer_highlight_shadow(), composer_shadow()]
+            .into_iter()
+            .flatten()
+            .collect();
         let mut card = div()
             .flex()
             .flex_col()
@@ -3998,7 +4099,7 @@ impl AppView {
             .bg(theme::composer_surface())
             .border_1()
             .border_color(theme::composer_outline())
-            .shadow(vec![composer_highlight_shadow(), composer_shadow()])
+            .shadow(card_shadows)
             .drag_over::<ExternalPaths>(|style, _paths, _window, _cx| style.bg(theme::accent()));
 
         // `data-chat-composer-body`: px-4 pt-4 pb-2 around the prompt editor.
@@ -4048,17 +4149,29 @@ impl AppView {
             );
         }
 
-        // `composer-tiptap`: text-sm foreground, leading-relaxed (22.75px at
-        // 14px), min-h of two lines + p-1, max-h-52 scroll. The field's own
-        // hitbox is one line tall; clicks in the wrapper's dead space below
-        // forward focus like a real textarea.
+        // `composer-tiptap`: `-m-1 p-1` text-sm foreground, leading-relaxed
+        // (22.75px at 14px), min-h of two lines + p-1 (53.5px), max-h-52
+        // scroll. The field wraps and measures its own height; the wrapper
+        // clips it and forwards wheel deltas, and the negative margin pulls
+        // the hitbox over the body padding like the web so clicks in the dead
+        // space still land in the editor.
         body = body.child(
             div()
-                .min_h(px(54.))
-                .max_h(px(208.))
+                .min_h(px(53.5))
+                .max_h(px(crate::text_field::FIELD_MAX_H))
+                .m(px(-crate::text_field::FIELD_PAD))
                 .text_sm()
                 .line_height(px(22.75))
                 .text_color(theme::fg())
+                .overflow_y_hidden()
+                .on_scroll({
+                    let composer = composer.clone();
+                    move |event: &gpui::ScrollEvent, window, cx| {
+                        let line_height = window.line_height();
+                        let delta = event.delta.pixel_delta(line_height).y;
+                        composer.update(cx, |field, cx| field.scroll_by(delta, cx));
+                    }
+                })
                 .on_mouse_down(MouseButton::Left, {
                     let composer = composer.clone();
                     move |_event, window, cx| {
@@ -4171,9 +4284,10 @@ impl AppView {
             if let Some(glyph) = self.provider_icon() {
                 let color = match glyph {
                     // Claude's mark keeps its brand orange (web `fill-[#d97757]`);
-                    // the OpenAI knot is white/black like web's text token.
+                    // other provider glyphs sit at muted-foreground (web
+                    // `[&_svg:not([class*='text-'])]:text-muted-foreground`).
                     Icon::ProviderClaude => rgb(0xd97757),
-                    _ => theme::fg(),
+                    _ => theme::fg_muted(),
                 };
                 model_chip = model_chip.child(icon(glyph, 16.).text_color(color));
             } else {
@@ -4244,36 +4358,10 @@ impl AppView {
                 );
             }
 
-            // `CompactComposerControlsMenu` — the icon-only ellipsis control
-            // behind which the controls with no resting slot live.
-            let overflow_open = state.picker == Some(PickerKind::Overflow);
-            controls = controls.child(
-                ghost_icon_button("composer-overflow")
-                    .group("composer-overflow")
-                    .when(overflow_open, |s| {
-                        s.bg(theme::accent()).text_color(theme::accent_fg())
-                    })
-                    .when(!overflow_open, |s| {
-                        s.hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
-                    })
-                    .tooltip(tooltip("More controls"))
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                        ensure_composer_hooks(window, cx);
-                        let Some(view) = app_view(window) else {
-                            return;
-                        };
-                        view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::Overflow, cx)
-                        });
-                    })
-                    .child(hover_icon(
-                        Icon::Ellipsis,
-                        16.,
-                        theme::fg_muted(),
-                        theme::fg(),
-                        "composer-overflow",
-                    )),
-            );
+            // Web `CompactComposerControlsMenu` renders only when the resting
+            // controls overflow the lane (`hiddenRestingBlockIds`); at normal
+            // widths there is no ellipsis — its rows hang off the model
+            // picker's footer instead.
         }
         right = right.child(controls);
 
@@ -4369,12 +4457,15 @@ impl AppView {
             );
         }
 
-        // `message-action` primary button: 32px circle, primary fill, white
-        // glyph; disabled state keeps the blue circle dimmed (the reference's
-        // `disabled:opacity-64` stage-backdrop button), not the fg·12% fill.
+        // `message-action` primary button: 32px circle, stage-backdrop
+        // blueprint gradient, white glyph. Web `disabled:opacity-64` dims the
+        // whole button — gradient and arrow together. A busy thread keeps the
+        // send affordance while there's a draft (`CornerUpRight`/`ListPlus`
+        // in the web; ArrowUp here) and only drops to the interrupt square
+        // with an empty field.
         let sendable =
             (!state.draft.is_empty() || !state.attachments.is_empty()) && !provider_unavailable;
-        actions = actions.child(if running {
+        actions = actions.child(if running && !sendable {
             div()
                 .id("stop")
                 .w(px(32.))
@@ -4384,7 +4475,7 @@ impl AppView {
                 .justify_center()
                 .rounded_full()
                 .bg(theme::destructive_90())
-                .shadow(vec![control_highlight_shadow()])
+                .shadow(vec![send_shadow(), control_highlight_shadow()])
                 .cursor(gpui::CursorStyle::PointingHand)
                 .text_sm()
                 .text_color(gpui::white())
@@ -4406,15 +4497,16 @@ impl AppView {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .shadow(vec![control_highlight_shadow()])
+                .overflow_hidden()
+                .bg(send_art(false))
+                .text_color(gpui::white())
                 .cursor(gpui::CursorStyle::PointingHand)
                 .text_sm()
                 // Web `submitTooltip` — `submitLabel` rests at "Submit message".
                 .tooltip(tooltip("Submit message"))
                 .when(sendable, |s| {
-                    s.bg(theme::primary())
-                        .text_color(gpui::white())
-                        .hover(|s| s.bg(theme::primary_hover()))
+                    s.shadow(vec![send_shadow(), control_highlight_shadow()])
+                        .hover(|s| s.bg(send_art(true)))
                         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                             ensure_composer_hooks(window, cx);
                             let Some(view) = app_view(window) else {
@@ -4434,15 +4526,9 @@ impl AppView {
                         })
                 })
                 .when(!sendable, |s| {
-                    s.bg(theme::primary_dim())
-                        .text_color(theme::primary_fg_dim())
-                        .cursor(gpui::CursorStyle::Arrow)
+                    s.opacity(0.64).cursor(gpui::CursorStyle::Arrow)
                 })
-                .child(icon(Icon::ArrowUp, 14.).text_color(if sendable {
-                    gpui::white()
-                } else {
-                    theme::primary_fg_dim().into()
-                }))
+                .child(icon(Icon::ArrowUp, 14.).text_color(gpui::white()))
         });
 
         right = right.child(actions);
