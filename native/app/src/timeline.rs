@@ -1348,6 +1348,63 @@ impl AppView {
         // Top/bottom spacers ≈ chat-list-header/footer (h-3 / h-4).
         lane = lane.child(div().h(px(12.)).flex_shrink_0());
 
+        // Web `TimelineHistoryControl`: a `gap-1.5 pb-2` lane row whose
+        // full-width button centers the label between `h-px flex-1
+        // bg-border/70` hairlines; the error note sits below it.
+        if self.has_more_history || self.history_error {
+            lane = lane.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .pb_2()
+                    .when(self.has_more_history, |col| {
+                        col.child(
+                            div()
+                                .id("load-earlier-turns")
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .py_1p5()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .hover(|s| s.text_color(theme::fg()))
+                                .child(
+                                    div().h(px(1.)).flex_1().bg(theme::hairline().opacity(0.7)),
+                                )
+                                .child(
+                                    div().flex_none().child(if self.history_loading {
+                                        "Loading earlier turns…"
+                                    } else {
+                                        "Load earlier turns"
+                                    }),
+                                )
+                                .child(
+                                    div().h(px(1.)).flex_1().bg(theme::hairline().opacity(0.7)),
+                                )
+                                .on_click(|_event, window, cx| {
+                                    update_view(window, cx, |this, cx| {
+                                        this.load_earlier_turns(cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                    .when(self.history_error, |col| {
+                        col.child(
+                            div()
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child("Couldn't load earlier turns. Try again."),
+                        )
+                    }),
+            );
+        }
+
         // The web's empty-thread placeholder is a standalone `h-full` flex
         // that centers the text in the viewport (with bottom padding for the
         // composer inset), not a row inside the scroll lane.

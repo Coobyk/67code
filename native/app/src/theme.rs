@@ -391,9 +391,9 @@ pub fn command_highlight() -> Rgba {
 pub fn accent_soft() -> Rgba {
     pick(rgba(0xffffff06), rgba(0x00000004))
 }
-/// `bg-foreground/[0.07]` — Kbd chip fill.
+/// `bg-foreground/[0.08]` — Kbd chip fill.
 pub fn kbd_bg() -> Rgba {
-    pick(rgba(0xf5f5f512), rgba(0x18181b12))
+    pick(rgba(0xf5f5f514), rgba(0x18181b14))
 }
 /// `bg-foreground/[0.025]` — cmdk footer strip.
 pub fn command_footer_bg() -> Rgba {

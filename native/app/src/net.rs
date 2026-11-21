@@ -126,6 +126,19 @@ pub enum ShellEvent {
     },
     ThreadSnapshot {
         items: Vec<TurnItemView>,
+        /// `hasMoreHistory`/`historyCursor` on a bounded snapshot — older
+        /// turn items page in through `ClientCommand::LoadHistory`.
+        has_more_history: bool,
+        history_cursor: Option<String>,
+    },
+    /// `OrchestrationV2ThreadHistoryPage` answer to `LoadHistory`.
+    ThreadHistoryPage {
+        thread_id: String,
+        items: Vec<TurnItemView>,
+        next_cursor: Option<String>,
+        has_more_history: bool,
+        /// HTTP/decode failure — the UI offers a retry.
+        error: Option<String>,
     },
     ThreadItemUpdated {
         item: TurnItemView,
@@ -166,6 +179,12 @@ pub enum ClientCommand {
     SubscribeAuthAccess,
     SubscribeThread {
         thread_id: String,
+    },
+    /// `GET /api/orchestration/threads/:id/history?cursor=…` — answered as
+    /// `ShellEvent::ThreadHistoryPage`; never produces a WS frame.
+    LoadHistory {
+        thread_id: String,
+        cursor: String,
     },
     /// A raw `OrchestrationV2Command` JSON payload.
     Dispatch {
@@ -390,7 +409,11 @@ fn parse_thread_stream_item(v: &Value) -> Option<ShellEvent> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(ShellEvent::ThreadSnapshot { items })
+            Some(ShellEvent::ThreadSnapshot {
+                items,
+                has_more_history: v["hasMoreHistory"].as_bool().unwrap_or(false),
+                history_cursor: v["historyCursor"].as_str().map(str::to_owned),
+            })
         }
         "event" => {
             let event = &v["event"];
@@ -461,6 +484,63 @@ fn mint_ticket(endpoint: &ServerEndpoint) -> Result<String, String> {
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| format!("no ticket in response: {body}"))
+}
+
+/// `GET /api/orchestration/threads/:threadId/history?cursor=<opaque>`
+/// (`environmentHttp.ts` `threadHistoryPage`). The cursor is a base64url
+/// payload, already query-safe. Runs on the net thread — the socket loop
+/// pauses for the fetch duration.
+fn fetch_history_page(
+    endpoint: &ServerEndpoint,
+    thread_id: &str,
+    cursor: &str,
+) -> ShellEvent {
+    let url = format!(
+        "{}/api/orchestration/threads/{}/history?cursor={}",
+        endpoint.http_url.trim_end_matches('/'),
+        thread_id,
+        cursor,
+    );
+    let failed = |error: String| ShellEvent::ThreadHistoryPage {
+        thread_id: thread_id.to_string(),
+        items: Vec::new(),
+        next_cursor: None,
+        has_more_history: false,
+        error: Some(error),
+    };
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .new_agent();
+    let mut response = match agent
+        .get(&url)
+        .header("authorization", format!("Bearer {}", endpoint.token))
+        // `OrchestrationProtocolHeaders` — required literal on the contract.
+        .header("x-t3-orchestration-protocol", "2")
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => return failed(format!("history request failed: {e}")),
+    };
+    let body: Value = match response.body_mut().read_json() {
+        Ok(v) => v,
+        Err(e) => return failed(format!("history decode failed: {e}")),
+    };
+    let items = body["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|entry| parse_turn_item(&entry["item"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    ShellEvent::ThreadHistoryPage {
+        thread_id: thread_id.to_string(),
+        items,
+        next_cursor: body["nextCursor"].as_str().map(str::to_owned),
+        has_more_history: body["hasMoreHistory"].as_bool().unwrap_or(false),
+        error: None,
+    }
 }
 
 /// Connects, subscribes to the orchestration shell stream, and forwards parsed
@@ -569,6 +649,15 @@ fn run_inner(
                     }
                     ClientCommand::Query { reply, .. } => {
                         queries.insert(id, reply.clone());
+                    }
+                    ClientCommand::LoadHistory { thread_id, cursor } => {
+                        // HTTP page fetch, not a WS frame (`environmentHttp.ts`
+                        // `threadHistoryPage`). Blocking here stalls the read
+                        // loop only for the fetch duration — same trade the
+                        // ticket mint already makes.
+                        let event = fetch_history_page(endpoint, thread_id, cursor);
+                        let _ = events.send_blocking(event);
+                        return Ok(None);
                     }
                     _ => {}
                 }
@@ -737,7 +826,11 @@ fn send_command(
             "_tag": "Request",
             "id": id,
             "tag": "orchestration.subscribeThread",
-            "payload": { "threadId": thread_id, "requestCompletionMarker": true },
+            "payload": {
+                "threadId": thread_id,
+                "requestCompletionMarker": true,
+                "acceptBoundedSnapshot": true,
+            },
             "headers": [],
         }),
         ClientCommand::Dispatch { command } => json!({
@@ -767,6 +860,8 @@ fn send_command(
         }
         // InterruptStream emits its frame in the subscription match above.
         ClientCommand::InterruptStream { .. } => unreachable!(),
+        // LoadHistory is an HTTP fetch handled in the run loop — no frame.
+        ClientCommand::LoadHistory { .. } => unreachable!("handled in send_one"),
         ClientCommand::Interrupt { request_id } => json!({
             "_tag": "Interrupt",
             "requestId": request_id,

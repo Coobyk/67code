@@ -1196,11 +1196,13 @@ impl AppView {
         self.close_palette(window, cx);
     }
 
-    /// One result row — the web `CommandItem`: `min-h-7 px-2 py-1.5 rounded-sm
-    /// gap-2 text-sm`, highlighted `bg-foreground/[0.09]`, leading
+    /// One result row — the web `CommandItem`: `min-h-8 px-2 py-1.5 rounded-sm
+    /// gap-2` (measured 32px one-line, 48px two-line), highlighted `bg-accent`
+    /// (foreground 4% — the palette passes `active`, which overrides the
+    /// `data-highlighted:bg-foreground/[0.09]` hover style), leading
     /// `CommandPaletteTitleIcon` (16px glyph in an h-5 top-aligned slot),
-    /// two-line `title + description` content column, then a timestamp or
-    /// `CommandShortcut` at the right edge.
+    /// two-line `title + description` content column (20px + 16px lines),
+    /// then a timestamp or `CommandShortcut` at the right edge.
     fn render_palette_row(
         &self,
         row: &Row,
@@ -1217,11 +1219,11 @@ impl AppView {
             .gap_2()
             .px_2()
             .py_1p5()
-            .min_h(px(28.))
+            .min_h(px(32.))
             .rounded_sm()
             .text_sm();
         if active {
-            el = el.bg(theme::command_highlight());
+            el = el.bg(theme::accent());
         }
         if row.enabled {
             el = el.cursor_pointer();
@@ -1273,7 +1275,8 @@ impl AppView {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(18.))
+                            // 20px title line — web text-sm row line box.
+                            .h(px(20.))
                             .truncate()
                             .text_color(title_color)
                             .child(SharedString::from(row.label.clone())),
@@ -1284,7 +1287,8 @@ impl AppView {
                                 // Explicit height — the nowrap+ellipsis text
                                 // measures ~0 in a scroll list, letting it
                                 // paint over the next row otherwise.
-                                .h(px(15.))
+                                // 16px — web text-xs description line box.
+                                .h(px(16.))
                                 .truncate()
                                 .text_xs()
                                 .text_color(theme::fg_muted_soft())
@@ -1365,6 +1369,8 @@ impl AppView {
                         .px_2()
                         .py_1p5()
                         .text_xs()
+                        // Web label box: 16px line + 6px top/bottom = 28px.
+                        .line_height(px(16.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme::fg_muted())
                         .child(row.section);
@@ -1428,31 +1434,33 @@ impl AppView {
                 cx.stop_propagation();
             });
 
-        // `CommandInput`: search icon start-addon + borderless lg input in a
-        // `px-2 py-1.5` shell (icon sits at ps-11px, input text at ps-36px).
+        // `CommandInput`: search icon start-addon + borderless input in a
+        // `px-[--command-shell-inset](8px) py-1.5` shell. The inner
+        // `input-control` box measures 36px with its 0px border; the icon
+        // sits 10px in and the input's own `ps-32px` puts text at +32px.
         if let Some(field) = self.palette_state.field.clone() {
             panel = panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1p5()
-                    .min_h(px(46.))
-                    .text_sm()
-                    .child(
-                        div().flex_none().w(px(16.)).flex().items_center().child(
-                            crate::icons::icon(crate::icons::Icon::Search, 14.)
-                                .text_color(theme::icon_muted()),
+                div().px_2().py_1p5().text_sm().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(36.))
+                        .pl(px(10.))
+                        .gap(px(6.))
+                        .child(
+                            div().flex_none().w(px(16.)).flex().items_center().child(
+                                crate::icons::icon(crate::icons::Icon::Search, 16.)
+                                    .text_color(theme::icon_muted()),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(theme::fg())
+                                .child(field),
                         ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(theme::fg())
-                            .child(field),
-                    ),
+                ),
             );
         }
 
