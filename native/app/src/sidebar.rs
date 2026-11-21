@@ -2073,6 +2073,411 @@ impl AppView {
         row.into_any_element()
     }
 
+    /// Web default (`data-testid="sidebar-row-card"`): every active thread is
+    /// its own rounded card — `[favicon][pin?] project-name · rel-time` on the
+    /// first h-5 line, `title · status` on the second (`mt-1`), an optional
+    /// `GitBranch` meta line, and a hover-only snooze + "✓ Settle" cluster
+    /// covering the time slot.
+    fn render_card_row(
+        &self,
+        thread: &Thread,
+        row_id: usize,
+        project: &Project,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.state.selected.as_ref() == Some(&thread.id);
+        let renaming = self.sidebar_state.renaming.as_ref() == Some(&thread.id);
+        let unread = self.is_unread(thread);
+        let snoozed = self.is_snoozed(thread);
+        // Web `shouldRecedeSidebarThread` — same inputs as the slim row.
+        let receded = !active
+            && !thread.has_pending_request
+            && !thread.has_actionable_proposed_plan
+            && (thread.running() || !unread);
+        // Card title ink: `font-medium text-foreground`; receded rows drop to
+        // `font-normal text-foreground/75` until the card is hovered.
+        let mut receded_title = theme::sidebar_fg();
+        receded_title.a *= 0.75;
+        let title_color = if receded {
+            receded_title
+        } else {
+            theme::sidebar_fg()
+        };
+        let meta = self.sidebar_state.thread_meta.get(thread.id.as_ref());
+        let branch = meta
+            .and_then(|m| m.branch.clone())
+            .filter(|b| !b.is_empty());
+        // `pinned` lands on the thread shell; `pinnedAt` arrives on the
+        // metadata harvest — either marks the card's pin.
+        let pinned = thread.pinned || meta.is_some_and(|m| m.pinned);
+        let rel_time = rel_time_label(thread.updated_at.as_ref());
+        let select_id = thread.id.clone();
+        let menu_id = thread.id.clone();
+        let settle_id = thread.id.clone();
+        let snooze_id = thread.id.clone();
+        let unpin_id = thread.id.clone();
+
+        // Right-side status glyph — same priority order as the slim row.
+        let (status_icon, status_color): (Icon, gpui::Rgba) = if thread.has_pending_request {
+            (Icon::CircleHelp, theme::warning_fg())
+        } else if thread.has_actionable_proposed_plan {
+            (Icon::Shield, rgb(0xa78bfa))
+        } else if thread.running() {
+            (Icon::CircleDot, theme::info_fg())
+        } else if matches!(thread.status.as_ref(), "failed" | "error") {
+            (Icon::CircleAlert, theme::error_fg())
+        } else if matches!(thread.status.as_ref(), "completed") {
+            (Icon::CircleCheck, theme::sidebar_icon())
+        } else {
+            (Icon::CircleDashed, theme::sidebar_faint())
+        };
+
+        let mut line1 = div()
+            .flex()
+            .items_center()
+            .h_5()
+            .gap_1p5()
+            .child(self.project_chip(project));
+        if pinned {
+            // Web `pinIndicator`: a muted size-3 Pin that flips to an unpin
+            // affordance on hover — the bundled set has no pin-off, so the
+            // pin keeps its glyph and only brightens.
+            line1 = line1.child(
+                div()
+                    .id(("unpin", row_id))
+                    .flex_none()
+                    .cursor_pointer()
+                    .tooltip(tooltip("Unpin thread"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            if let Some(thread) =
+                                this.state.threads.iter_mut().find(|t| t.id == unpin_id)
+                            {
+                                thread.pinned = false;
+                                thread.pin_order_key = None;
+                            }
+                            this.dispatch(json!({
+                                "type": "thread.unpin",
+                                "commandId": Uuid::new_v4().to_string(),
+                                "threadId": unpin_id,
+                            }));
+                            cx.notify();
+                        }),
+                    )
+                    .child(hover_icon(
+                        Icon::Pin,
+                        12.,
+                        theme::sidebar_faint(),
+                        theme::sidebar_fg(),
+                        "unpin",
+                    )),
+            );
+        }
+        line1 = line1
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(theme::sidebar_secondary_label())
+                    .child(project.name.clone()),
+            )
+            // Status slot: `tabular-nums text-secondary-label` rel-time —
+            // snoozed rows lead it with the info clock — hidden on card
+            // hover, when the snooze/settle cluster covers it.
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .group_hover("thread-row", |s| s.opacity(0.))
+                    .when(snoozed, |el| {
+                        el.child(
+                            icon(Icon::Clock, 12.)
+                                .flex_none()
+                                .text_color(theme::info_fg()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::sidebar_secondary_label())
+                            .child(rel_time),
+                    ),
+            );
+
+        let mut line2 = div().mt_1().flex().items_center().h_5().gap_1p5();
+        if renaming {
+            if let Some(field) = self.sidebar_state.rename_field.clone() {
+                line2 = line2.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::sidebar_fg())
+                        .child(field),
+                );
+            }
+        } else {
+            line2 = line2.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .text_sm()
+                    .when(!receded, |s| s.font_weight(gpui::FontWeight::MEDIUM))
+                    .text_color(title_color)
+                    .child(thread.title.clone()),
+            );
+        }
+        if thread
+            .linked_pull_request
+            .as_ref()
+            .and_then(|pr| pr.get("url"))
+            .and_then(|url| url.as_str())
+            .is_some()
+        {
+            line2 = line2.child(
+                icon(Icon::GitPullRequest, 12.)
+                    .flex_none()
+                    .text_color(theme::sidebar_secondary_label()),
+            );
+        }
+        if thread.has_pending_request {
+            line2 = line2.child(
+                icon(Icon::TriangleAlert, 12.)
+                    .flex_none()
+                    .text_color(theme::warning_fg()),
+            );
+        }
+        if thread.has_actionable_proposed_plan {
+            line2 = line2.child(
+                div()
+                    .flex_none()
+                    .px_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(0xa78bfa))
+                    .text_xs()
+                    .text_color(rgb(0xa78bfa))
+                    .child("Plan"),
+            );
+        }
+        // The web puts the provider badge here; the closest native slot is
+        // the row status glyph, which also carries state the badge lacks.
+        line2 = line2.child(icon(status_icon, 14.).flex_none().text_color(status_color));
+
+        let mut card = div()
+            .id(("thread", row_id))
+            .group("thread-row")
+            .relative()
+            .w_full()
+            .rounded_md()
+            .overflow_hidden()
+            .px(px(10.))
+            .py(px(8.))
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .when(active, |s| {
+                // Web `bg-sidebar-row-active` + `light:ring-sidebar-border/70`.
+                s.bg(theme::sidebar_active()).when(
+                    !theme::effective_dark(),
+                    |s| s.border_1().border_color(theme::sidebar_border_soft()),
+                )
+            })
+            .when(!active, |s| s.hover(|s| s.bg(theme::sidebar_hover())))
+            .when(receded && thread.running(), |s| s.opacity(0.7))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    if this.sidebar_state.renaming.as_ref() != Some(&select_id) {
+                        this.sidebar_state.renaming = None;
+                    }
+                    this.select_and_visit(select_id.clone(), cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                    this.sidebar_state.context_menu = Some(ContextMenu {
+                        thread_id: menu_id.clone(),
+                        position: ev.position,
+                    });
+                    this.sidebar_state.delete_confirm = None;
+                    if let Some(focus) = this.sidebar_state.menu_focus.clone() {
+                        focus.focus(window, cx);
+                    }
+                    this.select_and_visit(menu_id.clone(), cx);
+                }),
+            )
+            .child(line1)
+            .when(expanded, |card| {
+                let card = card.child(line2);
+                // Meta line — web `metaLine` (`mt-0.5`, secondary-label): the
+                // worktree branch when the thread's metadata reports one.
+                if let Some(branch) = branch {
+                    card.child(
+                        div()
+                            .mt(px(2.))
+                            .flex()
+                            .items_center()
+                            .h_5()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(theme::sidebar_secondary_label())
+                            .child(
+                                icon(Icon::GitBranch, 12.)
+                                    .flex_none()
+                                    .text_color(theme::sidebar_secondary_label()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .overflow_x_hidden()
+                                    .text_ellipsis()
+                                    .child(branch),
+                            ),
+                    )
+                } else {
+                    card
+                }
+            });
+
+        if !self.is_settled(thread.id.as_ref()) {
+            // Hover-only controls covering the time slot — web's ghost
+            // snooze button + "✓ Settle" (both `text-muted-foreground`,
+            // brightening on their own hover).
+            let mut controls = div()
+                .absolute()
+                .top(px(8.))
+                .right(px(6.))
+                .h_5()
+                .flex()
+                .items_center()
+                .opacity(0.)
+                .group_hover("thread-row", |s| s.opacity(1.));
+            if snoozed {
+                // Web `unsnooze` affordance — a clock button that wakes the
+                // thread now.
+                controls = controls.child(
+                    div()
+                        .id(("unsnooze", row_id))
+                        .group("unsnooze")
+                        .flex_none()
+                        .w_5()
+                        .h_5()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .text_color(theme::sidebar_fg_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme::sidebar_fg()))
+                        .tooltip(tooltip("Wake thread now"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                this.unsnooze_thread(snooze_id.clone(), cx);
+                            }),
+                        )
+                        .child(hover_icon(
+                            Icon::Clock,
+                            14.,
+                            theme::sidebar_fg_muted(),
+                            theme::sidebar_fg(),
+                            "unsnooze",
+                        )),
+                );
+            } else {
+                controls = controls.child(
+                    div()
+                        .id(("snooze", row_id))
+                        .group("snooze")
+                        .flex_none()
+                        .w_5()
+                        .h_5()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .text_color(theme::sidebar_fg_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme::sidebar_fg()))
+                        .tooltip(tooltip("Snooze"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some((_, until)) = snooze_presets(unix_now()).first()
+                                {
+                                    this.snooze_thread(
+                                        snooze_id.clone(),
+                                        iso_from_unix(*until),
+                                        cx,
+                                    );
+                                }
+                            }),
+                        )
+                        .child(hover_icon(
+                            Icon::Clock,
+                            14.,
+                            theme::sidebar_fg_muted(),
+                            theme::sidebar_fg(),
+                            "snooze",
+                        )),
+                );
+                controls = controls.child(
+                    div()
+                        .id(("settle", row_id))
+                        .group("settle")
+                        .flex_none()
+                        .h_5()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_md()
+                        .px_1p5()
+                        .text_xs()
+                        .text_color(theme::sidebar_fg_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme::sidebar_fg()))
+                        .tooltip(tooltip("Settle thread"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                this.settle_thread(settle_id.clone(), cx);
+                            }),
+                        )
+                        .child(hover_icon(
+                            Icon::Check,
+                            14.,
+                            theme::sidebar_fg_muted(),
+                            theme::sidebar_fg(),
+                            "settle",
+                        ))
+                        .child("Settle"),
+                );
+            }
+            card = card.child(controls);
+        }
+
+        // Web `li.py-0.5` — 2px top/bottom air between cards.
+        div().py(px(2.)).child(card).into_any_element()
+    }
+
     fn render_context_menu(&self, menu: &ContextMenu, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self
             .state
@@ -2850,19 +3255,10 @@ impl AppView {
             }
             // Web group model: the default sidebar renders every active
             // thread as its own card headed by its project chip + display
-            // name — each scratch "No project" thread therefore sits under
-            // its own "No project" header. Real projects keep the
-            // one-header-per-project folder shape; the scratch workspace
-            // (server-managed `<base>/scratch`, both servers hardcode it)
-            // splits into one group per live thread to match the web's
-            // group boundaries.
-            let is_scratch = |project: &Project| {
-                project
-                    .path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .is_some_and(|base| base == "scratch")
-            };
+            // name (no project folders — those live behind the web's opt-in
+            // "boring sidebar" labs flag). Each live thread therefore gets
+            // its own singleton section.
+
             // Web `sortActiveThreadsByOrderKey`: threads carrying an
             // activeOrderKey sort first by that key, the rest by newest
             // activity anchor. A section's rank is its freshest member's.
@@ -2873,12 +3269,21 @@ impl AppView {
             struct Section {
                 project: Project,
                 threads: Vec<Thread>,
-                /// Scratch singleton: the single thread this group holds —
+                /// Card singleton: the single thread this section holds —
                 /// its id keys the collapse state (`project.expanded` is
-                /// shared, and the web gives each scratch row its own
-                /// header).
+                /// shared between cards).
                 singleton: Option<SharedString>,
             }
+            // The shell `pinned` flag and the `pinnedAt` metadata harvest
+            // both mark pinned cards.
+            let is_pinned = |t: &Thread| {
+                t.pinned
+                    || self
+                        .sidebar_state
+                        .thread_meta
+                        .get(t.id.as_ref())
+                        .is_some_and(|m| m.pinned)
+            };
             let mut sections: Vec<Section> = Vec::new();
             for project in projects.iter() {
                 let mut threads: Vec<Thread> = self
@@ -2893,224 +3298,60 @@ impl AppView {
                 // pinned block), then awake threads, snoozed last.
                 threads.sort_by_key(|t| {
                     (
-                        !t.pinned,
+                        !is_pinned(t),
                         t.pin_order_key.is_none(),
                         t.pin_order_key.clone().unwrap_or_default(),
                         self.is_snoozed(t),
                         Reverse(t.updated_at.clone()),
                     )
                 });
-                if is_scratch(project) {
-                    for thread in threads {
-                        sections.push(Section {
-                            project: project.clone(),
-                            singleton: Some(thread.id.clone()),
-                            threads: vec![thread],
-                        });
-                    }
-                } else {
+                // The default web sidebar is flat: every live thread is its
+                // own card, so each becomes a singleton section.
+                for thread in threads {
                     sections.push(Section {
                         project: project.clone(),
-                        threads,
-                        singleton: None,
+                        singleton: Some(thread.id.clone()),
+                        threads: vec![thread],
                     });
                 }
             }
-            // Sections interleave by their freshest member like the web's
-            // flat list; empty folders (no live threads) sink to the end in
-            // project order.
+            // Sections interleave like the web's flat list: pinned cards
+            // first (pinOrderKey order), then awake cards by rank, snoozed
+            // last.
             sections.sort_by_key(|section| {
-                section
-                    .threads
-                    .iter()
-                    .map(&rank)
-                    .min()
-                    .unwrap_or_else(|| (true, String::new(), Reverse("".into())))
+                let thread = section.threads.first();
+                (
+                    !thread.is_some_and(&is_pinned),
+                    !thread.is_some_and(|t| t.pin_order_key.is_some()),
+                    thread
+                        .map(|t| t.pin_order_key.clone().unwrap_or_default().to_string())
+                        .unwrap_or_default(),
+                    thread.is_some_and(|t| self.is_snoozed(t)),
+                    thread
+                        .map(&rank)
+                        .unwrap_or_else(|| (true, String::new(), Reverse("".into()))),
+                )
             });
 
             let mut row_id = 0usize;
-            for (si, section) in sections.iter().enumerate() {
+            for section in sections.iter() {
                 let project = &section.project;
+                // Cards have no fold on the web; the collapse reads stay so a
+                // previously-collapsed scratch row can only grow detail lines.
                 let expanded = match &section.singleton {
                     Some(id) => !self.sidebar_state.scratch_collapsed.contains(id.as_ref()),
                     None => project.expanded,
                 };
-                let toggle_project_id = (!section.singleton.is_some()).then(|| project.id.clone());
-                let toggle_thread_id = section.singleton.clone();
-                let new_thread_id = project.id.clone();
-                // Web `SidebarProjectFolderHeader`: collapsed folders surface the
-                // most urgent hidden-thread state as a size-1.5 dot and show the
-                // hidden-thread count (priority attention > failed > unread >
-                // working — `resolveSidebarFolderDot`).
-                let hidden: Vec<&Thread> = section.threads.iter().collect();
-                // Web `SidebarProjectFolderHeader` right slot: the newest
-                // member thread's relative activity stamp.
-                let header_time = hidden
-                    .iter()
-                    .map(|t| t.updated_at.as_ref())
-                    .max()
-                    .map(rel_time_label)
-                    .unwrap_or_default();
-                let folder_dot = if expanded || hidden.is_empty() {
-                    None
-                } else if hidden
-                    .iter()
-                    .any(|t| t.has_pending_request || t.has_actionable_proposed_plan)
-                {
-                    Some(theme::warning())
-                } else if hidden
-                    .iter()
-                    .any(|t| matches!(t.status.as_ref(), "failed" | "error"))
-                {
-                    Some(theme::error())
-                } else if hidden.iter().any(|t| self.is_unread(t)) {
-                    Some(theme::success())
-                } else if hidden.iter().any(|t| t.running()) {
-                    Some(theme::info())
-                } else {
-                    None
-                };
-                // Web `SidebarProjectFolderHeader`: a size-3 muted
-                // ChevronDown rotated -90° while collapsed.
-                let chevron = if expanded {
-                    icon(Icon::ChevronDown, 12.)
-                } else {
-                    icon(Icon::ChevronRight, 12.)
-                };
-                let header = div()
-                    .id(("project", si))
-                    .group("project-folder")
-                    .flex()
-                    .items_center()
-                    .h_8()
-                    .gap_2p5()
-                    .px_2p5()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::sidebar_hover()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            match (&toggle_project_id, &toggle_thread_id) {
-                                // Folders toggle `project.expanded`; scratch
-                                // singletons toggle their own collapse bit.
-                                (Some(project_id), None) => {
-                                    if let Some(project) =
-                                        this.state.projects.iter_mut().find(|p| p.id == *project_id)
-                                    {
-                                        project.expanded = !project.expanded;
-                                    }
-                                }
-                                (None, Some(thread_id)) => {
-                                    if !this
-                                        .sidebar_state
-                                        .scratch_collapsed
-                                        .remove(thread_id.as_ref())
-                                    {
-                                        this.sidebar_state
-                                            .scratch_collapsed
-                                            .insert(thread_id.clone());
-                                    }
-                                }
-                                _ => {}
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    // A loaded favicon beats the icon chip; failures and
-                    // in-flight fetches fall back to the icon chip, then the
-                    // derived `ProjectMonogram` tile (web's default).
-                    .child(self.project_chip(project))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .overflow_x_hidden()
-                            .text_ellipsis()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme::sidebar_fg_soft())
-                            .child(project.name.clone()),
-                    )
-                    .when_some(folder_dot, |row, color| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .w(px(6.))
-                                .h(px(6.))
-                                .rounded_full()
-                                .bg(color),
-                        )
-                    })
-                    .when(!header_time.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(theme::sidebar_fg_muted())
-                                .child(header_time),
-                        )
-                    })
-                    .when(!expanded && !hidden.is_empty(), |row| {
-                        // Web hides the count while the folder is hovered —
-                        // the new-thread button appears in its place.
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(theme::sidebar_fg_muted())
-                                .group_hover("project-folder", |s| s.opacity(0.))
-                                .child(format!("{}", hidden.len())),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("new-thread", si))
-                            .flex_none()
-                            .w_6()
-                            .h_6()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .text_sm()
-                            .text_color(theme::sidebar_icon())
-                            .opacity(0.)
-                            .group_hover("project-folder", |s| s.opacity(1.))
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    cx.stop_propagation();
-                                    this.new_thread(new_thread_id.clone(), cx);
-                                }),
-                            )
-                            // Web's in-folder new-thread button is an
-                            // `icon-xs` SquarePen → pencil at 14px. Svg
-                            // doesn't inherit the parent's ink — carry it.
-                            .child(icon(Icon::Pencil, 14.).text_color(theme::sidebar_icon())),
-                    )
-                    .child(chevron.flex_none().text_color(theme::sidebar_fg_muted()));
-
-                // Web folders get `mt-2 first:mt-0` breathing room.
-                let mut section_el = div()
-                    .flex()
-                    .flex_col()
-                    .when(si > 0, |s| s.mt_2())
-                    .child(header);
-                if expanded {
-                    // An expanded empty folder renders nothing on the web —
-                    // the header alone is the affordance, so no empty-state
-                    // row here.
-                    for thread in section.threads.iter() {
-                        section_el = section_el
-                            .child(self.render_thread_row(thread, row_id, None, true, cx));
-                        row_id += 1;
-                    }
+                for thread in section.threads.iter() {
+                    list = list.child(self.render_card_row(
+                        thread,
+                        row_id,
+                        project,
+                        expanded,
+                        cx,
+                    ));
+                    row_id += 1;
                 }
-                list = list.child(section_el);
             }
         }
 
@@ -3618,8 +3859,11 @@ impl AppView {
                     )
                     .child(div().flex_1().min_w_0())
                     .child(
-                        // Far-right circular update/status pill — mirrors
-                        // the web's update button; ink reflects connection.
+                        // Far-right circular update/status pill — the web's
+                        // `DesktopUpdateStatusIcon` "everything" state is
+                        // `CircleArrowUpIcon` on the control surface; the
+                        // bundled set has no circled arrow, so it composes
+                        // one from a border ring + ArrowUp.
                         div()
                             .id("update-status")
                             .flex_none()
@@ -3629,8 +3873,9 @@ impl AppView {
                             .items_center()
                             .justify_center()
                             .rounded_full()
+                            .bg(theme::sidebar_control())
                             .text_xs()
-                            .text_color(status_color)
+                            .text_color(theme::sidebar_fg())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::sidebar_hover()))
                             .on_mouse_down(
@@ -3642,16 +3887,27 @@ impl AppView {
                                 }),
                             )
                             .child(
-                                icon(
-                                    if matches!(self.state.connection, ConnectionStatus::Connected)
-                                    {
-                                        Icon::CircleCheck
-                                    } else {
-                                        Icon::RefreshCw
-                                    },
-                                    14.,
-                                )
-                                .text_color(status_color),
+                                if matches!(self.state.connection, ConnectionStatus::Connected)
+                                {
+                                    div()
+                                        .w(px(16.))
+                                        .h(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(theme::sidebar_fg())
+                                        .child(
+                                            icon(Icon::ArrowUp, 9.)
+                                                .text_color(theme::sidebar_fg()),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    icon(Icon::RefreshCw, 14.)
+                                        .text_color(status_color)
+                                        .into_any_element()
+                                },
                             ),
                     ),
             );
