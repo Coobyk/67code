@@ -23,11 +23,12 @@ use serde_json::json;
 
 use crate::AppView;
 use crate::config;
-use crate::icons::{Icon, icon};
+use crate::icons::{Icon, hover_icon, icon};
 use crate::model::{ConnectionStatus, Message, Role};
 use crate::notifications::ToastKind;
 use crate::text_field::{PromptSubmitted, Submit, TextField};
 use crate::theme;
+use crate::tooltip::tooltip;
 
 /// Composer-local UI state. Expand freely — this field lives on `AppView`.
 pub struct State {
@@ -4075,7 +4076,9 @@ impl AppView {
         let mut card_footer = div().flex().items_center().px_2().pb_2().child(
             div().mr_2().child(
                 ghost_icon_button("composer-attach")
+                    .group("composer-attach")
                     .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .tooltip(tooltip("Attach files"))
                     .on_mouse_down(MouseButton::Left, |_event, window, cx| {
                         ensure_composer_hooks(window, cx);
                         let Some(view) = app_view(window) else {
@@ -4085,7 +4088,13 @@ impl AppView {
                             this.toggle_composer_picker(PickerKind::Attach, cx);
                         });
                     })
-                    .child(icon(Icon::Paperclip, 16.).text_color(theme::fg_muted())),
+                    .child(hover_icon(
+                        Icon::Paperclip,
+                        16.,
+                        theme::fg_muted(),
+                        theme::fg(),
+                        "composer-attach",
+                    )),
             ),
         );
 
@@ -4114,6 +4123,7 @@ impl AppView {
             // settings" and jumps to Settings → Providers.
             controls = controls.child(
                 control_chip("composer-provider-settings")
+                    .group("composer-provider-settings")
                     .text_color(theme::control_fg())
                     .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
                     .on_mouse_down(MouseButton::Left, |_event, window, cx| {
@@ -4126,7 +4136,13 @@ impl AppView {
                             cx.notify();
                         });
                     })
-                    .child(icon(Icon::CircleAlert, 16.).text_color(theme::fg_muted()))
+                    .child(hover_icon(
+                        Icon::CircleAlert,
+                        16.,
+                        theme::fg_muted(),
+                        theme::fg(),
+                        "composer-provider-settings",
+                    ))
                     .child("Open provider settings"),
             );
         } else {
@@ -4195,6 +4211,7 @@ impl AppView {
                 let permissions_open = state.picker == Some(PickerKind::RuntimeMode);
                 controls = controls.child(
                     control_chip("composer-permissions")
+                        .group("composer-permissions")
                         .when(permissions_open, |s| {
                             s.bg(theme::accent()).text_color(theme::accent_fg())
                         })
@@ -4202,6 +4219,11 @@ impl AppView {
                             s.text_color(theme::control_fg())
                                 .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
                         })
+                        // Web: `Permissions: ${runtimeModeOption.label}.`
+                        .tooltip(tooltip(format!(
+                            "Permissions: {}",
+                            runtime_mode_label(&state.runtime_mode)
+                        )))
                         .on_mouse_down(MouseButton::Left, |_event, window, cx| {
                             ensure_composer_hooks(window, cx);
                             let Some(view) = app_view(window) else {
@@ -4211,7 +4233,13 @@ impl AppView {
                                 this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
                             });
                         })
-                        .child(icon(mode_glyph, 16.).text_color(theme::fg_muted()))
+                        .child(hover_icon(
+                            mode_glyph,
+                            16.,
+                            theme::fg_muted(),
+                            theme::fg(),
+                            "composer-permissions",
+                        ))
                         .child(runtime_mode_label(&state.runtime_mode)),
                 );
             }
@@ -4221,12 +4249,14 @@ impl AppView {
             let overflow_open = state.picker == Some(PickerKind::Overflow);
             controls = controls.child(
                 ghost_icon_button("composer-overflow")
+                    .group("composer-overflow")
                     .when(overflow_open, |s| {
                         s.bg(theme::accent()).text_color(theme::accent_fg())
                     })
                     .when(!overflow_open, |s| {
                         s.hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
                     })
+                    .tooltip(tooltip("More controls"))
                     .on_mouse_down(MouseButton::Left, |_event, window, cx| {
                         ensure_composer_hooks(window, cx);
                         let Some(view) = app_view(window) else {
@@ -4236,7 +4266,13 @@ impl AppView {
                             this.toggle_composer_picker(PickerKind::Overflow, cx)
                         });
                     })
-                    .child(icon(Icon::Ellipsis, 16.).text_color(theme::fg_muted())),
+                    .child(hover_icon(
+                        Icon::Ellipsis,
+                        16.,
+                        theme::fg_muted(),
+                        theme::fg(),
+                        "composer-overflow",
+                    )),
             );
         }
         right = right.child(controls);
@@ -4275,7 +4311,9 @@ impl AppView {
                     .child(format!("{}:{:02}", elapsed / 60, elapsed % 60))
             } else {
                 ghost_icon_button("composer-dictation")
+                    .group("composer-dictation")
                     .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .tooltip(tooltip("Start voice input"))
                     .on_mouse_down(MouseButton::Left, |_event, window, cx| {
                         ensure_composer_hooks(window, cx);
                         let Some(view) = app_view(window) else {
@@ -4283,17 +4321,17 @@ impl AppView {
                         };
                         view.update(cx, |this, cx| this.toggle_dictation(window, cx));
                     })
-                    .child(
-                        icon(
-                            if transcribing {
-                                Icon::LoaderCircle
-                            } else {
-                                Icon::Mic
-                            },
-                            16.,
-                        )
-                        .text_color(theme::fg_muted()),
-                    )
+                    .child(hover_icon(
+                        if transcribing {
+                            Icon::LoaderCircle
+                        } else {
+                            Icon::Mic
+                        },
+                        16.,
+                        theme::fg_muted(),
+                        theme::fg(),
+                        "composer-dictation",
+                    ))
             });
         }
 
@@ -4307,6 +4345,7 @@ impl AppView {
             };
             actions = actions.child(
                 control_chip("composer-runopt")
+                    .group("composer-runopt")
                     .bg(theme::accent_soft())
                     .text_color(theme::fg())
                     .hover(|s| s.bg(theme::accent()))
@@ -4320,12 +4359,13 @@ impl AppView {
                         });
                     })
                     .child(run_label)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(icon(Icon::ChevronDown, 12.).text_color(theme::fg_muted())),
-                    ),
+                    .child(div().flex().items_center().child(hover_icon(
+                        Icon::ChevronDown,
+                        12.,
+                        theme::fg_muted(),
+                        theme::fg(),
+                        "composer-runopt",
+                    ))),
             );
         }
 
@@ -4349,6 +4389,7 @@ impl AppView {
                 .text_sm()
                 .text_color(gpui::white())
                 .hover(|s| s.bg(theme::error()))
+                .tooltip(tooltip("Interrupt"))
                 .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                     let Some(view) = app_view(window) else {
                         return;
@@ -4368,6 +4409,8 @@ impl AppView {
                 .shadow(vec![control_highlight_shadow()])
                 .cursor(gpui::CursorStyle::PointingHand)
                 .text_sm()
+                // Web `submitTooltip` — `submitLabel` rests at "Submit message".
+                .tooltip(tooltip("Submit message"))
                 .when(sendable, |s| {
                     s.bg(theme::primary())
                         .text_color(gpui::white())

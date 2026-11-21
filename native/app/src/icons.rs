@@ -2,7 +2,7 @@
 //! GPUI's `svg()` element which inherits `text_color`, matching lucide's
 //! `stroke="currentColor"`.
 
-use gpui::{Styled, Svg, px, svg};
+use gpui::{Hsla, Styled, Svg, prelude::*, px, svg};
 
 #[allow(dead_code)] // Consumed per-surface as icons land.
 /// Every bundled lucide glyph.
@@ -486,4 +486,27 @@ impl Icon {
 #[allow(dead_code)] // Consumed per-surface as icons land.
 pub fn icon(icon: Icon, size: f32) -> Svg {
     svg().data(icon.data()).w(px(size)).h(px(size))
+}
+
+/// `icon` tinted `base`, recoloring to `hover` while the ancestor hitbox
+/// tagged `.group(group)` is hovered — the web's `hover:[&>svg]` /
+/// `group-hover:` recolor (`SidebarMenuButton` does
+/// `hover:[&>svg]:text-sidebar-foreground`). `Svg::paint` reads its own
+/// `style.text.color`, so a parent's `.hover(text_color)` never reaches the
+/// glyph; `group_hover` refines the svg's own style at paint time instead.
+/// The ancestor must be `Stateful` (`.id(...)`, giving it a hitbox) and
+/// `.group(group)`; group push/pop is scoped to the ancestor's paint, so the
+/// same name may be reused across sibling buttons.
+#[allow(dead_code)] // Consumed per-surface as icons land.
+pub fn hover_icon(
+    glyph: Icon,
+    size: f32,
+    base: impl Into<Hsla>,
+    hover: impl Into<Hsla>,
+    group: &'static str,
+) -> Svg {
+    let hover = hover.into();
+    icon(glyph, size)
+        .text_color(base)
+        .group_hover(group, move |s| s.text_color(hover))
 }

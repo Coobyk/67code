@@ -24,6 +24,7 @@ mod terminal_drawer;
 mod text_field;
 mod theme;
 mod timeline;
+mod tooltip;
 mod vcs;
 mod welcome;
 
@@ -117,6 +118,14 @@ struct AppView {
     search_field: Entity<TextField>,
     commands: Option<std::sync::mpsc::Sender<ClientCommand>>,
     thread_items: Vec<net::TurnItemView>,
+    /// Bounded-snapshot paging (`hasMoreHistory`/`historyCursor` from the
+    /// thread snapshot; `LoadHistory` pages older items above them).
+    has_more_history: bool,
+    history_cursor: Option<String>,
+    /// A history page fetch is in flight (button shows "Loading…").
+    history_loading: bool,
+    /// The last history page fetch failed — show the retry affordance.
+    history_error: bool,
     scroll_handle: ScrollHandle,
     provider: String,
     model: String,
@@ -247,6 +256,10 @@ impl AppView {
             search_field,
             commands,
             thread_items: Vec::new(),
+            has_more_history: false,
+            history_cursor: None,
+            history_loading: false,
+            history_error: false,
             scroll_handle: ScrollHandle::new(),
             provider: config.provider.clone(),
             model: config.model.clone(),
@@ -374,9 +387,53 @@ impl AppView {
             ShellEvent::ThreadRemoved { thread_id, .. } => {
                 self.state.threads.retain(|t| t.id.as_ref() != thread_id);
             }
-            ShellEvent::ThreadSnapshot { items } => {
+            ShellEvent::ThreadSnapshot {
+                items,
+                has_more_history,
+                history_cursor,
+            } => {
                 self.thread_items = items;
+                // A fresh bounded snapshot replaces any paged-in prefix.
+                self.has_more_history = has_more_history;
+                self.history_cursor = history_cursor;
+                self.history_loading = false;
+                self.history_error = false;
                 self.scroll_handle.scroll_to_bottom();
+            }
+            ShellEvent::ThreadHistoryPage {
+                thread_id,
+                items,
+                next_cursor,
+                has_more_history,
+                error,
+            } => {
+                let for_selected = self
+                    .state
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| s.as_ref() == thread_id);
+                if !for_selected {
+                    return;
+                }
+                self.history_loading = false;
+                match error {
+                    Some(_) => self.history_error = true,
+                    None => {
+                        self.history_error = false;
+                        self.has_more_history = has_more_history;
+                        self.history_cursor = next_cursor;
+                        // The page is strictly older than the loaded window —
+                        // prepend, dropping any id already present.
+                        let mut merged: Vec<net::TurnItemView> = items
+                            .into_iter()
+                            .filter(|new| {
+                                !self.thread_items.iter().any(|t| t.id == new.id)
+                            })
+                            .collect();
+                        merged.append(&mut self.thread_items);
+                        self.thread_items = merged;
+                    }
+                }
             }
             ShellEvent::ThreadItemUpdated { item } => {
                 match self.thread_items.iter().position(|i| i.id == item.id) {
@@ -570,6 +627,10 @@ impl AppView {
     fn on_new_thread(&mut self, _action: &NewThread, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.selected = None;
         self.thread_items.clear();
+        self.has_more_history = false;
+        self.history_cursor = None;
+        self.history_loading = false;
+        self.history_error = false;
         self.set_center_view(CenterView::Chat, cx);
     }
 
@@ -776,6 +837,10 @@ impl AppView {
 
     fn select_thread(&mut self, thread_id: SharedString, cx: &mut Context<Self>) {
         self.thread_items.clear();
+        self.has_more_history = false;
+        self.history_cursor = None;
+        self.history_loading = false;
+        self.history_error = false;
         self.turn_started_at = None;
         if let Some(commands) = &self.commands {
             if commands
@@ -789,6 +854,33 @@ impl AppView {
         }
         self.state.selected = Some(thread_id);
         self.set_center_view(CenterView::Chat, cx);
+    }
+
+    /// "Load earlier turns" (`TimelineHistoryControl` → `loadEarlierHistory`):
+    /// fetch the page strictly older than `history_cursor` and prepend it.
+    fn load_earlier_turns(&mut self, _cx: &mut Context<Self>) {
+        if self.history_loading || !self.has_more_history {
+            return;
+        }
+        let (Some(thread_id), Some(cursor)) = (
+            self.state.selected.as_ref().map(|s| s.to_string()),
+            self.history_cursor.clone(),
+        ) else {
+            return;
+        };
+        if let Some(commands) = &self.commands {
+            if commands
+                .send(ClientCommand::LoadHistory {
+                    thread_id,
+                    cursor,
+                })
+                .is_err()
+            {
+                eprintln!("[ui] command channel closed");
+            }
+        }
+        self.history_loading = true;
+        self.history_error = false;
     }
 
     /// Center-column content for the standalone modes: a back-to-chat
@@ -1101,6 +1193,7 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("diff-panel-toggle")
+                                            .group("diff-panel-toggle")
                                             .w_6()
                                             .h_6()
                                             .flex()
@@ -1111,10 +1204,14 @@ impl Render for AppView {
                                             .text_xs()
                                             .text_color(theme::fg_muted())
                                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                                            .child(
-                                                icons::icon(icons::Icon::FileDiff, 14.)
-                                                    .text_color(theme::fg_muted()),
-                                            )
+                                            .tooltip(tooltip::tooltip("Toggle diff viewer"))
+                                            .child(icons::hover_icon(
+                                                icons::Icon::FileDiff,
+                                                14.,
+                                                theme::fg_muted(),
+                                                theme::fg(),
+                                                "diff-panel-toggle",
+                                            ))
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, _w, cx| {
@@ -1132,6 +1229,7 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("thread-panel-toggle")
+                                            .group("thread-panel-toggle")
                                             .w_6()
                                             .h_6()
                                             .flex()
@@ -1142,10 +1240,14 @@ impl Render for AppView {
                                             .text_xs()
                                             .text_color(theme::fg_muted())
                                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                                            .child(
-                                                icons::icon(icons::Icon::SquareMenu, 14.)
-                                                    .text_color(theme::fg_muted()),
-                                            )
+                                            .tooltip(tooltip::tooltip("Toggle thread details"))
+                                            .child(icons::hover_icon(
+                                                icons::Icon::SquareMenu,
+                                                14.,
+                                                theme::fg_muted(),
+                                                theme::fg(),
+                                                "thread-panel-toggle",
+                                            ))
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, _w, cx| {
@@ -1163,6 +1265,7 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("terminal-drawer-toggle")
+                                            .group("terminal-drawer-toggle")
                                             .w_6()
                                             .h_6()
                                             .flex()
@@ -1173,10 +1276,14 @@ impl Render for AppView {
                                             .text_xs()
                                             .text_color(theme::fg_muted())
                                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                                            .child(
-                                                icons::icon(icons::Icon::PanelBottom, 14.)
-                                                    .text_color(theme::fg_muted()),
-                                            )
+                                            .tooltip(tooltip::tooltip("Toggle terminal drawer"))
+                                            .child(icons::hover_icon(
+                                                icons::Icon::PanelBottom,
+                                                14.,
+                                                theme::fg_muted(),
+                                                theme::fg(),
+                                                "terminal-drawer-toggle",
+                                            ))
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, w, cx| {
@@ -1188,6 +1295,7 @@ impl Render for AppView {
                                     .child(
                                         div()
                                             .id("right-panel-toggle")
+                                            .group("right-panel-toggle")
                                             .w_6()
                                             .h_6()
                                             .flex()
@@ -1198,10 +1306,14 @@ impl Render for AppView {
                                             .text_xs()
                                             .text_color(theme::fg_muted())
                                             .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                                            .child(
-                                                icons::icon(icons::Icon::PanelRight, 14.)
-                                                    .text_color(theme::fg_muted()),
-                                            )
+                                            .tooltip(tooltip::tooltip("Toggle right panel"))
+                                            .child(icons::hover_icon(
+                                                icons::Icon::PanelRight,
+                                                14.,
+                                                theme::fg_muted(),
+                                                theme::fg(),
+                                                "right-panel-toggle",
+                                            ))
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(|this, _ev, _w, cx| {

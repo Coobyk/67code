@@ -2,8 +2,8 @@
 //! Owns `impl AppView` sidebar render methods and `sidebar::State`.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use gpui::{
     AnyElement, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, ObjectFit,
@@ -17,11 +17,12 @@ use crate::AppView;
 use crate::CenterView;
 use crate::composer::{Attachment, AttachmentKind};
 use crate::config;
-use crate::icons::{Icon, icon};
+use crate::icons::{Icon, hover_icon, icon};
 use crate::model::{ConnectionStatus, Project, Thread};
 use crate::notifications::{ToastAction, ToastKind};
 use crate::text_field::{PromptSubmitted, TextField};
 use crate::theme;
+use crate::tooltip::tooltip;
 
 /// Sidebar-local UI state. Expand freely — this field lives on `AppView`.
 #[derive(Default)]
@@ -67,6 +68,10 @@ pub struct State {
     pub meta_started: bool,
     /// The collapsed "Settled" shelf is expanded.
     pub settled_open: bool,
+    /// Scratch singleton groups the user collapsed, keyed by thread id.
+    /// Each "No project" thread is its own group (web group model), so
+    /// `Project.expanded` can't express per-thread collapse.
+    pub scratch_collapsed: HashSet<SharedString>,
     /// List-filter toggle: when set, the sidebar lists only threads of this
     /// project (the web's `ListFilter` project-scope button).
     pub project_filter: Option<SharedString>,
@@ -535,6 +540,22 @@ fn project_icon_chip(icon: &Value, project_name: &str) -> Option<AnyElement> {
         }
         _ => None,
     }
+}
+
+/// The sidebar brand aurora — a 2x prerender of the web's `DevBlueprintArt`
+/// SVG under `sidebar-stage-backdrop` masking (see the render comment in
+/// `render_sidebar`). Baked per theme since the web resolves different
+/// `--stage-art-*` pigments and `--stage-fade` for dark vs light.
+fn aurora_image() -> Option<Arc<RenderImage>> {
+    static DARK: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
+    static LIGHT: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
+    let (slot, bytes) = if theme::effective_dark() {
+        (&DARK, &include_bytes!("../assets/aurora-dark.png")[..])
+    } else {
+        (&LIGHT, &include_bytes!("../assets/aurora-light.png")[..])
+    };
+    slot.get_or_init(|| crate::explorer::decode_image(bytes))
+        .clone()
 }
 
 /// 16px image chip for a decoded project favicon — same slot as
@@ -1169,6 +1190,10 @@ impl AppView {
         };
         self.state.selected = None;
         self.thread_items.clear();
+        self.has_more_history = false;
+        self.history_cursor = None;
+        self.history_loading = false;
+        self.history_error = false;
         self.composer.update(cx, |field, cx| {
             field.reset(window, cx);
             field.replace_text_in_range(None, &draft.prompt, window, cx);
@@ -1972,6 +1997,7 @@ impl AppView {
             row = row.child(
                 div()
                     .id(("settle", row_id))
+                    .group("settle-pill")
                     .absolute()
                     .right(px(6.))
                     .top(px(6.))
@@ -1998,7 +2024,13 @@ impl AppView {
                             this.settle_thread(settle_id.clone(), cx);
                         }),
                     )
-                    .child(icon(Icon::Check, 10.).text_color(theme::sidebar_fg_muted()))
+                    .child(hover_icon(
+                        Icon::Check,
+                        10.,
+                        theme::sidebar_fg_muted(),
+                        theme::sidebar_fg(),
+                        "settle-pill",
+                    ))
                     .child("Settle"),
             );
         }
@@ -2816,21 +2848,101 @@ impl AppView {
                         ),
                 );
             }
-            let mut row_id = 0usize;
-            for (pi, project) in projects.iter().enumerate() {
-                let toggle_id = project.id.clone();
-                let new_thread_id = project.id.clone();
-                // Web `SidebarProjectFolderHeader`: collapsed folders surface the
-                // most urgent hidden-thread state as a size-1.5 dot and show the
-                // hidden-thread count (priority attention > failed > unread >
-                // working — `resolveSidebarFolderDot`).
-                let hidden: Vec<&Thread> = self
+            // Web group model: the default sidebar renders every active
+            // thread as its own card headed by its project chip + display
+            // name — each scratch "No project" thread therefore sits under
+            // its own "No project" header. Real projects keep the
+            // one-header-per-project folder shape; the scratch workspace
+            // (server-managed `<base>/scratch`, both servers hardcode it)
+            // splits into one group per live thread to match the web's
+            // group boundaries.
+            let is_scratch = |project: &Project| {
+                project
+                    .path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|base| base == "scratch")
+            };
+            // Web `sortActiveThreadsByOrderKey`: threads carrying an
+            // activeOrderKey sort first by that key, the rest by newest
+            // activity anchor. A section's rank is its freshest member's.
+            let rank = |t: &Thread| match &t.active_order_key {
+                Some(key) => (false, key.to_string(), Reverse(SharedString::from(""))),
+                None => (true, String::new(), Reverse(t.updated_at.clone())),
+            };
+            struct Section {
+                project: Project,
+                threads: Vec<Thread>,
+                /// Scratch singleton: the single thread this group holds —
+                /// its id keys the collapse state (`project.expanded` is
+                /// shared, and the web gives each scratch row its own
+                /// header).
+                singleton: Option<SharedString>,
+            }
+            let mut sections: Vec<Section> = Vec::new();
+            for project in projects.iter() {
+                let mut threads: Vec<Thread> = self
                     .state
                     .threads
                     .iter()
                     .filter(|t| t.project_id == project.id)
                     .filter(|t| live_thread(t))
+                    .cloned()
                     .collect();
+                // Pinned first (ordered by pinOrderKey like the web's
+                // pinned block), then awake threads, snoozed last.
+                threads.sort_by_key(|t| {
+                    (
+                        !t.pinned,
+                        t.pin_order_key.is_none(),
+                        t.pin_order_key.clone().unwrap_or_default(),
+                        self.is_snoozed(t),
+                        Reverse(t.updated_at.clone()),
+                    )
+                });
+                if is_scratch(project) {
+                    for thread in threads {
+                        sections.push(Section {
+                            project: project.clone(),
+                            singleton: Some(thread.id.clone()),
+                            threads: vec![thread],
+                        });
+                    }
+                } else {
+                    sections.push(Section {
+                        project: project.clone(),
+                        threads,
+                        singleton: None,
+                    });
+                }
+            }
+            // Sections interleave by their freshest member like the web's
+            // flat list; empty folders (no live threads) sink to the end in
+            // project order.
+            sections.sort_by_key(|section| {
+                section
+                    .threads
+                    .iter()
+                    .map(&rank)
+                    .min()
+                    .unwrap_or_else(|| (true, String::new(), Reverse("".into())))
+            });
+
+            let mut row_id = 0usize;
+            for (si, section) in sections.iter().enumerate() {
+                let project = &section.project;
+                let expanded = match &section.singleton {
+                    Some(id) => !self.sidebar_state.scratch_collapsed.contains(id.as_ref()),
+                    None => project.expanded,
+                };
+                let toggle_project_id = (!section.singleton.is_some()).then(|| project.id.clone());
+                let toggle_thread_id = section.singleton.clone();
+                let new_thread_id = project.id.clone();
+                // Web `SidebarProjectFolderHeader`: collapsed folders surface the
+                // most urgent hidden-thread state as a size-1.5 dot and show the
+                // hidden-thread count (priority attention > failed > unread >
+                // working — `resolveSidebarFolderDot`).
+                let hidden: Vec<&Thread> = section.threads.iter().collect();
                 // Web `SidebarProjectFolderHeader` right slot: the newest
                 // member thread's relative activity stamp.
                 let header_time = hidden
@@ -2839,7 +2951,7 @@ impl AppView {
                     .max()
                     .map(rel_time_label)
                     .unwrap_or_default();
-                let folder_dot = if project.expanded || hidden.is_empty() {
+                let folder_dot = if expanded || hidden.is_empty() {
                     None
                 } else if hidden
                     .iter()
@@ -2860,13 +2972,13 @@ impl AppView {
                 };
                 // Web `SidebarProjectFolderHeader`: a size-3 muted
                 // ChevronDown rotated -90° while collapsed.
-                let chevron = if project.expanded {
+                let chevron = if expanded {
                     icon(Icon::ChevronDown, 12.)
                 } else {
                     icon(Icon::ChevronRight, 12.)
                 };
                 let header = div()
-                    .id(("project", pi))
+                    .id(("project", si))
                     .group("project-folder")
                     .flex()
                     .items_center()
@@ -2879,10 +2991,28 @@ impl AppView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
-                            if let Some(project) =
-                                this.state.projects.iter_mut().find(|p| p.id == toggle_id)
-                            {
-                                project.expanded = !project.expanded;
+                            match (&toggle_project_id, &toggle_thread_id) {
+                                // Folders toggle `project.expanded`; scratch
+                                // singletons toggle their own collapse bit.
+                                (Some(project_id), None) => {
+                                    if let Some(project) =
+                                        this.state.projects.iter_mut().find(|p| p.id == *project_id)
+                                    {
+                                        project.expanded = !project.expanded;
+                                    }
+                                }
+                                (None, Some(thread_id)) => {
+                                    if !this
+                                        .sidebar_state
+                                        .scratch_collapsed
+                                        .remove(thread_id.as_ref())
+                                    {
+                                        this.sidebar_state
+                                            .scratch_collapsed
+                                            .insert(thread_id.clone());
+                                    }
+                                }
+                                _ => {}
                             }
                             cx.notify();
                         }),
@@ -2922,7 +3052,7 @@ impl AppView {
                                 .child(header_time),
                         )
                     })
-                    .when(!project.expanded && !hidden.is_empty(), |row| {
+                    .when(!expanded && !hidden.is_empty(), |row| {
                         // Web hides the count while the folder is hovered —
                         // the new-thread button appears in its place.
                         row.child(
@@ -2936,7 +3066,7 @@ impl AppView {
                     })
                     .child(
                         div()
-                            .id(("new-thread", pi))
+                            .id(("new-thread", si))
                             .flex_none()
                             .w_6()
                             .h_6()
@@ -2965,52 +3095,35 @@ impl AppView {
                     .child(chevron.flex_none().text_color(theme::sidebar_fg_muted()));
 
                 // Web folders get `mt-2 first:mt-0` breathing room.
-                let mut section = div()
+                let mut section_el = div()
                     .flex()
                     .flex_col()
-                    .when(pi > 0, |s| s.mt_2())
+                    .when(si > 0, |s| s.mt_2())
                     .child(header);
-                if project.expanded {
-                    let mut threads: Vec<Thread> = self
-                        .state
-                        .threads
-                        .iter()
-                        .filter(|t| t.project_id == project.id)
-                        .filter(|t| live_thread(t))
-                        .cloned()
-                        .collect();
-                    // Pinned first (ordered by pinOrderKey like the web's
-                    // pinned block), then awake threads, snoozed last.
-                    threads.sort_by_key(|t| {
-                        (
-                            !t.pinned,
-                            t.pin_order_key.is_none(),
-                            t.pin_order_key.clone().unwrap_or_default(),
-                            self.is_snoozed(t),
-                            Reverse(t.updated_at.clone()),
-                        )
-                    });
+                if expanded {
                     // An expanded empty folder renders nothing on the web —
                     // the header alone is the affordance, so no empty-state
                     // row here.
-                    for thread in threads.iter() {
-                        section =
-                            section.child(self.render_thread_row(thread, row_id, None, true, cx));
+                    for thread in section.threads.iter() {
+                        section_el = section_el
+                            .child(self.render_thread_row(thread, row_id, None, true, cx));
                         row_id += 1;
                     }
                 }
-                list = list.child(section);
+                list = list.child(section_el);
             }
         }
 
         // Web `SidebarHeaderIconButton`: `size-7` ghost icon button on the
-        // sidebar-icon color, `bg-sidebar-row-hover` on hover. GPUI svgs
-        // don't inherit the parent's text color (and Svg has no hover
-        // styling), so the icon carries its own sidebar-icon ink; the web's
-        // `hover:[&>svg]:text-sidebar-foreground` brighten isn't reachable.
-        let header_icon_button = |id: &'static str, leading: Icon| {
+        // sidebar-icon color, `bg-sidebar-row-hover` on hover plus the
+        // `hover:[&>svg]:text-sidebar-foreground` brighten — carried on the
+        // svg via `hover_icon` + the button's `.group(id)` since a parent's
+        // `.hover(text_color)` can't reach the glyph — and the `TooltipPopup`
+        // the web mounts on each trigger.
+        let header_icon_button = |id: &'static str, leading: Icon, tip: &'static str| {
             div()
                 .id(id)
+                .group(id)
                 .flex_none()
                 .w_7()
                 .h_7()
@@ -3020,7 +3133,14 @@ impl AppView {
                 .rounded_md()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::sidebar_hover()))
-                .child(icon(leading, 16.).text_color(theme::sidebar_icon()))
+                .tooltip(tooltip(tip))
+                .child(hover_icon(
+                    leading,
+                    16.,
+                    theme::sidebar_icon(),
+                    theme::sidebar_fg(),
+                    id,
+                ))
         };
         // Project the header "new thread" button targets — the web writes to
         // the current project; the closest native analogue is the selected
@@ -3095,33 +3215,27 @@ impl AppView {
                     cx.notify();
                 }
             }))
-            // Web `SidebarStageBackdrop`: a blue aurora behind the brand
-            // header, fading out ~80px down the sidebar. GPUI has no radial
-            // blur, so it is approximated with layered linear gradients.
-            .child(div().absolute().top_0().left_0().right_0().h(px(88.)).bg(
-                gpui::linear_gradient(
-                    180.,
-                    gpui::linear_color_stop(gpui::hsla(220. / 360., 0.84, 0.60, 0.22), 0.),
-                    gpui::linear_color_stop(gpui::hsla(220. / 360., 0.84, 0.60, 0.0), 1.),
-                ),
-            ))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-24.))
-                    .left(px(-40.))
-                    .w(px(200.))
-                    .h(px(56.))
-                    .rounded_full()
-                    .bg(gpui::linear_gradient(
-                        115.,
-                        gpui::linear_color_stop(gpui::hsla(217. / 360., 0.91, 0.65, 0.35), 0.),
-                        gpui::linear_color_stop(gpui::hsla(240. / 360., 0.75, 0.65, 0.0), 1.),
-                    )),
-            )
+            // Web `SidebarStageBackdrop` (dev "blueprint" variant): the exact
+            // SVG artwork behind the brand header, prerendered offline from
+            // `DevBlueprintArt` + the `sidebar-stage-backdrop` mask/fade
+            // (apps/web) — GPUI has no SVG patterns/gradient transforms, so
+            // the baked PNG is the primitive. Alpha fades into the sidebar
+            // surface like the web's mask + `--stage-fade` overlay.
+            .when_some(aurora_image(), |el, image| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(80.))
+                        .child(img(gpui::ImageSource::Render(image)).size_full()),
+                )
+            })
             .child(
                 // Web `SidebarChromeHeader`: the 52px workspace topbar with the
-                // h-7 brand — 67 wordmark in foreground + "Code" muted.
+                // h-7 brand. With the stage backdrop up the web flips the brand
+                // to `text-white` / `text-white/70` (`onBackdrop`).
                 div()
                     .h(px(theme::TOPBAR_H))
                     .pl_3()
@@ -3136,8 +3250,8 @@ impl AppView {
                             .gap_1()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(div().text_color(theme::sidebar_fg()).child("67"))
-                            .child(div().text_color(theme::sidebar_fg_muted()).child("Code")),
+                            .child(div().text_color(gpui::white()).child("67"))
+                            .child(div().text_color(gpui::rgba(0xffffffb3)).child("Code")),
                     ),
             )
             .child(
@@ -3182,6 +3296,7 @@ impl AppView {
                                 el.child(
                                     div()
                                         .id("clear-search")
+                                        .group("clear-search")
                                         .flex_none()
                                         .w_5()
                                         .h_5()
@@ -3204,28 +3319,33 @@ impl AppView {
                                                 cx.notify();
                                             }),
                                         )
-                                        .child(
-                                            icon(Icon::X, 12.).text_color(theme::sidebar_icon()),
-                                        ),
+                                        .child(hover_icon(
+                                            Icon::X,
+                                            12.,
+                                            theme::sidebar_icon(),
+                                            theme::sidebar_fg(),
+                                            "clear-search",
+                                        )),
                                 )
                             }),
                     )
                     // Web `SidebarThreadHeader` trailing controls, in order:
                     // project list-filter, new project, new thread.
                     .child(
-                        header_icon_button("list-filter", Icon::ListFilter)
-                            .when(self.sidebar_state.project_filter.is_some(), |b| {
-                                b.bg(theme::sidebar_active())
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    cx.stop_propagation();
-                                    this.sidebar_state.project_filter = if this
-                                        .sidebar_state
-                                        .project_filter
-                                        .is_some()
-                                    {
+                        header_icon_button(
+                            "list-filter",
+                            Icon::ListFilter,
+                            "Filter threads by project",
+                        )
+                        .when(self.sidebar_state.project_filter.is_some(), |b| {
+                            b.bg(theme::sidebar_active())
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                cx.stop_propagation();
+                                this.sidebar_state.project_filter =
+                                    if this.sidebar_state.project_filter.is_some() {
                                         None
                                     } else {
                                         this.state
@@ -3239,37 +3359,39 @@ impl AppView {
                                                 this.state.projects.first().map(|p| p.id.clone())
                                             })
                                     };
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        header_icon_button("new-project", Icon::FolderPlus).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, window, cx| {
-                                cx.stop_propagation();
-                                this.sidebar_state.new_project_open =
-                                    !this.sidebar_state.new_project_open;
-                                if this.sidebar_state.new_project_open
-                                    && let Some(field) =
-                                        this.sidebar_state.project_name_field.clone()
-                                {
-                                    let focus = field.read(cx).focus_handle(cx);
-                                    focus.focus(window, cx);
-                                }
                                 cx.notify();
                             }),
                         ),
                     )
-                    .when_some(header_thread_project, |el, project_id| {
-                        el.child(
-                            header_icon_button("new-thread-header", Icon::SquarePen).on_mouse_down(
+                    .child(
+                        header_icon_button("new-project", Icon::FolderPlus, "Add project")
+                            .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
+                                cx.listener(|this, _ev, window, cx| {
                                     cx.stop_propagation();
-                                    this.new_thread(project_id.clone(), cx);
+                                    this.sidebar_state.new_project_open =
+                                        !this.sidebar_state.new_project_open;
+                                    if this.sidebar_state.new_project_open
+                                        && let Some(field) =
+                                            this.sidebar_state.project_name_field.clone()
+                                    {
+                                        let focus = field.read(cx).focus_handle(cx);
+                                        focus.focus(window, cx);
+                                    }
+                                    cx.notify();
                                 }),
                             ),
+                    )
+                    .when_some(header_thread_project, |el, project_id| {
+                        el.child(
+                            header_icon_button("new-thread-header", Icon::SquarePen, "New thread")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.new_thread(project_id.clone(), cx);
+                                    }),
+                                ),
                         )
                     }),
             )
@@ -3402,9 +3524,11 @@ impl AppView {
                     .items_center()
                     .child(
                         // Web `SidebarUtilityItem` — `size="icon"` button
-                        // (size-8) carrying a size-4 lucide glyph.
+                        // (size-8) carrying a size-4 lucide glyph, wrapped in
+                        // the web's `Tooltip`.
                         div()
                             .id("settings-gear")
+                            .group("settings-gear")
                             .flex_none()
                             .w_8()
                             .h_8()
@@ -3415,6 +3539,7 @@ impl AppView {
                             .text_color(theme::sidebar_icon())
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
+                            .tooltip(tooltip("Settings"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _window, cx| {
@@ -3423,11 +3548,18 @@ impl AppView {
                                     cx.notify();
                                 }),
                             )
-                            .child(icon(Icon::Settings, 16.).text_color(theme::sidebar_icon())),
+                            .child(hover_icon(
+                                Icon::Settings,
+                                16.,
+                                theme::sidebar_icon(),
+                                theme::sidebar_fg(),
+                                "settings-gear",
+                            )),
                     )
                     .child(
                         div()
                             .id("pull-requests")
+                            .group("pull-requests")
                             .flex_none()
                             .w_8()
                             .h_8()
@@ -3438,6 +3570,7 @@ impl AppView {
                             .text_color(theme::sidebar_icon())
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
+                            .tooltip(tooltip("Pull requests"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _window, cx| {
@@ -3445,13 +3578,18 @@ impl AppView {
                                     this.set_center_view(CenterView::PullRequests, cx);
                                 }),
                             )
-                            .child(
-                                icon(Icon::GitPullRequest, 16.).text_color(theme::sidebar_icon()),
-                            ),
+                            .child(hover_icon(
+                                Icon::GitPullRequest,
+                                16.,
+                                theme::sidebar_icon(),
+                                theme::sidebar_fg(),
+                                "pull-requests",
+                            )),
                     )
                     .child(
                         div()
                             .id("usage-view")
+                            .group("usage-view")
                             .flex_none()
                             .w_8()
                             .h_8()
@@ -3462,6 +3600,7 @@ impl AppView {
                             .text_color(theme::sidebar_icon())
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::sidebar_fg()).bg(theme::sidebar_hover()))
+                            .tooltip(tooltip("Usage"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _ev, _window, cx| {
@@ -3469,10 +3608,13 @@ impl AppView {
                                     this.set_center_view(CenterView::Usage, cx);
                                 }),
                             )
-                            .child(
-                                icon(Icon::ChartNoAxesColumn, 16.)
-                                    .text_color(theme::sidebar_icon()),
-                            ),
+                            .child(hover_icon(
+                                Icon::ChartNoAxesColumn,
+                                16.,
+                                theme::sidebar_icon(),
+                                theme::sidebar_fg(),
+                                "usage-view",
+                            )),
                     )
                     .child(div().flex_1().min_w_0())
                     .child(
