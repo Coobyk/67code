@@ -96,6 +96,15 @@ pub fn raised() -> Rgba {
 pub fn border() -> Rgba {
     pick(rgba(0xffffff14), rgb(0xe4e4e7))
 }
+/// `border-border/70` — the model picker's pane separators and footer top
+/// edge (`border-l border-border/70`, `border-t border-border/70`).
+pub fn border_70() -> Rgba {
+    pick(rgba(0xffffff0e), rgba(0xe4e4e7b3))
+}
+/// `bg-foreground/10` — icon-button hover/selected fill on the provider rail.
+pub fn fg_10() -> Rgba {
+    pick(rgba(0xf5f5f51a), rgba(0x18181b1a))
+}
 /// `border-border/60` — the web's 60%-border (SettingsGroup card outline).
 /// (`border_soft` already covers the terminal drawer's /80 hairline.)
 pub fn card_border() -> Rgba {
@@ -114,9 +123,25 @@ pub fn card_divider() -> Rgba {
 pub fn input() -> Rgba {
     pick(rgba(0xffffff1c), rgb(0xd4d4d8))
 }
+/// `bg-input/40` — segmented-control track (picker footer speed/permissions).
+pub fn input_40() -> Rgba {
+    pick(rgba(0xffffff0b), rgba(0xd4d4d866))
+}
+/// `bg-input/72` — the checked segment inside an `bg-input/40` track.
+pub fn input_72() -> Rgba {
+    pick(rgba(0xffffff14), rgba(0xd4d4d8b8))
+}
 /// `--muted` (surface). dark white·3% · light zinc-50 #fafafa
 pub fn muted() -> Rgba {
     pick(rgba(0xffffff08), rgb(0xfafafa))
+}
+/// `bg-muted/30` — the model picker's left provider rail.
+pub fn muted_30() -> Rgba {
+    pick(rgba(0xffffff02), rgba(0xfafafa4d))
+}
+/// `bg-muted/40` — the model picker's model/effort panes and footer strip.
+pub fn muted_40() -> Rgba {
+    pick(rgba(0xffffff03), rgba(0xfafafa66))
 }
 /// `--muted-foreground`. dark neutral-400 #a3a3a3 · light zinc-500 #71717a
 pub fn fg_muted() -> Rgba {
@@ -126,6 +151,10 @@ pub fn fg_muted() -> Rgba {
 /// descriptions, thread-row timestamps).
 pub fn fg_muted_soft() -> Rgba {
     pick(rgba(0xa3a3a3b3), rgba(0x71717ab3))
+}
+/// `text-muted-foreground/55` — the model picker's search-glass icon.
+pub fn fg_muted_55() -> Rgba {
+    pick(rgba(0xa3a3a38c), rgba(0x71717a8c))
 }
 /// `--placeholder` = muted-foreground.
 pub fn placeholder() -> Rgba {

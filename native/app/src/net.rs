@@ -255,6 +255,7 @@ fn parse_thread(v: &Value) -> ShellThread {
             })
             .unwrap_or_default(),
         pinned: v["pinned"].as_bool() == Some(true)
+            || !v["pinnedAt"].is_null()
             || !v["pinnedOrderKey"].is_null()
             || !v["orderKey"].is_null(),
         updated_at: v["updatedAt"].as_str().unwrap_or_default().to_string(),

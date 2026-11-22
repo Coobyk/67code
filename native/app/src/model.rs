@@ -16,6 +16,11 @@ pub struct Project {
     pub id: SharedString,
     pub name: SharedString,
     pub path: SharedString,
+    /// Retained for the sidebar's flat card list — project rows are
+    /// always expanded there (sidebar.rs constructs every `Project`
+    /// with `expanded: true`), but per-project collapse isn't
+    /// implemented; nothing reads this yet.
+    #[allow(dead_code)]
     pub expanded: bool,
 }
 

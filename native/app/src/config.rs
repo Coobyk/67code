@@ -140,6 +140,110 @@ pub struct ClientConfig {
     /// ("locale" | "12-hour" | "24-hour"; empty = locale default).
     #[serde(default)]
     pub timestamp_format: String,
+    /// Chat "Send shortcut" — the web's `ClientSettings.sendShortcut`
+    /// ("enter" | "mod-enter-multiline" | "mod-enter"; default "enter").
+    #[serde(default = "send_shortcut")]
+    pub send_shortcut: String,
+    /// Chat "Rich text composer" — `ClientSettings.composerRichTextEnabled`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub composer_rich_text: bool,
+    /// Chat "Skills in slash menu" — `ClientSettings.showSkillsInSlashMenu`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub show_skills_in_slash_menu: bool,
+    /// Chat "Follow-up behavior" — `ClientSettings.followUpBehavior`
+    /// ("queue" | "steer"; default "queue").
+    #[serde(default = "follow_up_behavior")]
+    pub follow_up_behavior: String,
+    /// Activity "Tool calls in chat" — `ClientSettings.toolCallVisibility`
+    /// ("showAll" | "hideSuccessful" | "hideAll" | "zen"; default "showAll").
+    #[serde(default = "tool_call_visibility")]
+    pub tool_call_visibility: String,
+    /// Activity "Screen reader announcements" —
+    /// `ClientSettings.screenReaderAnnouncements`
+    /// ("status" | "messages" | "everything"; default "status").
+    #[serde(default = "screen_reader_announcements")]
+    pub screen_reader_announcements: String,
+    /// Diffs "Diff colors" — `ClientSettings.diffColorScheme`
+    /// ("red-green" | "blue-orange"; default "red-green").
+    #[serde(default = "diff_color_scheme")]
+    pub diff_color_scheme: String,
+    /// Diffs "Open pull request links in T3 Code" —
+    /// `ClientSettings.pullRequestLinksOpenInApp` (default true).
+    #[serde(default = "default_true")]
+    pub pull_request_links_open_in_app: bool,
+    /// Voice "Dictation shortcut" — `ClientSettings.voiceShortcutMode`
+    /// ("auto" | "hold" | "toggle"; default "auto").
+    #[serde(default = "voice_shortcut_mode")]
+    pub voice_shortcut_mode: String,
+    /// Voice "Language" — `ClientSettings.speechLanguage` ("" / "auto" =
+    /// auto-detect; BCP-47 code otherwise).
+    #[serde(default = "speech_language")]
+    pub speech_language: String,
+    /// Voice "Translate to English" — `ClientSettings.speechTranslateToEnglish`.
+    #[serde(default)]
+    pub speech_translate_to_english: bool,
+    /// Voice "Silence filtering" — `ClientSettings.speechSilenceFiltering`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub speech_silence_filtering: bool,
+    /// Voice "Remove filler words" — `ClientSettings.speechRemoveFillerWords`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub speech_remove_filler_words: bool,
+    /// Voice "Dictionary" — `ClientSettings.speechCustomWords`, comma-separated.
+    #[serde(default)]
+    pub speech_custom_words: String,
+    /// Voice "Correction cue" — `ClientSettings.speechCorrectionWord`.
+    #[serde(default)]
+    pub speech_correction_word: String,
+    /// SnapShots "SnapShots" — `ClientSettings.snapShotEnabled`.
+    #[serde(default)]
+    pub snap_shot_enabled: bool,
+    /// SnapShots "Include accessibility text" —
+    /// `ClientSettings.snapShotIncludeAccessibility` (default true).
+    #[serde(default = "default_true")]
+    pub snap_shot_include_accessibility: bool,
+    /// SnapShots "Capture shortcut" — `ClientSettings.snapShotShortcut`
+    /// reduced to a label string ("" = platform default).
+    #[serde(default = "snap_shot_shortcut")]
+    pub snap_shot_shortcut: String,
+    /// SnapShots "Play sound" — `ClientSettings.snapShotPlaySound`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub snap_shot_play_sound: bool,
+    /// SnapShots "Capture sound" — `ClientSettings.snapShotSound`
+    /// ("soft-pop" | "camera-shutter"; default "soft-pop").
+    #[serde(default = "snap_shot_sound")]
+    pub snap_shot_sound: String,
+    /// SnapShots "Flash" — `ClientSettings.snapShotFlash` (default true).
+    #[serde(default = "default_true")]
+    pub snap_shot_flash: bool,
+    /// SnapShots "Animations" — `ClientSettings.snapShotAnimations`
+    /// (default true).
+    #[serde(default = "default_true")]
+    pub snap_shot_animations: bool,
+    /// Browser "Open links" — `ClientSettings.browserLinkTarget`
+    /// ("system" | "app"; default "system" — the native client has no embedded
+    /// browser, so links always open in the system browser either way).
+    #[serde(default = "browser_link_target")]
+    pub browser_link_target: String,
+    /// Browser "Search engine" — `ClientSettings.browserSearchEngine`
+    /// (default "duckduckgo" upstream; "" = default).
+    #[serde(default = "browser_search_engine")]
+    pub browser_search_engine: String,
+    /// Browser "Show floating preview" —
+    /// `ClientSettings.browserAutoShowFloatingPreview` (default true).
+    #[serde(default = "default_true")]
+    pub browser_auto_show_floating_preview: bool,
+    /// Labs "Boring sidebar" — `ClientSettings.boringSidebarEnabled`.
+    #[serde(default)]
+    pub boring_sidebar: bool,
+    /// Labs "Two-line thread rows" —
+    /// `ClientSettings.boringSidebarMultilineRows`.
+    #[serde(default)]
+    pub boring_sidebar_multiline: bool,
 }
 
 fn default_in_app_notifications() -> bool {
@@ -152,6 +256,40 @@ fn default_project_sort_order() -> String {
 
 fn default_diff_layout() -> String {
     "stacked".to_string()
+}
+
+fn send_shortcut() -> String {
+    "enter".to_string()
+}
+fn follow_up_behavior() -> String {
+    "queue".to_string()
+}
+fn tool_call_visibility() -> String {
+    "showAll".to_string()
+}
+fn screen_reader_announcements() -> String {
+    "status".to_string()
+}
+fn diff_color_scheme() -> String {
+    "red-green".to_string()
+}
+fn voice_shortcut_mode() -> String {
+    "auto".to_string()
+}
+fn speech_language() -> String {
+    "auto".to_string()
+}
+fn snap_shot_shortcut() -> String {
+    "both-shift-keys".to_string()
+}
+fn snap_shot_sound() -> String {
+    "soft-pop".to_string()
+}
+fn browser_link_target() -> String {
+    "system".to_string()
+}
+fn browser_search_engine() -> String {
+    "duckduckgo".to_string()
 }
 
 fn default_true() -> bool {
