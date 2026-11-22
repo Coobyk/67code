@@ -124,6 +124,57 @@ pub struct State {
     signin_detail: Option<String>,
 }
 
+impl State {
+    /// `(local, remote, remote_seen)` snapshot for surfaces outside this
+    /// pane — the thread-details card renders the same live values.
+    pub(crate) fn card_status(&self) -> (Option<&Value>, Option<&Value>, bool) {
+        (
+            self.status_local.as_ref(),
+            self.status_remote.as_ref(),
+            self.remote_seen,
+        )
+    }
+
+    /// Whether the inline branch picker is open.
+    pub(crate) fn picker_open(&self) -> bool {
+        self.picker_open
+    }
+}
+
+/// Dispatch flavor of the details-card Git row — web `GitQuickAction.kind`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuickActionKind {
+    /// `git.runStackedAction` with `action`.
+    Stacked,
+    /// `vcs.pull` (ff-only).
+    Pull,
+    /// `vcs.init` — "Initialize Git".
+    Init,
+    /// Disabled state — the web shows a tooltip; native shows a toast.
+    Hint,
+}
+
+/// Resolved details-card Git row (web `GitQuickAction`): label, leading
+/// icon and what a click should dispatch.
+pub(crate) struct QuickAction {
+    pub label: String,
+    pub icon: Icon,
+    pub kind: QuickActionKind,
+    /// `GitStackedAction` payload value when `kind == Stacked`.
+    pub action: String,
+}
+
+impl QuickAction {
+    fn run(label: &str, icon: Icon, action: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            icon,
+            kind: QuickActionKind::Stacked,
+            action: action.to_string(),
+        }
+    }
+}
+
 /// Stable row/expansion key for a list entry.
 fn pr_key(entry: &Value) -> String {
     format!(
@@ -246,7 +297,8 @@ fn summarize_checks(checks: &[Value]) -> String {
 /// Readable message out of a Failure `Exit` frame. Tagged server errors put
 /// their text in `requirement` (PullRequestUnavailableError), `detail`
 /// (PullRequestOperationError/GitCommandError) or `message` (RpcClientError).
-fn failure_message(exit: &Value) -> String {
+/// `pub(crate)` — the details card reuses it for `shell.openInEditor`.
+pub(crate) fn failure_message(exit: &Value) -> String {
     let error = &exit["cause"]["error"];
     for key in ["requirement", "detail", "message"] {
         if let Some(s) = error[key].as_str().filter(|s| !s.is_empty()) {
@@ -359,8 +411,9 @@ fn centered_message(title: &str, detail: &str) -> Div {
 
 impl AppView {
     /// `(project_id, workspace_root)` of the selected thread's project —
-    /// the scope every RPC in this pane carries.
-    fn pr_scope(&self) -> Option<(String, String)> {
+    /// the scope every RPC in this pane carries. `pub(crate)` — the
+    /// details card uses the same scope for scripts and `shell.openInEditor`.
+    pub(crate) fn pr_scope(&self) -> Option<(String, String)> {
         let thread = self.state.selected_thread()?;
         let project = self
             .state
@@ -368,6 +421,30 @@ impl AppView {
             .iter()
             .find(|p| p.id == thread.project_id)?;
         Some((project.id.to_string(), project.path.to_string()))
+    }
+
+    /// Scope-change check shared by `render_prs_pane` and the thread-details
+    /// card — schedules the deferred resync exactly once per scope change.
+    pub(crate) fn vcs_maybe_sync(&self, cx: &mut Context<Self>) {
+        let scope_id = self.pr_scope().map(|(id, _)| id);
+        if self.vcs_state.scope.borrow().as_deref() != scope_id.as_deref()
+            && !self.vcs_state.sync_scheduled.replace(true)
+        {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| this.vcs_sync_scope(cx));
+            })
+            .detach();
+        }
+    }
+
+    /// Toggle the inline branch picker (loads refs on open). Shared between
+    /// the Pull-requests status card and the details card's branch row.
+    pub(crate) fn vcs_toggle_picker(&mut self, cx: &mut Context<Self>) {
+        self.vcs_state.picker_open = !self.vcs_state.picker_open;
+        if self.vcs_state.picker_open {
+            self.vcs_load_refs(cx);
+        }
+        cx.notify();
     }
 
     /// Re-key the pane to the selected thread's project: tear down old
@@ -638,6 +715,209 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Web `resolveQuickAction` (GitActionsControl.logic.ts): the single
+    /// primary git affordance the details card shows — Commit / Push / Pull /
+    /// Create PR — resolved from the live `subscribeVcsStatus` snapshot.
+    pub(crate) fn git_quick_action(&self) -> QuickAction {
+        let busy = self.vcs_state.pull_pending || self.vcs_state.init_pending;
+        let (local, remote, remote_seen) = self.vcs_state.card_status();
+        let merged_remote = |key: &str| -> Option<&Value> {
+            remote.and_then(|r| r.get(key)).or_else(|| {
+                // `vcs.refreshStatus` results arrive merged — remote-shaped
+                // keys also live on the local payload then.
+                local.and_then(|l| l.get(key))
+            })
+        };
+        let has_upstream = merged_remote("hasUpstream").and_then(Value::as_bool);
+        let ahead = merged_remote("aheadCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let behind = merged_remote("behindCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let ahead_of_default = merged_remote("aheadOfDefaultCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(ahead);
+        let has_open_pr =
+            merged_remote("pr").and_then(|p| p["state"].as_str()) == Some("open");
+        let disabled = |label: &str| QuickAction {
+            label: label.to_string(),
+            icon: Icon::GitCommitHorizontal,
+            kind: QuickActionKind::Hint,
+            action: String::new(),
+        };
+        if busy {
+            return disabled("Commit");
+        }
+        let Some(local) = local else {
+            return disabled("Commit");
+        };
+        if local["isRepo"].as_bool() != Some(true) {
+            return QuickAction {
+                label: "Initialize Git".to_string(),
+                icon: Icon::GitBranch,
+                kind: QuickActionKind::Init,
+                action: String::new(),
+            };
+        }
+        let ref_name = local["refName"].as_str();
+        let has_branch = ref_name.is_some_and(|n| !n.is_empty());
+        let has_changes = local["hasWorkingTreeChanges"].as_bool() == Some(true);
+        let is_default_ref = local["isDefaultRef"].as_bool() == Some(true);
+        let has_remote = local["hasPrimaryRemote"].as_bool() != Some(false);
+        if !has_branch {
+            return disabled("Commit");
+        }
+        // Remote status not seen yet — the web defaults `hasUpstream`
+        // optimistically; do the same so the row settles when data lands.
+        let upstream = has_upstream.unwrap_or(!remote_seen);
+        if has_changes {
+            if behind > 0 || (!upstream && !has_remote) {
+                return QuickAction::run("Commit", Icon::GitCommitHorizontal, "commit");
+            }
+            if has_open_pr || is_default_ref {
+                return QuickAction::run("Commit & push", Icon::GitCommitHorizontal, "commit_push");
+            }
+            return QuickAction::run(
+                "Commit, push & PR",
+                Icon::GitPullRequest,
+                "commit_push_pr",
+            );
+        }
+        if !upstream {
+            if !has_remote {
+                return disabled("Publish repository");
+            }
+            if ahead <= 0 {
+                return if has_open_pr {
+                    disabled("Commit")
+                } else {
+                    disabled("Push")
+                };
+            }
+            if has_open_pr || is_default_ref {
+                return QuickAction::run("Push", Icon::CloudUpload, "push");
+            }
+            return QuickAction::run("Push & create PR", Icon::GitPullRequest, "create_pr");
+        }
+        if ahead > 0 && behind > 0 {
+            return disabled("Sync ref");
+        }
+        if behind > 0 {
+            return QuickAction {
+                label: "Pull".to_string(),
+                icon: Icon::CloudDownload,
+                kind: QuickActionKind::Pull,
+                action: String::new(),
+            };
+        }
+        if ahead > 0 {
+            if has_open_pr || is_default_ref {
+                return QuickAction::run("Push", Icon::CloudUpload, "push");
+            }
+            return QuickAction::run("Push & create PR", Icon::GitPullRequest, "create_pr");
+        }
+        if ahead_of_default > 0 && !is_default_ref {
+            return QuickAction::run("Create PR", Icon::GitPullRequest, "create_pr");
+        }
+        disabled("Commit")
+    }
+
+    /// Port of the web `resolveChangesTotals` — branchChanges wins when
+    /// nonzero, else workingTree, else whichever exists. Returns
+    /// `(insertions, deletions, base_ref)` — `base_ref` None = uncommitted
+    /// vs HEAD.
+    pub(crate) fn git_changes_totals(&self) -> (i64, i64, Option<String>) {
+        let (local, _remote, _seen) = self.vcs_state.card_status();
+        let Some(local) = local else {
+            return (0, 0, None);
+        };
+        let branch = &local["branchChanges"];
+        let tree = &local["workingTree"];
+        let num = |v: &Value, key: &str| v[key].as_i64().unwrap_or(0);
+        let (b_ins, b_del) = (num(branch, "insertions"), num(branch, "deletions"));
+        let (t_ins, t_del) = (num(tree, "insertions"), num(tree, "deletions"));
+        if b_ins > 0 || b_del > 0 {
+            (
+                b_ins,
+                b_del,
+                branch["baseRef"].as_str().map(str::to_string),
+            )
+        } else if t_ins > 0 || t_del > 0 {
+            (t_ins, t_del, None)
+        } else if !branch.is_null() {
+            (
+                b_ins,
+                b_del,
+                branch["baseRef"].as_str().map(str::to_string),
+            )
+        } else {
+            (t_ins, t_del, None)
+        }
+    }
+
+    /// Details-card Git row click — dispatch the resolved quick action.
+    /// `commit`/`push`/`create_pr`/`commit_push`/`commit_push_pr` go through
+    /// `git.runStackedAction`; `Pull` reuses `vcs.pull`; `Hint` surfaces the
+    /// web's tooltip text as an info toast.
+    pub(crate) fn vcs_run_quick_action(&mut self, quick: &QuickAction, cx: &mut Context<Self>) {
+        match quick.kind {
+            QuickActionKind::Pull => self.vcs_pull(cx),
+            QuickActionKind::Init => self.vcs_init(cx),
+            QuickActionKind::Hint => {
+                self.push_toast(
+                    ToastKind::Info,
+                    quick.label.clone(),
+                    Some("No action needed right now.".to_string()),
+                    None,
+                    cx,
+                );
+            }
+            QuickActionKind::Stacked => {
+                let Some((_pid, cwd)) = self.pr_scope() else {
+                    return;
+                };
+                let payload = json!({
+                    "actionId": format!("card-{}", self.vcs_state.generation),
+                    "cwd": cwd,
+                    "action": quick.action,
+                    "threadId": self.state.selected,
+                    "projectId": _pid,
+                });
+                let Some(rx) = self.send_query("git.runStackedAction", payload) else {
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let exit = rx
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+                    let _ = this.update(cx, |this, cx| {
+                        if exit["_tag"].as_str() == Some("Success") {
+                            this.push_toast(
+                                ToastKind::Success,
+                                "Git action finished".to_string(),
+                                None,
+                                None,
+                                cx,
+                            );
+                        } else {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Git action failed".to_string(),
+                                Some(failure_message(&exit)),
+                                None,
+                                cx,
+                            );
+                        }
+                        this.vcs_refresh_status(cx);
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     /// `vcs.init` — `git init` in the project root ("Not a git repository").
@@ -1400,16 +1680,7 @@ impl AppView {
     }
 
     pub(crate) fn render_prs_pane(&self, cx: &mut Context<Self>) -> Div {
-        // Scope changed → schedule one resync (deferred: render runs &self).
-        let scope_id = self.pr_scope().map(|(id, _)| id);
-        if self.vcs_state.scope.borrow().as_deref() != scope_id.as_deref()
-            && !self.vcs_state.sync_scheduled.replace(true)
-        {
-            cx.spawn(async move |this, cx| {
-                let _ = this.update(cx, |this, cx| this.vcs_sync_scope(cx));
-            })
-            .detach();
-        }
+        self.vcs_maybe_sync(cx);
 
         if self.state.selected.is_none() || self.state.selected_thread().is_none() {
             return centered_message(
@@ -1662,8 +1933,9 @@ impl AppView {
         card.child(actions)
     }
 
-    /// Inline branch picker under the status card.
-    fn render_branch_picker(&self, cx: &mut Context<Self>) -> Div {
+    /// Inline branch picker under the status card. `pub(crate)` so the
+    /// thread-details card's branch row can expand the same picker.
+    pub(crate) fn render_branch_picker(&self, cx: &mut Context<Self>) -> Div {
         let s = &self.vcs_state;
         let mut picker = div()
             .mx_2()

@@ -7,11 +7,18 @@
 //! and offers "Open in browser" via `xdg-open`. There is no embedded
 //! webview — the GPUI client doesn't pretend to render pages.
 
-use gpui::{Context, Div, MouseButton, ScrollHandle, div, point, prelude::*, px};
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AnyElement, Context, Div, FontWeight, MouseButton, ScrollHandle, SharedString, div, point,
+    prelude::*, px,
+};
 use serde_json::{Value, json};
 
 use crate::AppView;
+use crate::CenterView;
 use crate::icons::{Icon, icon};
+use crate::model::ConnectionStatus;
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -42,6 +49,33 @@ pub struct PreviewSession {
     pub runtime: Option<String>,
 }
 
+/// `server.getConfig` slice the thread-details card needs, plus the
+/// expansion flags for its inline pickers (workspace, open-in). The card
+/// itself is the web's `ThreadDetailsCard` — an absolute `dropdown-glass`
+/// panel at the chat canvas' top-right (`right: 12`, `top: 12`, 280px
+/// wide, `THREAD_DETAILS_CARD_GAP`).
+#[derive(Default)]
+pub struct DetailsState {
+    /// `environment.label` ("ferrum" in the web screenshot).
+    pub environment_label: Option<String>,
+    /// `environment.environmentId` — `shell.openInEditor` needs it?
+    /// (kept for parity with the web's environmentId prop).
+    pub environment_id: Option<String>,
+    /// `availableEditors` — EditorId list; empty means the server has no
+    /// editor detection and the open-in row renders disabled.
+    pub editors: Vec<String>,
+    /// `settings` — `defaultProjectScripts` + per-project overrides feed
+    /// the scripts rows (web `resolveProjectScripts`).
+    pub settings: Option<Value>,
+    /// Last successful config fetch (~5 min cadence, like the composer).
+    pub config_fetched_at: Option<Instant>,
+    pub config_loading: bool,
+    /// Workspace row expanded → saved-environments list.
+    pub env_expanded: bool,
+    /// Open-in row expanded → editor list.
+    pub editor_expanded: bool,
+}
+
 /// `preview.list` state for the Browser tab.
 #[derive(Default)]
 pub struct BrowserState {
@@ -70,6 +104,8 @@ pub struct State {
     /// each render (the Window itself is on the update stack mid-render,
     /// so render can't read `viewport_size` directly). 0 = unmeasured.
     pub viewport_w: f32,
+    /// Thread-details card (floating, canvas top-right).
+    pub details: DetailsState,
 }
 
 /// Web `RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY` = `(max-width: 980px)`
@@ -127,7 +163,11 @@ impl AppView {
             }
         });
         let Some(tab) = self.panel_state.tab else {
-            return div();
+            // Panel closed → zero-size positioned anchor at the canvas'
+            // top-right corner; it still carries the floating details
+            // card (absolute children anchor to the nearest positioned
+            // parent and aren't clipped to its bounds).
+            return div().relative().child(self.render_details_card(cx));
         };
         // Below the web's 980px inline-layout breakpoint the panel hides
         // (the web renders a floating sheet there — see narrow.png at
@@ -135,7 +175,7 @@ impl AppView {
         if self.panel_state.viewport_w > 0.
             && self.panel_state.viewport_w <= INLINE_PANEL_BREAKPOINT
         {
-            return div();
+            return div().relative().child(self.render_details_card(cx));
         }
         let body = match tab {
             Tab::Files => self.render_explorer_pane(cx).into_any_element(),
@@ -151,12 +191,15 @@ impl AppView {
         // buttons — the same behaviour the web's RightPanelTabs implements
         // (`hasOverflow` → ChevronLeft/ChevronRight icon-xs buttons).
         div()
+            .relative()
             // w + max_w: content min-width (long tree names etc.) would
             // otherwise stretch the item past 280 despite flex_none.
+            // (`overflow_x_hidden` sits on the body wrap instead — the
+            // floating details card escapes the left edge when the panel
+            // is open and must not be clipped.)
             .w(px(theme::DETAILS_PANEL_W))
             .max_w(px(theme::DETAILS_PANEL_W))
             .min_w_0()
-            .overflow_x_hidden()
             .flex_none()
             .h_full()
             .border_l_1()
@@ -165,7 +208,17 @@ impl AppView {
             .flex()
             .flex_col()
             .child(self.render_panel_tab_bar(cx))
-            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_x_hidden()
+                    .child(body),
+            )
+            .child(self.render_details_card(cx))
     }
 
     /// Web `RightPanelTabs`: the strip sits at `--workspace-topbar-height`
@@ -577,5 +630,577 @@ impl AppView {
             list = list.child(row);
         }
         pane.child(list)
+    }
+
+    // ------------------------------------------------------------------
+    // Thread details card — web `ThreadDetailsCard`/`ThreadDetailsPanel`
+    // ------------------------------------------------------------------
+    //
+    // The web card is `absolute z-20` at the chat canvas' top-right:
+    // `right: THREAD_DETAILS_CARD_GAP (12)`, `top: 12`, width 280,
+    // `rounded-2xl dropdown-glass` (popover @92% + contrast-fg/10 hairline).
+    // `resolveThreadDetailsCardLayout` hides it when the lane would shrink
+    // below `minChatWidth` 640 (plus `DETAILS_CARD_CLEARANCE` 32 and lane
+    // padding ~24): canvas ≥ 988.
+    //
+    // Rows (threadDetailsPanelStyles): h-8 rounded-lg controls, gap-2.5
+    // px-2.5 content, 13px medium text-foreground/80 labels, size-4
+    // muted icons and chevrons, `hover:bg-white/[0.08]` (dark) =
+    // `theme::hover()`.
+
+    /// The card needs at least this much canvas width (see layout notes).
+    const DETAILS_CARD_MIN_CANVAS_W: f32 = 988.0;
+    /// Chat sidebar column width (`sidebar.rs` root `.w(px(256.))`).
+    const SIDEBAR_W: f32 = 256.0;
+    /// Refetch `server.getConfig` after 5 min — matches the composer's
+    /// provider-config cadence.
+    const DETAILS_CONFIG_TTL: Duration = Duration::from_secs(300);
+
+    /// Deferred reconcile (render is `&self`): fetch `server.getConfig`
+    /// when the cached slice is missing or stale.
+    fn details_maybe_sync(&self, cx: &mut Context<Self>) {
+        let connected = matches!(self.state.connection, ConnectionStatus::Connected);
+        if !connected {
+            return;
+        }
+        let d = &self.panel_state.details;
+        let stale = d
+            .config_fetched_at
+            .map(|t| t.elapsed() > Self::DETAILS_CONFIG_TTL)
+            .unwrap_or(true);
+        if !stale || d.config_loading {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this, cx| this.details_fetch(cx));
+        })
+        .detach();
+    }
+
+    fn details_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.panel_state.details.config_loading {
+            return;
+        }
+        let Some(rx) = self.send_query("server.getConfig", json!({})) else {
+            return;
+        };
+        self.panel_state.details.config_loading = true;
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                let d = &mut this.panel_state.details;
+                d.config_loading = false;
+                if exit["_tag"].as_str() == Some("Success") {
+                    let env = &exit["value"]["environment"];
+                    d.environment_label = env["label"].as_str().map(str::to_string);
+                    d.environment_id = env["environmentId"].as_str().map(str::to_string);
+                    d.editors = exit["value"]["availableEditors"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    d.settings = Some(exit["value"]["settings"].clone());
+                    d.config_fetched_at = Some(Instant::now());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Port of `resolveProjectScripts` (packages/shared/projectScripts.ts)
+    /// minus `project.scripts` — the native shell stream doesn't carry a
+    /// per-project scripts field, so defaults and settings overrides are
+    /// the honest sources.
+    fn details_scripts(&self) -> Vec<Value> {
+        let Some(settings) = &self.panel_state.details.settings else {
+            return Vec::new();
+        };
+        let project_id = self.pr_scope().map(|(id, _)| id);
+        let defaults = settings["defaultProjectScripts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(pid) = project_id.as_ref() {
+            if let Some(over) =
+                settings["projectSettingsOverrides"][pid]["defaultProjectScripts"].as_array()
+            {
+                return over.clone();
+            }
+        }
+        if settings["projectSettingsFolded"].as_bool() == Some(true) {
+            return defaults;
+        }
+        if let Some(pid) = project_id.as_ref() {
+            let legacy = &settings["projectScriptOverrides"][pid];
+            if legacy.is_null() {
+                return defaults;
+            }
+            if let Some(list) = legacy.as_array() {
+                return list.clone();
+            }
+        }
+        defaults
+    }
+
+    /// `shell.openInEditor` — real editors only; the row is disabled when
+    /// `availableEditors` is empty so nothing claims support the server
+    /// doesn't have.
+    fn details_open_editor(&mut self, editor: String, cx: &mut Context<Self>) {
+        let Some((_pid, cwd)) = self.pr_scope() else {
+            return;
+        };
+        let Some(rx) = self.send_query(
+            "shell.openInEditor",
+            json!({ "cwd": cwd, "editor": editor }),
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let exit = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| json!({"_tag": "Failure"}));
+            let _ = this.update(cx, |this, cx| {
+                if exit["_tag"].as_str() != Some("Success") {
+                    this.push_toast(
+                        crate::notifications::ToastKind::Error,
+                        "Couldn't open editor".to_string(),
+                        Some(crate::vcs::failure_message(&exit)),
+                        None,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The floating card itself. Lives on the panel anchor (a zero-size
+    /// flex item at the canvas' top-right when the tabbed panel is closed)
+    /// so no lib.rs changes are needed; `right` adds the panel width when
+    /// the column is open.
+    pub(crate) fn render_details_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.details_maybe_sync(cx);
+        self.vcs_maybe_sync(cx);
+        if self.center_view != CenterView::Chat {
+            return div().into_any_element();
+        }
+        let panel_open = self.panel_state.tab.is_some()
+            && !(self.panel_state.viewport_w > 0.
+                && self.panel_state.viewport_w <= INLINE_PANEL_BREAKPOINT);
+        // `resolveThreadDetailsCardLayout` → null when the remaining lane
+        // drops under `minChatWidth`; mirror the arithmetic.
+        if self.panel_state.viewport_w > 0. {
+            let canvas_w = self.panel_state.viewport_w
+                - Self::SIDEBAR_W
+                - if panel_open { theme::DETAILS_PANEL_W } else { 0. };
+            if canvas_w < Self::DETAILS_CARD_MIN_CANVAS_W {
+                return div().into_any_element();
+            }
+        }
+        let connected = matches!(self.state.connection, ConnectionStatus::Connected);
+        if !connected || self.state.selected.is_none() {
+            return div().into_any_element();
+        }
+
+        // Row factory: web THREAD_DETAILS_PANEL_ROW_CLASS. Generic
+        // `on_click` so rows can capture context (script commands capture
+        // the command string).
+        fn row(
+            id: &'static str,
+            row_icon: Icon,
+            label: SharedString,
+            chevron: Option<Icon>,
+            disabled: bool,
+            cx: &mut Context<AppView>,
+            on_click: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,
+            trailing: Option<AnyElement>,
+        ) -> impl IntoElement {
+            div()
+                .id(id)
+                .h(px(32.))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .rounded(theme::radius::LG)
+                .when(!disabled, |s| s.cursor_pointer())
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if disabled {
+                    theme::fg_muted()
+                } else {
+                    theme::control_fg()
+                })
+                .when(!disabled, |s| {
+                    s.hover(|h| h.bg(theme::hover())).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _w, cx| on_click(this, cx)),
+                    )
+                })
+                .child(
+                    icon(row_icon, 16.)
+                        .flex_none()
+                        .text_color(theme::fg_muted()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .child(label),
+                )
+                .when_some(trailing, |el, t| el.child(t))
+                .when_some(chevron, |el, c| {
+                    el.child(icon(c, 16.).flex_none().text_color(theme::fg_muted()))
+                })
+        }
+
+        let mut card = div()
+            .id("thread-details-card")
+            .w(px(theme::DETAILS_PANEL_W))
+            .flex()
+            .flex_col()
+            .rounded(theme::radius::XL2)
+            .border_1()
+            .border_color(theme::popover_border())
+            .bg(theme::popover_92())
+            .shadow_lg()
+            .p_1()
+            .overflow_hidden();
+
+        // ── Workspace section: environment row, open-in row, scripts ──
+        let env_label = self
+            .panel_state
+            .details
+            .environment_label
+            .clone()
+            .unwrap_or_else(|| self.endpoint_label.clone());
+        card = card.child(row(
+            "details-env",
+            Icon::Monitor,
+            env_label.into(),
+            Some(Icon::ChevronDown),
+            false,
+            cx,
+            |this, cx| {
+                this.panel_state.details.env_expanded =
+                    !this.panel_state.details.env_expanded;
+                cx.notify();
+            },
+            Some(icon(Icon::Folder, 16.).text_color(theme::fg_muted()).into_any_element()),
+        ));
+        if self.panel_state.details.env_expanded {
+            let mut envs = div().flex().flex_col();
+            for (ix, env) in self.client_config.environments.iter().enumerate() {
+                // `envs::is_env_active` is private to that module; the
+                // check is one line — compare against the live endpoint.
+                let active = self
+                    .active_endpoint
+                    .as_ref()
+                    .is_some_and(|e| e.http_url == env.http_url);
+                let label = env.label.clone();
+                envs = envs.child(
+                    div()
+                        .id(("details-env-row", ix))
+                        .h(px(28.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(10.))
+                        .rounded(theme::radius::LG)
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(if active {
+                            theme::fg()
+                        } else {
+                            theme::control_fg()
+                        })
+                        .hover(|s| s.bg(theme::hover()))
+                        .child(icon(Icon::Monitor, 14.).text_color(theme::fg_muted()))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when(active, |s| {
+                            s.child(icon(Icon::Check, 14.).text_color(theme::fg()))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _w, cx| {
+                                // `envs::connect_environment` is private to
+                                // that module — inline the same switch:
+                                // persist the pick, swap endpoint labels,
+                                // ask the net loop to reconnect.
+                                let Some(env) =
+                                    this.client_config.environments.get(ix).cloned()
+                                else {
+                                    return;
+                                };
+                                this.client_config.active_environment = Some(ix);
+                                this.client_config.save();
+                                this.endpoint_label = env.http_url.clone();
+                                this.active_endpoint = Some(crate::net::ServerEndpoint {
+                                    http_url: env.http_url.clone(),
+                                    token: env.token.clone(),
+                                });
+                                if let Some(commands) = &this.commands {
+                                    if let Err(err) = commands.send(
+                                        crate::net::ClientCommand::SwitchEndpoint {
+                                            http_url: env.http_url,
+                                            token: env.token,
+                                        },
+                                    ) {
+                                        this.push_toast(
+                                            crate::notifications::ToastKind::Error,
+                                            "Couldn't switch environment".to_string(),
+                                            Some(err.to_string()),
+                                            None,
+                                            cx,
+                                        );
+                                    } else {
+                                        this.state.connection =
+                                            ConnectionStatus::Connecting;
+                                    }
+                                }
+                                this.panel_state.details.env_expanded = false;
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
+            card = card.child(envs);
+        }
+
+        // ── Open-in row (web OpenInPicker): always rendered, disabled
+        // when the server reports no editors. ──
+        let editors = self.panel_state.details.editors.clone();
+        let primary_editor = editors.first().cloned();
+        let open_label = primary_editor
+            .as_deref()
+            .map(|id| format!("Open in {}", editor_label(id)))
+            .unwrap_or_else(|| "Open in editor".to_string());
+        card = card.child(row(
+            "details-open-in",
+            primary_editor
+                .as_deref()
+                .map(editor_icon)
+                .unwrap_or(Icon::SquareArrowOutUpRight),
+            open_label.into(),
+            primary_editor.as_ref().map(|_| Icon::ChevronDown),
+            primary_editor.is_none(),
+            cx,
+            |this, cx| {
+                if this.panel_state.details.editors.is_empty() {
+                    this.push_toast(
+                        crate::notifications::ToastKind::Info,
+                        "No editors available".to_string(),
+                        Some("This server reported no detected editors.".to_string()),
+                        None,
+                        cx,
+                    );
+                } else {
+                    this.panel_state.details.editor_expanded =
+                        !this.panel_state.details.editor_expanded;
+                    cx.notify();
+                }
+            },
+            None,
+        ));
+        if self.panel_state.details.editor_expanded {
+            let mut rows = div().flex().flex_col();
+            for editor in &editors {
+                let editor = editor.clone();
+                let label = editor_label(&editor);
+                rows = rows.child(
+                    div()
+                        .id(format!("details-editor-{editor}"))
+                        .h(px(28.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(10.))
+                        .rounded(theme::radius::LG)
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(theme::control_fg())
+                        .hover(|s| s.bg(theme::hover()))
+                        .child(icon(editor_icon(&editor), 14.).text_color(theme::fg_muted()))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _w, cx| {
+                                this.details_open_editor(editor.clone(), cx);
+                            }),
+                        ),
+                );
+            }
+            card = card.child(rows);
+        }
+
+        // ── Project scripts (web ProjectScriptsControl): each script is a
+        // Play-icon row; running opens the drawer and types the command. ──
+        for script in self.details_scripts() {
+            let name = script["name"].as_str().unwrap_or("Script").to_string();
+            let command = script["command"].as_str().unwrap_or_default().to_string();
+            if command.is_empty() {
+                continue;
+            }
+            let cmd = command.clone();
+            card = card.child(row(
+                "details-script",
+                Icon::Play,
+                name.into(),
+                None,
+                false,
+                cx,
+                move |this, cx| this.terminal_run_script(cmd.clone(), cx),
+                Some(
+                    icon(Icon::Terminal, 16.)
+                        .text_color(theme::fg_muted())
+                        .into_any_element(),
+                ),
+            ));
+        }
+
+        // ── Version control section (border-border/65 divider) ──
+        let (local, _remote, _seen) = self.vcs_state.card_status();
+        let is_repo = local
+            .and_then(|l| l["isRepo"].as_bool())
+            .unwrap_or(false);
+        if local.is_some() && is_repo {
+            card = card.child(
+                div()
+                    .h(px(1.))
+                    .mx(px(10.))
+                    .my(px(3.))
+                    .bg(theme::border_70()),
+            );
+            let branch = local
+                .and_then(|l| l["refName"].as_str())
+                .unwrap_or("detached")
+                .to_string();
+            card = card.child(row(
+                "details-branch",
+                Icon::GitBranch,
+                branch.into(),
+                Some(Icon::ChevronDown),
+                false,
+                cx,
+                |this, cx| this.vcs_toggle_picker(cx),
+                None,
+            ));
+            if self.vcs_state.picker_open() {
+                card = card.child(self.render_branch_picker(cx).into_any_element());
+            }
+            let quick = self.git_quick_action();
+            let disabled = matches!(quick.kind, crate::vcs::QuickActionKind::Hint);
+            card = card.child(row(
+                "details-git-action",
+                quick.icon,
+                quick.label.clone().into(),
+                Some(Icon::ChevronDown),
+                disabled,
+                cx,
+                move |this, cx| {
+                    let quick = this.git_quick_action();
+                    this.vcs_run_quick_action(&quick, cx);
+                },
+                None,
+            ));
+            // Changes row → diff pane (web onOpenChanges). The web shows
+            // only the +/− counters on the right; the base descriptor would
+            // squeeze the label to an ellipsis at 280px.
+            let (ins, del, _base) = self.git_changes_totals();
+            card = card.child(row(
+                "details-changes",
+                Icon::FileDiff,
+                "Changes".into(),
+                None,
+                false,
+                cx,
+                |this, cx| {
+                    this.panel_state.tab = Some(Tab::Diff);
+                    cx.notify();
+                },
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .font_family(theme::FONT_MONO)
+                                .child(
+                                    div()
+                                        .text_color(if ins > 0 {
+                                            theme::diff_add_fg()
+                                        } else {
+                                            theme::fg_muted()
+                                        })
+                                        .child(format!("+{ins}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(if del > 0 {
+                                            theme::diff_del_fg()
+                                        } else {
+                                            theme::fg_muted()
+                                        })
+                                        .child(format!("-{del}")),
+                                ),
+                        )
+                        .into_any_element(),
+                ),
+            ));
+        }
+
+        card.absolute()
+            // The anchor row's top is the titlebar's bottom edge — the
+            // canvas starts below the topbar, so y = TOPBAR_H + 12 (the
+            // web's `topInset`-aware `gap + topInset` resolves the same).
+            .top(px(theme::TOPBAR_H + 12.))
+            .right(px(12. + if panel_open { theme::DETAILS_PANEL_W } else { 0. }))
+            .into_any_element()
+    }
+}
+
+/// EditorId → display label (web `editorLabelForPlatform` simplifies to
+/// the catalog name — we only know ids over the wire, so title-case the
+/// common ones).
+fn editor_label(id: &str) -> String {
+    match id {
+        "zed" => "Zed".to_string(),
+        "vscode" => "VS Code".to_string(),
+        "cursor" => "Cursor".to_string(),
+        "file-manager" => "File manager".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                None => other.to_string(),
+            }
+        }
+    }
+}
+
+/// EditorId → row glyph: the Zed brand mark, a file-manager folder, else
+/// the generic external-open square.
+fn editor_icon(id: &str) -> Icon {
+    match id {
+        "zed" => Icon::Zed,
+        "file-manager" => Icon::Folder,
+        _ => Icon::SquareArrowOutUpRight,
     }
 }

@@ -87,6 +87,18 @@ struct Session {
     /// Grid size the last layout pass asked for. Debounced: `terminal.resize`
     /// goes out ~250ms after the value stops changing.
     desired_size: Option<(u16, u16)>,
+    /// Pixel height the body canvas last laid out at — the scrollback list
+    /// needs a literal height (percentage/`flex_1` measure zero under
+    /// uniform_list's Infer sizing).
+    body_height: Option<f32>,
+    /// Scrollback list scroll position — per session so split panes keep
+    /// independent scroll offsets.
+    scroll: UniformListScrollHandle,
+    /// Details-card project-script input: written via `terminal.write`
+    /// once the attach lands and the session is Running
+    /// (` {command}\r` — leading space suppresses shell history, the web's
+    /// `projectScriptTerminalInput`).
+    pub(crate) script_input: Option<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +117,25 @@ enum TermStatus {
 impl TermStatus {
     fn dead(&self) -> bool {
         matches!(self, Self::Dead | Self::Closed | Self::Exited(_))
+    }
+}
+
+/// One visible pane group — web `ThreadTerminalGroup`. `vertical` = the
+/// web's `splitDirection: "vertical"` ("Stacked"); default is "Side by
+/// side". `pub(crate)` so the details card can mint script terminals into
+/// their own group.
+#[derive(Clone, Default)]
+pub(crate) struct TermGroup {
+    pub(crate) ids: Vec<String>,
+    pub(crate) vertical: bool,
+}
+
+impl TermGroup {
+    pub(crate) fn single(id: String) -> Self {
+        Self {
+            ids: vec![id],
+            vertical: false,
+        }
     }
 }
 
@@ -135,11 +166,16 @@ pub struct State {
     meta_want: bool,
     /// Key-capture focus handle for the drawer.
     focus: Option<gpui::FocusHandle>,
-    /// Window focus listeners feeding `focused` for the input-row indicator.
+    /// Window focus listeners feeding `focused` for the cursor style.
     focus_subs: Vec<gpui::Subscription>,
     focused: bool,
-    /// Scroll handle for the scrollback list.
-    scroll: UniformListScrollHandle,
+    /// thread_id → ordered split groups, the web's
+    /// `ThreadTerminalGroup[]` (`{terminalIds, splitDirection}`). Lazily
+    /// seeded: every terminal the client knows about starts as its own
+    /// single-terminal group ("Single").
+    groups: HashMap<String, Vec<TermGroup>>,
+    /// thread_id → index into `groups[tid]` currently shown.
+    active_group: HashMap<String, usize>,
     /// Connection flag last frame — detects Disconnected→Connected edges.
     was_connected: bool,
     /// Drawer-open edge tracking — focuses the terminal on open.
@@ -159,7 +195,8 @@ impl Default for State {
             focus: None,
             focus_subs: Vec::new(),
             focused: false,
-            scroll: UniformListScrollHandle::default(),
+            groups: HashMap::new(),
+            active_group: HashMap::new(),
             was_connected: false,
             drawer_was_open: false,
             focus_pending: false,
@@ -1154,16 +1191,6 @@ fn status_label(session: &Session) -> String {
     }
 }
 
-/// Status-dot tone — same semantic roles as the row dot below.
-fn status_color(session: &Session) -> gpui::Hsla {
-    match &session.status {
-        TermStatus::Running => theme::success().into(),
-        TermStatus::Connecting => theme::warning().into(),
-        TermStatus::Exited(_) | TermStatus::Closed => theme::fg_muted().into(),
-        TermStatus::Dead => theme::error().into(),
-    }
-}
-
 impl AppView {
     /// Project workspace root for a thread (payload `cwd` for `terminal.open`).
     fn terminal_cwd_for(&self, thread_id: &str) -> Option<String> {
@@ -1183,7 +1210,7 @@ impl AppView {
 
     /// Mint a fresh terminal id (`t2`, `t3`, …) not colliding with live or
     /// known sessions for the thread.
-    fn mint_terminal_id(&self, thread_id: &str) -> String {
+    pub(crate) fn mint_terminal_id(&self, thread_id: &str) -> String {
         for n in 1u32.. {
             let id = format!("t{n}");
             let key = (thread_id.to_string(), id.clone());
@@ -1198,7 +1225,7 @@ impl AppView {
 
     /// Open (or re-attach) a PTY for `thread`/`term`. `restart` re-uses the
     /// attach stream with `restartIfNotRunning`, which respawns a dead shell.
-    fn ensure_terminal(
+    pub(crate) fn ensure_terminal(
         &mut self,
         thread_id: &str,
         terminal_id: &str,
@@ -1219,6 +1246,9 @@ impl AppView {
                 input_queue: String::new(),
                 input_writing: false,
                 desired_size: None,
+                body_height: None,
+                scroll: UniformListScrollHandle::new(),
+                script_input: None,
             });
             s.want_attach = true;
             if s.stream_id.is_some() && !restart {
@@ -1391,24 +1421,24 @@ impl AppView {
         match v["type"].as_str().unwrap_or("") {
             "snapshot" => {
                 snap_fields(&v["snapshot"], s);
-                self.terminal_state.scroll.scroll_to_bottom();
+                s.scroll.scroll_to_bottom();
             }
             "restarted" => {
                 snap_fields(&v["snapshot"], s);
-                self.terminal_state.scroll.scroll_to_bottom();
+                s.scroll.scroll_to_bottom();
             }
             "output" => {
-                let at_end = self.terminal_state.scroll.is_scrolled_to_end() != Some(false);
+                let at_end = s.scroll.is_scrolled_to_end() != Some(false);
                 if let Some(data) = v["data"].as_str() {
                     s.screen.feed(data);
                 }
                 if at_end {
-                    self.terminal_state.scroll.scroll_to_bottom();
+                    s.scroll.scroll_to_bottom();
                 }
             }
             "exited" => {
                 s.status = TermStatus::Exited(v["exitCode"].as_i64());
-                self.terminal_state.scroll.scroll_to_bottom();
+                s.scroll.scroll_to_bottom();
             }
             "closed" => {
                 s.status = TermStatus::Closed;
@@ -1416,7 +1446,7 @@ impl AppView {
             }
             "cleared" => {
                 s.screen.clear_all();
-                self.terminal_state.scroll.scroll_to_bottom();
+                s.scroll.scroll_to_bottom();
             }
             "activity" => {
                 if let Some(l) = v["label"].as_str() {
@@ -1429,6 +1459,23 @@ impl AppView {
                 s.status = TermStatus::Dead;
             }
             _ => {}
+        }
+        // A queued project-script command goes out once the attach lands
+        // and the shell is running (web `runProjectScript` writes after
+        // `terminal.open` resolves).
+        let pending = self
+            .terminal_state
+            .sessions
+            .get_mut(&key)
+            .and_then(|s| {
+                if matches!(s.status, TermStatus::Running) {
+                    s.script_input.take()
+                } else {
+                    None
+                }
+            });
+        if let Some(input) = pending {
+            self.terminal_write(thread_id, terminal_id, input, cx);
         }
         cx.notify();
     }
@@ -1720,6 +1767,19 @@ impl AppView {
             if st.active.get(thread_id) == Some(&terminal_id.to_string()) {
                 st.active.remove(thread_id);
             }
+            // Drop the id from its split group; an emptied group goes too.
+            if let Some(groups) = st.groups.get_mut(thread_id) {
+                groups.retain_mut(|g| {
+                    g.ids.retain(|id| id != terminal_id);
+                    !g.ids.is_empty()
+                });
+                if groups.is_empty() {
+                    st.groups.remove(thread_id);
+                    st.active_group.remove(thread_id);
+                } else if let Some(ix) = st.active_group.get_mut(thread_id) {
+                    *ix = (*ix).min(groups.len() - 1);
+                }
+            }
             stream
         };
         if let Some(id) = stale {
@@ -1729,6 +1789,8 @@ impl AppView {
     }
 
     /// "+" — open a new terminal (`t2`, `t3`, …) for the selected thread.
+    /// A new terminal lands in its own group, like the web's "New
+    /// Terminal" action.
     fn terminal_new_for_selected(&mut self, cx: &mut Context<Self>) {
         let Some(tid) = self.state.selected.clone() else {
             self.push_toast(
@@ -1741,9 +1803,74 @@ impl AppView {
             return;
         };
         let term = self.mint_terminal_id(&tid);
-        let st = &mut self.terminal_state;
-        st.active.insert(tid.to_string(), term.clone());
-        st.drawer_open = true;
+        {
+            let st = &mut self.terminal_state;
+            st.active.insert(tid.to_string(), term.clone());
+            let groups = st.groups.entry(tid.to_string()).or_default();
+            groups.push(TermGroup {
+                ids: vec![term.clone()],
+                vertical: false,
+            });
+            st.active_group.insert(tid.to_string(), groups.len() - 1);
+            st.drawer_open = true;
+        }
+        self.ensure_terminal(&tid, &term, false, cx);
+        cx.notify();
+    }
+
+    /// Details-card project script (web `runProjectScript`): mint a
+    /// terminal in its own group, open the drawer, attach, then write
+    /// ` {command}\r` — the leading space is `projectScriptTerminalInput`'s
+    /// shell-history suppression. `Session::script_input` holds the bytes
+    /// until the attach snapshot marks the session Running.
+    pub(crate) fn terminal_run_script(&mut self, command: String, cx: &mut Context<Self>) {
+        let Some(tid) = self.state.selected.clone() else {
+            return;
+        };
+        let term = self.mint_terminal_id(&tid);
+        {
+            let st = &mut self.terminal_state;
+            st.active.insert(tid.to_string(), term.clone());
+            let groups = st.groups.entry(tid.to_string()).or_default();
+            groups.push(TermGroup::single(term.clone()));
+            st.active_group.insert(tid.to_string(), groups.len() - 1);
+            st.drawer_open = true;
+        }
+        self.ensure_terminal(&tid, &term, false, cx);
+        if let Some(s) = self
+            .terminal_state
+            .sessions
+            .get_mut(&(tid.to_string(), term.clone()))
+        {
+            s.script_input = Some(format!(" {command}\r"));
+        }
+        cx.notify();
+    }
+
+    /// Floating-toolbar split buttons — mint a terminal in the active
+    /// group (`vertical` = the web's `splitDirection: "vertical"`).
+    fn terminal_split_for_selected(&mut self, vertical: bool, cx: &mut Context<Self>) {
+        let Some(tid) = self.state.selected.clone() else {
+            return;
+        };
+        let term = self.mint_terminal_id(&tid);
+        {
+            let st = &mut self.terminal_state;
+            let ix = st.active_group.get(tid.as_ref()).copied().unwrap_or(0);
+            let groups = st.groups.entry(tid.to_string()).or_default();
+            if groups.is_empty() {
+                groups.push(TermGroup::default());
+            }
+            let ix = ix.min(groups.len() - 1);
+            // Max 4 panes per group, the web's MAX_TERMINALS_PER_GROUP.
+            if groups[ix].ids.len() >= 4 {
+                return;
+            }
+            groups[ix].ids.push(term.clone());
+            groups[ix].vertical = vertical;
+            st.active.insert(tid.to_string(), term.clone());
+            st.active_group.insert(tid.to_string(), ix);
+        }
         self.ensure_terminal(&tid, &term, false, cx);
         cx.notify();
     }
@@ -1821,12 +1948,17 @@ impl AppView {
         terminal_id: &str,
         cols: u16,
         rows: u16,
+        height_px: f32,
         cx: &mut Context<Self>,
     ) {
         let key = (thread_id.to_string(), terminal_id.to_string());
         let Some(session) = self.terminal_state.sessions.get_mut(&key) else {
             return;
         };
+        if session.body_height != Some(height_px) {
+            session.body_height = Some(height_px);
+            cx.notify();
+        }
         if session.desired_size == Some((cols, rows)) {
             return;
         }
@@ -1965,159 +2097,517 @@ impl AppView {
                 .cloned()
                 .or_else(|| self.newest_known_terminal(t))
         });
-        // Owned snapshot of the active session's header state — the body
-        // renderer borrows `self` mutably, so nothing may stay borrowed.
-        let session_info: Option<(String, String, Option<i64>, gpui::Hsla, bool)> =
-            tid.as_ref().and_then(|t| {
-                term.as_ref().and_then(|term| {
-                    st.sessions.get(&(t.to_string(), term.clone())).map(|s| {
-                        (
-                            s.label.clone(),
-                            status_label(s),
-                            s.pid,
-                            status_color(s),
-                            s.status.dead(),
-                        )
-                    })
-                })
-            });
 
-        // Header row ------------------------------------------------------------
-        let mut header = div()
-            .h(px(30.))
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .border_b_1()
-            .border_color(theme::border())
-            .text_xs()
-            .child(icon(Icon::Terminal, 12.).text_color(theme::fg_muted()));
-        match (tid.as_ref(), session_info.as_ref()) {
-            (Some(_), Some((label, status, pid, dot, _dead))) => {
-                header = header.child(div().text_color(theme::fg()).child(label.clone()));
-                header = header.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(*dot))
-                        .child(div().text_color(theme::fg_muted()).child(status.clone())),
-                );
-                if let Some(pid) = pid {
-                    header = header.child(
-                        div()
-                            .text_color(theme::fg_muted())
-                            .child(format!("pid {pid}")),
-                    );
+        // Seed split groups for terminals that predate group state (server
+        // sessions, attached terminals): each becomes its own "Single"
+        // group, ordered oldest→newest like the web's terminal list.
+        if let Some(tid_str) = tid.as_ref().map(|t| t.to_string()) {
+            let st = &mut self.terminal_state;
+            let mut known_ids: Vec<(String, String)> = st
+                .known
+                .values()
+                .filter(|k| k.thread_id == tid_str)
+                .map(|k| (k.updated_at.clone(), k.terminal_id.clone()))
+                .collect();
+            known_ids.sort();
+            // `HashMap` order is arbitrary — collect then sort for a
+            // stable seed order.
+            let mut session_ids: Vec<String> = st
+                .sessions
+                .keys()
+                .filter(|(t, _)| *t == tid_str)
+                .map(|(_, term)| term.clone())
+                .collect();
+            session_ids.sort();
+            let grouped: std::collections::HashSet<&String> = st
+                .groups
+                .get(&tid_str)
+                .map(|gs| gs.iter().flat_map(|g| g.ids.iter()).collect())
+                .unwrap_or_default();
+            let mut ungrouped: Vec<String> = known_ids
+                .drain(..)
+                .map(|(_, id)| id)
+                .chain(session_ids)
+                .filter(|id| !grouped.contains(id))
+                .collect();
+            ungrouped.dedup();
+            if !ungrouped.is_empty() {
+                let groups = st.groups.entry(tid_str.clone()).or_default();
+                for id in ungrouped {
+                    groups.push(TermGroup {
+                        ids: vec![id],
+                        vertical: false,
+                    });
                 }
             }
-            (Some(_), None) => {
-                header = header.child(
-                    div()
-                        .text_color(theme::fg_muted())
-                        .child("terminal starting…"),
-                );
-            }
-            (None, _) => {
-                header = header.child(
-                    div()
-                        .text_color(theme::fg_muted())
-                        .child("no thread selected"),
-                );
+        }
+        let st = &self.terminal_state;
+        let tid_str = tid.as_ref().map(|t| t.to_string());
+        // Owned clone — `render_terminal_body` borrows `self` mutably below.
+        let groups: Vec<TermGroup> = tid_str
+            .as_ref()
+            .and_then(|t| st.groups.get(t))
+            .cloned()
+            .unwrap_or_default();
+        let active_ix = tid_str
+            .as_ref()
+            .and_then(|t| {
+                st.active_group.get(t).copied().or_else(|| {
+                    // The group holding the active terminal wins; else 0.
+                    term.as_ref().and_then(|term| {
+                        groups
+                            .iter()
+                            .position(|g| g.ids.iter().any(|id| id == term))
+                    })
+                })
+            })
+            .unwrap_or(0)
+            .min(groups.len().saturating_sub(1));
+        let group = groups.get(active_ix);
+        let visible: Vec<String> = group.map(|g| g.ids.clone()).unwrap_or_else(|| {
+            term.clone().map(|t| vec![t]).unwrap_or_default()
+        });
+        let vertical = group.map(|g| g.vertical).unwrap_or(false);
+        // Every known terminal for the thread (sidebar rows).
+        let mut all_ids: Vec<String> = Vec::new();
+        for g in &groups {
+            for id in &g.ids {
+                if !all_ids.contains(id) {
+                    all_ids.push(id.clone());
+                }
             }
         }
-        header = header.child(div().flex_1());
-        // +: new terminal for the selected thread.
-        header = header.child(
-            drawer_button(Icon::Plus, "new-terminal")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _ev, _w, cx| {
-                        this.terminal_new_for_selected(cx);
-                    }),
-                )
-                .into_any_element(),
-        );
-        // Restart the active session.
-        if let (Some(t), Some(term)) = (tid.clone(), term.clone()) {
-            header = header.child(
-                drawer_button(Icon::RefreshCw, "restart-terminal")
+        for id in &visible {
+            if !all_ids.contains(id) {
+                all_ids.push(id.clone());
+            }
+        }
+        let has_sidebar = all_ids.len() > 1;
+        let at_split_limit = visible.len() >= 4;
+
+        // ── Empty state (web: no terminalIds → note + "New Terminal") ──
+        if all_ids.is_empty() && tid.is_some() && term.is_none() {
+            let focus = self.terminal_state.focus.clone();
+            let focus2 = focus.clone();
+            return div()
+                .flex()
+                .flex_col()
+                .h(px(DRAWER_HEIGHT))
+                .border_t_1()
+                .border_color(theme::border_soft())
+                .bg(term_bg())
+                .key_context("Terminal")
+                .when_some(focus, |el, h| el.track_focus(&h))
+                .on_key_down(cx.listener(AppView::on_terminal_key))
+                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    if let Some(h) = &focus2 {
+                        h.focus(window, cx);
+                    }
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .px_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::fg_muted())
+                                .child("No terminal sessions for this thread yet."),
+                        )
+                        .child(
+                            div()
+                                .id("terminal-new-empty")
+                                .px_2()
+                                .h(px(22.))
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme::border())
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::hover()))
+                                .child("New Terminal")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _w, cx| {
+                                        this.terminal_new_for_selected(cx);
+                                    }),
+                                ),
+                        ),
+                );
+        }
+
+        // ── Floating action group (web `!hasTerminalSidebar` top-right) ──
+        // split-h | split-v | + | trash, 1px h-4 separators, p-1 buttons.
+        let action_button = |button_icon: Icon,
+                             id: &'static str,
+                             disabled: bool,
+                             cx: &mut Context<Self>,
+                             on_click: fn(&mut Self, &mut Context<Self>)| {
+            div()
+                .id(id)
+                .w(px(21.))
+                .h(px(21.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(!disabled, |s| s.cursor_pointer())
+                .text_color(if disabled {
+                    theme::fg_muted()
+                } else {
+                    theme::fg()
+                })
+                .when(!disabled, |s| {
+                    s.hover(|h| h.bg(theme::accent()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _w, cx| on_click(this, cx)),
+                        )
+                })
+                .child(icon(button_icon, 13.).text_color(theme::fg()))
+        };
+        let separator = || {
+            div()
+                .w(px(1.))
+                .h(px(16.))
+                .flex_none()
+                .bg(theme::border_soft())
+        };
+        let actions = |cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(theme::border_soft())
+                .bg(theme::canvas())
+                .child(action_button(
+                Icon::SquareSplitHorizontal,
+                "term-split-h",
+                at_split_limit || tid.is_none(),
+                cx,
+                |this, cx| this.terminal_split_for_selected(false, cx),
+            ))
+            .child(separator())
+            .child(action_button(
+                Icon::SquareSplitVertical,
+                "term-split-v",
+                at_split_limit || tid.is_none(),
+                cx,
+                |this, cx| this.terminal_split_for_selected(true, cx),
+            ))
+            .child(separator())
+            .child(action_button(
+                Icon::Plus,
+                "term-new",
+                tid.is_none(),
+                cx,
+                |this, cx| this.terminal_new_for_selected(cx),
+            ))
+            .child(separator())
+            .child(action_button(
+                Icon::Trash2,
+                "term-close",
+                tid.is_none() || term.is_none(),
+                cx,
+                |this, cx| {
+                    if let (Some(t), Some(term)) =
+                        (this.state.selected.clone(), this.active_terminal_id())
+                    {
+                        this.terminal_close(&t, &term, cx);
+                    }
+                },
+            ))
+        };
+
+        // ── Panes: the active group's ids in a row (Side by side) or a
+        // column (Stacked), `border-border/70` dividers, border-border on
+        // the active pane — TerminalSplitPanes in the web.
+        let mut panes = div().flex().flex_1().min_h_0().min_w_0();
+        if !vertical {
+            panes = panes.flex_row();
+        } else {
+            panes = panes.flex_col();
+        }
+        if visible.is_empty() {
+            panes = panes.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(self.render_terminal_body(tid.as_deref(), None, cx)),
+            );
+        }
+        for (ix, pane_id) in visible.iter().enumerate() {
+            let pane_active = term.as_ref() == Some(pane_id);
+            let mut cell = div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .when(ix > 0, |s| {
+                    if vertical {
+                        s.border_t_1()
+                    } else {
+                        s.border_l_1()
+                    }
+                })
+                .border_color(if pane_active {
+                    theme::border()
+                } else {
+                    theme::border_70()
+                });
+            cell = cell.child(self.render_terminal_body(
+                tid.as_deref(),
+                Some(pane_id.as_str()),
+                cx,
+            ));
+            let pane_tid = tid_str.clone();
+            let pane_term = pane_id.clone();
+            panes = panes.child(
+                cell.id(gpui::ElementId::named_usize("term-pane", ix))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
-                            this.ensure_terminal(&t, &term, true, cx);
-                            cx.notify();
+                            if let Some(t) = &pane_tid {
+                                if this.terminal_state.active.get(t.as_str())
+                                    != Some(&pane_term)
+                                {
+                                    this.terminal_state
+                                        .active
+                                        .insert(t.clone(), pane_term.clone());
+                                    cx.notify();
+                                }
+                            }
                         }),
-                    )
-                    .into_any_element(),
+                    ),
             );
         }
-        // Hide the drawer (streams stay attached — persistent terminals).
-        header = header.child(
-            drawer_button(Icon::X, "close-drawer")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _ev, w, cx| {
-                        this.terminal_drawer_set_open(false, w, cx);
-                    }),
-                )
-                .into_any_element(),
-        );
 
-        // Body ---------------------------------------------------------------
-        let body = self.render_terminal_body(tid.as_deref(), term.as_deref(), cx);
-
-        // Input row ------------------------------------------------------------
-        let focused = self.terminal_state.focused;
-        let hint = match session_info.as_ref() {
-            Some((_, status, _, _, false)) if status == "running" => {
-                "type to send input · ctrl-c interrupt · ctrl-l clear"
-            }
-            Some((_, _, _, _, true)) => "session ended — use the restart button above",
-            Some(_) => "connecting…",
-            None => "",
-        };
-        let input_row = div()
-            .h(px(26.))
-            .px_3()
+        // ── Sidebar (web `hasTerminalSidebar`: >1 terminal) — 144px,
+        // action strip header, group headers + 24px terminal rows.
+        let mut content = div()
             .flex()
-            .items_center()
-            .gap_2()
-            .border_t_1()
-            .border_color(theme::border())
-            .text_xs()
-            .child(
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .bg(term_bg())
+            .child(div().flex_1().min_w_0().min_h_0().child(panes));
+        if has_sidebar {
+            let mut rows = div()
+                .id("term-sidebar-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_1()
+                .py_1();
+            let show_headers =
+                groups.len() > 1 || groups.iter().any(|g| g.ids.len() > 1);
+            for (gix, g) in groups.iter().enumerate() {
+                let g_active = gix == active_ix;
+                if show_headers {
+                    let (glyph, label) = if g.ids.len() <= 1 {
+                        (Icon::Square, "Single".to_string())
+                    } else if g.vertical {
+                        (Icon::SquareSplitVertical, "Stacked".to_string())
+                    } else {
+                        (Icon::SquareSplitHorizontal, "Side by side".to_string())
+                    };
+                    let group_tid = tid_str.clone();
+                    let group_first = g.ids.first().cloned();
+                    rows = rows.child(
+                        div()
+                            .id(gpui::ElementId::named_usize("term-group", gix))
+                            .h(px(22.))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .rounded(px(4.))
+                            .px_1p5()
+                            .cursor_pointer()
+                            .text_color(if g_active {
+                                theme::fg()
+                            } else {
+                                theme::fg_muted()
+                            })
+                            .when(g_active, |s| s.bg(theme::accent_soft()))
+                            .hover(|s| {
+                                if g_active {
+                                    s
+                                } else {
+                                    s.bg(theme::accent_soft()).text_color(theme::fg())
+                                }
+                            })
+                            .child(icon(glyph, 12.).text_color(theme::fg_muted()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme::fg_muted())
+                                    .text_size(px(9.))
+                                    .child(format!("{}", g.ids.len())),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _w, cx| {
+                                    if let (Some(t), Some(first)) =
+                                        (&group_tid, &group_first)
+                                    {
+                                        this.terminal_state
+                                            .active_group
+                                            .insert(t.clone(), gix);
+                                        this.terminal_state
+                                            .active
+                                            .insert(t.clone(), first.clone());
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                    );
+                }
+                for term_id in &g.ids {
+                    let row_active = term.as_ref() == Some(term_id);
+                    let label = self
+                        .terminal_state
+                        .sessions
+                        .get(&(tid_str.clone().unwrap_or_default(), term_id.clone()))
+                        .map(|s| s.label.clone())
+                        .or_else(|| {
+                            self.terminal_state
+                                .known
+                                .get(&(tid_str.clone().unwrap_or_default(), term_id.clone()))
+                                .map(|k| k.label.clone())
+                        })
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or_else(|| label_for(term_id));
+                    let row_tid = tid_str.clone();
+                    let row_term = term_id.clone();
+                    let close_tid = tid_str.clone();
+                    let close_term = term_id.clone();
+                    rows = rows.child(
+                        div()
+                            .id(format!("term-row-{term_id}"))
+                            .h(px(24.))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .rounded_md()
+                            .pr_2()
+                            .pl_1p5()
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(if row_active {
+                                theme::fg()
+                            } else {
+                                theme::fg_muted()
+                            })
+                            .when(row_active, |s| s.bg(theme::accent()))
+                            .hover(|s| {
+                                if row_active {
+                                    s
+                                } else {
+                                    s.bg(theme::accent_soft()).text_color(theme::fg())
+                                }
+                            })
+                            .child(
+                                icon(Icon::SquareTerminal, 12.).text_color(theme::fg_muted()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("term-row-close-{term_id}"))
+                                    .w(px(16.))
+                                    .h(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_sm()
+                                    .hover(|s| s.bg(theme::hover()))
+                                    .child(
+                                        icon(Icon::X, 10.).text_color(theme::fg_muted()),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, _w, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(t) = &close_tid {
+                                                this.terminal_close(t, &close_term, cx);
+                                            }
+                                        }),
+                                    ),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _w, cx| {
+                                    if let Some(t) = &row_tid {
+                                        this.terminal_state
+                                            .active
+                                            .insert(t.clone(), row_term.clone());
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                    );
+                }
+            }
+            content = content.child(
                 div()
+                    .w(px(144.))
+                    .flex_none()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .child(icon(Icon::Terminal, 12.).text_color(if focused {
-                        theme::primary()
-                    } else {
-                        theme::fg_muted()
-                    })),
-            )
-            .child(
-                div()
-                    .text_color(if focused {
-                        theme::fg()
-                    } else {
-                        theme::fg_muted()
-                    })
-                    .child(if focused {
-                        hint.to_string()
-                    } else {
-                        format!("click to focus the terminal — {hint}")
-                    }),
+                    .flex_col()
+                    .border_l_1()
+                    .border_color(theme::border_soft())
+                    .child(
+                        div()
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .border_b_1()
+                            .border_color(theme::border_soft())
+                            .child(actions(cx)),
+                    )
+                    .child(rows),
             );
+        }
 
         let focus = self.terminal_state.focus.clone();
         let focus2 = focus.clone();
-        // Web drawer: `border-t border-border/80` over `--background`.
+        // Web drawer: `border-t border-border/80` over `--background`,
+        // terminal content straight to the top edge — no title bar — and
+        // the floating action group at `right-2 top-2` when there is no
+        // sidebar.
         div()
             .flex()
             .flex_col()
             .h(px(DRAWER_HEIGHT))
+            .relative()
             .border_t_1()
             .border_color(theme::border_soft())
             .bg(term_bg())
@@ -2129,9 +2619,22 @@ impl AppView {
                     h.focus(window, cx);
                 }
             })
-            .child(header)
-            .child(body)
-            .child(input_row)
+            .child(content)
+            .when(!has_sidebar, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .right(px(8.))
+                        .top(px(8.))
+                        .child(actions(cx)),
+                )
+            })
+    }
+
+    /// The thread's active terminal id, if any.
+    fn active_terminal_id(&self) -> Option<String> {
+        let tid = self.state.selected.as_ref()?;
+        self.terminal_state.active.get(tid.as_ref()).cloned()
     }
 
     fn render_terminal_body(
@@ -2151,6 +2654,7 @@ impl AppView {
             return center_note("Opening terminal…");
         };
         let key = (tid.to_string(), term.to_string());
+        let focused = self.terminal_state.focused;
         let Some(session) = self.terminal_state.sessions.get_mut(&key) else {
             return center_note("Opening terminal…");
         };
@@ -2199,7 +2703,8 @@ impl AppView {
                 _ => "(empty)",
             });
         }
-        let scroll = self.terminal_state.scroll.clone();
+        let scroll = session.scroll.clone();
+        let body_height = session.body_height;
         let measure_tid = tid.to_string();
         let measure_term = term.to_string();
         div()
@@ -2208,6 +2713,11 @@ impl AppView {
             .relative()
             .px_2()
             .py_1()
+            // Web: `select-text` on the focused terminal content.
+            .when(focused, |s| s.cursor_text())
+            // Cells with the VT default fg carry no highlight run — they
+            // inherit the ambient text color, which must be the app fg.
+            .text_color(theme::fg())
             .font_family(theme::FONT_MONO)
             .text_size(theme::code_text_size())
             .line_height(px(LINE_HEIGHT))
@@ -2230,6 +2740,7 @@ impl AppView {
                                     measure_term.as_str(),
                                     cols,
                                     rows,
+                                    f32::from(size.height),
                                     cx,
                                 );
                             });
@@ -2241,6 +2752,9 @@ impl AppView {
                 .inset_0(),
             )
             .child(
+                // Literal pixel height from the body's measured bounds —
+                // under uniform_list's Infer sizing a percentage or
+                // `flex_1` height lays the list out at zero.
                 uniform_list("terminal-scrollback", count, move |range, _window, _cx| {
                     // render_rows drops trailing blank lines; the cursor can
                     // sit on one, so it lands on the last rendered row.
@@ -2274,7 +2788,7 @@ impl AppView {
                         .collect()
                 })
                 .track_scroll(&scroll)
-                .h_full(),
+                .h(px(body_height.unwrap_or(DRAWER_HEIGHT - 16.))),
             )
     }
 }
