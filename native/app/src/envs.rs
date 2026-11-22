@@ -9,7 +9,7 @@
 
 use gpui::{
     Context, Entity, EntityInputHandler, Focusable, MouseButton, SharedString, Subscription,
-    Window, div, prelude::*, px, rgb,
+    Window, div, prelude::*, rgb,
 };
 
 use crate::AppView;
@@ -23,7 +23,7 @@ use crate::theme;
 pub struct State {
     /// Add-environment form visible.
     pub add_open: bool,
-    /// Mirrors of the add-form fields. `render_envs_section` is `&self`, so
+    /// Mirrors of the add-form fields. `render_env_add_form` is `&self`, so
     /// entity observers sync field text into these plain strings for the Add
     /// button's enabled state.
     pub draft_label: String,
@@ -39,36 +39,6 @@ pub struct State {
     url_field: Option<Entity<TextField>>,
     token_field: Option<Entity<TextField>>,
     subs: Vec<Subscription>,
-}
-
-/// Dot + label + optional detail for the live `ConnectionStatus`.
-/// Mirrors `connection_status` in settings.rs (module-private there).
-fn status_visual(status: &ConnectionStatus) -> (gpui::Rgba, &'static str, Option<SharedString>) {
-    match status {
-        ConnectionStatus::Mock => (
-            theme::fg_muted(),
-            "Offline",
-            Some("No server configured — showing built-in mock data.".into()),
-        ),
-        ConnectionStatus::Connecting => (rgb(0xfbbf24), "Connecting…", None),
-        ConnectionStatus::Connected => (rgb(0x34d399), "Connected", None),
-        ConnectionStatus::Failed(error) => {
-            (rgb(0xf87171), "Connection failed", Some(error.clone()))
-        }
-        ConnectionStatus::Disconnected(reason) => {
-            (rgb(0xf87171), "Disconnected", Some(reason.clone()))
-        }
-    }
-}
-
-/// Small caption above a group of rows (mirrors `group_label` in settings.rs).
-fn env_group_label(text: &'static str) -> gpui::Div {
-    div()
-        .pb_1()
-        .pt_3()
-        .text_xs()
-        .text_color(theme::fg_muted())
-        .child(text)
 }
 
 /// Read a text field's contents when no `&mut Window` is on the update stack
@@ -211,8 +181,9 @@ impl AppView {
     }
 
     /// "Add environment" opener: build fields on first use, clear drafts, and
-    /// focus the label input.
-    fn open_env_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// focus the label input. Called from the Environments settings page
+    /// header (settings.rs).
+    pub(crate) fn open_env_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_env_fields(cx);
         self.env_state.add_open = true;
         self.env_state.error = None;
@@ -363,7 +334,7 @@ impl AppView {
     /// URL match (not just `active_environment`) so a stale persisted index —
     /// e.g. env vars winning over the saved selection at launch — can't show
     /// a false "Active" badge.
-    fn is_env_active(&self, ix: usize) -> bool {
+    pub(crate) fn is_env_active(&self, ix: usize) -> bool {
         let Some(env) = self.client_config.environments.get(ix) else {
             return false;
         };
@@ -374,7 +345,7 @@ impl AppView {
 
     /// Point the app at saved env `ix`: persist the selection, swap the live
     /// endpoint labels other surfaces read, and ask the net loop to reconnect.
-    fn connect_environment(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn connect_environment(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(env) = self.client_config.environments.get(ix).cloned() else {
             return;
         };
@@ -402,7 +373,7 @@ impl AppView {
     /// Two-stage remove: first click arms the row, second confirms. Refuses
     /// while the row is the live endpoint (removing it would strand the
     /// connection).
-    fn remove_environment(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn remove_environment(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.is_env_active(ix) {
             return;
         }
@@ -427,123 +398,72 @@ impl AppView {
         cx.notify();
     }
 
-    pub fn render_envs_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (dot_color, status_label, status_detail) = status_visual(&self.state.connection);
+    /// The inline add-environment form — the web `AddEnvironmentDialog`
+    /// flattened into the Environments settings page. Rendered by
+    /// settings.rs below the env list while `env_state.add_open`; the
+    /// "+ Add environment" header button calls `open_env_form`.
+    pub(crate) fn render_env_add_form(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut form = div().flex().flex_col().gap_2();
+        for (caption, field) in [
+            ("Label", self.env_state.label_field.clone()),
+            ("URL", self.env_state.url_field.clone()),
+            ("Token", self.env_state.token_field.clone()),
+        ] {
+            if let Some(field) = field {
+                form = form.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme::border())
+                                .bg(theme::canvas())
+                                .text_sm()
+                                .text_color(theme::fg())
+                                .child(field),
+                        ),
+                );
+            }
+        }
 
-        let mut section = div().flex().flex_col();
+        let draft_url = self.env_state.draft_url.trim();
+        let url_ok = draft_url.starts_with("http://") || draft_url.starts_with("https://");
+        let mut add_button = div()
+            .id("env-add-submit")
+            .px_3()
+            .py_1p5()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer()
+            .bg(theme::primary())
+            .text_color(gpui::white())
+            .child("Add environment");
+        if !url_ok {
+            add_button = add_button.opacity(0.4);
+        }
+        add_button = add_button.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev, window, cx| {
+                this.add_environment_click(window, cx);
+            }),
+        );
 
-        // ── This app: live endpoint + status, mirroring the Connection
-        // section's dot + label + detail. ──────────────────────────────
-        section = section.child(env_group_label("This app")).child(
+        form.child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .py_1p5()
-                .text_sm()
+                .pt_1()
+                .child(add_button)
                 .child(
                     div()
-                        .w(px(8.))
-                        .h(px(8.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(dot_color),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(theme::fg())
-                        .child(status_label),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(self.endpoint_label.clone()),
-                ),
-        );
-        if let Some(detail) = status_detail {
-            section = section.child(
-                div()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(detail),
-            );
-        }
-        if self.commands.is_none() && self.active_endpoint.is_some() {
-            section = section.child(
-                div()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Selected environment is saved and will be used on next launch."),
-            );
-        }
-
-        // ── Saved environments ───────────────────────────────────────
-        section = section.child(env_group_label("Saved environments"));
-
-        if self.client_config.environments.is_empty() {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No saved environments yet — add one below to switch servers without restarting."),
-            );
-        }
-
-        for (ix, env) in self.client_config.environments.iter().enumerate() {
-            let active = self.is_env_active(ix);
-            let armed = self.env_state.confirm_remove == Some(ix);
-
-            let mut row = div()
-                .id(("env-row", ix))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .text_sm();
-            if active {
-                row = row.bg(theme::selected());
-            }
-            row = row
-                .child(
-                    div()
-                        .w(px(140.))
-                        .flex_none()
-                        .truncate()
-                        .text_color(theme::fg())
-                        .child(env.label.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(env.http_url.clone()),
-                );
-
-            if active {
-                row = row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme::primary())
-                        .child("Active"),
-                );
-            } else {
-                row = row.child(
-                    div()
-                        .id(("env-connect", ix))
+                        .id("env-add-cancel")
                         .px_3()
                         .py_1p5()
                         .rounded_md()
@@ -552,247 +472,27 @@ impl AppView {
                         .bg(theme::hover())
                         .text_color(theme::fg())
                         .hover(|s| s.bg(theme::selected()))
-                        .child("Connect")
+                        .child("Cancel")
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.connect_environment(ix, cx);
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.env_state.add_open = false;
+                                this.env_state.error = None;
+                                cx.notify();
                             }),
                         ),
-                );
-            }
-
-            // Remove: disabled on the live row, two-stage arm/confirm
-            // everywhere else.
-            if active {
-                row = row.child(
-                    div()
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .opacity(0.4)
-                        .child("Remove"),
-                );
-            } else if armed {
-                row = row.child(
-                    div()
-                        .id(("env-remove", ix))
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(rgb(0x7a2e2e))
-                        .text_color(gpui::white())
-                        .hover(|s| s.bg(rgb(0x9a3a3a)))
-                        .child("Confirm remove")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.remove_environment(ix, cx);
-                            }),
-                        ),
-                );
-            } else {
-                row = row.child(
-                    div()
-                        .id(("env-remove", ix))
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(theme::hover())
-                        .text_color(theme::fg_muted())
-                        .hover(|s| s.bg(theme::selected()))
-                        .child("Remove")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.remove_environment(ix, cx);
-                            }),
-                        ),
-                );
-            }
-            section = section.child(row);
-        }
-
-        // A live endpoint that no saved env covers — e.g. supplied via
-        // C67_SERVER_URL/C67_TOKEN — is shown read-only.
-        let live_url = self.active_endpoint.as_ref().map(|e| e.http_url.clone());
-        let live_is_saved = live_url.as_ref().is_some_and(|url| {
-            self.client_config
-                .environments
-                .iter()
-                .any(|e| &e.http_url == url)
-        });
-        if let Some(url) = live_url.filter(|_| !live_is_saved) {
-            let from_env = ServerEndpoint::from_env().is_some_and(|e| e.http_url == url);
-            let label = if from_env {
-                "Current (from environment)"
-            } else {
-                "Current"
-            };
-            section = section.child(
-                div()
-                    .id("env-row-current")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .text_sm()
-                    .bg(theme::selected())
-                    .child(
-                        div()
-                            .w(px(140.))
-                            .flex_none()
-                            .truncate()
-                            .text_color(theme::fg())
-                            .child(label),
-                    )
-                    .child(
+                )
+                .when_some(self.env_state.error.clone(), |s, error| {
+                    s.child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(url),
+                            .text_color(rgb(0xf87171))
+                            .child(error),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(theme::primary())
-                            .child("Active"),
-                    ),
-            );
-        }
-
-        // ── Add environment ──────────────────────────────────────────
-        if self.env_state.add_open {
-            let mut form = div().flex().flex_col().gap_2();
-            for (caption, field) in [
-                ("Label", self.env_state.label_field.clone()),
-                ("URL", self.env_state.url_field.clone()),
-                ("Token", self.env_state.token_field.clone()),
-            ] {
-                if let Some(field) = field {
-                    form = form.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xs().text_color(theme::fg_muted()).child(caption))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .bg(theme::canvas())
-                                    .text_sm()
-                                    .text_color(theme::fg())
-                                    .child(field),
-                            ),
-                    );
-                }
-            }
-
-            let draft_url = self.env_state.draft_url.trim();
-            let url_ok = draft_url.starts_with("http://") || draft_url.starts_with("https://");
-            let mut add_button = div()
-                .id("env-add-submit")
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .text_xs()
-                .cursor_pointer()
-                .bg(theme::primary())
-                .text_color(gpui::white())
-                .child("Add environment");
-            if !url_ok {
-                add_button = add_button.opacity(0.4);
-            }
-            add_button = add_button.on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, window, cx| {
-                    this.add_environment_click(window, cx);
                 }),
-            );
-
-            form = form.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pt_1()
-                    .child(add_button)
-                    .child(
-                        div()
-                            .id("env-add-cancel")
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .cursor_pointer()
-                            .bg(theme::hover())
-                            .text_color(theme::fg())
-                            .hover(|s| s.bg(theme::selected()))
-                            .child("Cancel")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.env_state.add_open = false;
-                                    this.env_state.error = None;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .when_some(self.env_state.error.clone(), |s, error| {
-                        s.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(rgb(0xf87171))
-                                .child(error),
-                        )
-                    }),
-            );
-            section = section
-                .child(env_group_label("New environment"))
-                .child(form);
-        } else {
-            section = section.child(
-                div().pt_3().flex().child(
-                    div()
-                        .id("env-add-open")
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(theme::hover())
-                        .text_color(theme::fg())
-                        .hover(|s| s.bg(theme::selected()))
-                        .child("+ Add environment")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, window, cx| {
-                                this.open_env_form(window, cx);
-                            }),
-                        ),
-                ),
-            );
-        }
-
-        section
+        )
     }
 }

@@ -8,11 +8,16 @@
 //! the per-area modules (appearance, envs, clients, acp, integrations,
 //! archived).
 
-use gpui::{Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px, rgb};
+use std::cell::Cell;
+
+use gpui::{
+    Context, IntoElement, MouseButton, SharedString, Window, deferred, div, prelude::*, px, rgb,
+};
+use serde_json::json;
 
 use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
-use crate::net::ClientCommand;
+use crate::settings_misc::{setting_row, settings_card, settings_section_title, switch_control};
 use crate::theme;
 use crate::{AppView, ToggleSettings};
 
@@ -165,6 +170,21 @@ pub struct State {
     /// `&self` nav render can filter.
     pub search_query: String,
     search_subs: Vec<gpui::Subscription>,
+    /// About-page `server.getNpmRelease` check — fired once per session on
+    /// first About render (Cell flags so the `&self` render can gate it,
+    /// like the `maybe_load_*` probes elsewhere).
+    pub about_update_checked: Cell<bool>,
+    pub about_update_checking: Cell<bool>,
+    /// Latest release version the registry reported (None = check ran but
+    /// returned no version, or hasn't completed).
+    pub about_latest: Option<String>,
+    /// About "Update track" select open (self-contained — the shared
+    /// `open_list` enum lives in settings_misc).
+    pub about_track_open: bool,
+    /// Environments page: index of the saved env whose ⋯ menu is open.
+    pub env_menu_open: Option<usize>,
+    /// About "c67 command" — last install/remove outcome, shown inline.
+    pub cli_message: Option<SharedString>,
 }
 
 /// Dot + label + optional detail for the live `ConnectionStatus`.
@@ -188,39 +208,91 @@ fn connection_status(
     }
 }
 
-/// Small uppercase-ish caption above a group of rows.
-fn group_label(text: &'static str) -> gpui::Div {
-    div()
-        .pb_1()
-        .pt_3()
-        .text_xs()
-        .text_color(theme::fg_muted())
-        .child(text)
-}
+/// The canonical repo URL — the fork's home for "View policy" /
+/// "View licenses" / "Download" (upstream web links point at t3.codes;
+/// this build ships from GitHub).
+const REPO_URL: &str = "https://github.com/Coobyk/67code";
 
-/// A key/value row: muted label on the left, value on the right.
-fn info_row(label: &'static str, value: impl Into<SharedString>) -> gpui::Div {
+/// About-page row: like `settings_misc::setting_row` but the title and
+/// description take elements/strings built at render time (version
+/// numbers, CLI paths, inline status lines).
+fn about_row(
+    title: impl IntoElement,
+    description: impl IntoElement,
+    control: impl IntoElement,
+) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap_3()
-        .py_1p5()
-        .text_sm()
-        .child(
-            div()
-                .w(px(140.))
-                .flex_none()
-                .text_color(theme::fg_muted())
-                .child(label),
-        )
+        .gap_8()
+        .px_4()
+        .py_3()
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
-                .text_color(theme::fg())
-                .child(value.into()),
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::fg())
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(description),
+                ),
         )
+        .child(control)
+}
+
+/// Web `Button variant="outline" size="sm"`: h-7 px-3 rounded-md border.
+fn outline_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    glyph: Option<Icon>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(28.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1p5()
+        .px_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme::input())
+        .text_xs()
+        .cursor_pointer()
+        .text_color(theme::fg())
+        .hover(|s| s.bg(theme::accent()))
+        .when_some(glyph, |b, g| b.child(icon(g, 13.).text_color(theme::fg())))
+        .child(label)
+}
+
+/// True when `url` points at this machine — the launcher-started
+/// in-process server. Loopback endpoints back the "This app / Local
+/// environment" row rather than a saved-env row.
+fn is_loopback_url(url: &str) -> bool {
+    url.contains("localhost") || url.contains("127.0.0.1") || url.contains("[::1]")
+}
+
+/// `http://host:port/path` → `host:port` for the env-row transport label.
+fn url_authority(url: &str) -> String {
+    let rest = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    rest.trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or(rest)
+        .to_string()
 }
 
 impl AppView {
@@ -519,117 +591,364 @@ impl AppView {
             )
     }
 
-    fn render_connection_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (dot_color, status_label, status_detail) = connection_status(&self.state.connection);
-        let in_process = self.endpoint_label != "offline";
+    /// One saved-environment row — the web `EnvironmentRow`: machine glyph,
+    /// name + `transport · status · Routes › · Permissions ›` subtitle,
+    /// enable switch, ⋯ menu (deferred popup with Connect / Remove).
+    fn render_env_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let env = self.client_config.environments[ix].clone();
+        let active = self.is_env_active(ix);
+        let armed = self.env_state.confirm_remove == Some(ix);
+        let menu_open = self.settings_state.env_menu_open == Some(ix);
 
-        let mut section = div().flex().flex_col().child(
+        // Transport label — `environmentTransportLabel`: our saved envs
+        // carry a direct URL, so the label is the endpoint authority.
+        let transport = url_authority(&env.http_url);
+        let status = if active {
+            connection_status(&self.state.connection).1
+        } else {
+            "Off"
+        };
+        let subtitle: SharedString =
+            format!("{transport} · {status} · Routes › · Permissions ›").into();
+
+        let switch = div()
+            .id(("env-switch", ix))
+            .cursor_pointer()
+            .flex_none()
+            .child(switch_control(active))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    // The switch mirrors "is this the live endpoint": a
+                    // click on an off row connects it; the live row stays
+                    // on (there's no disconnect — pick another env).
+                    if !this.is_env_active(ix) {
+                        this.connect_environment(ix, cx);
+                    }
+                }),
+            );
+
+        let mut menu_list = div()
+            .min_w(px(140.))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::raised())
+            .shadow_2xl()
+            .flex()
+            .flex_col();
+        if !active {
+            menu_list = menu_list.child(
+                div()
+                    .id(("env-menu-connect", ix))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .min_h(px(28.))
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg())
+                    .hover(|s| s.bg(theme::accent()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.settings_state.env_menu_open = None;
+                            this.connect_environment(ix, cx);
+                        }),
+                    )
+                    .child("Connect"),
+            );
+        }
+        // Remove: refused on the live endpoint, two-stage arm/confirm
+        // elsewhere (same state the old inline buttons used).
+        let remove_item = div()
+            .id(("env-menu-remove", ix))
+            .flex()
+            .items_center()
+            .px_2()
+            .py_1()
+            .min_h(px(28.))
+            .rounded_sm()
+            .text_sm()
+            .child(if armed { "Confirm remove" } else { "Remove" });
+        let remove_item = if active {
+            remove_item.text_color(theme::fg_muted()).opacity(0.5)
+        } else {
+            remove_item
+                .cursor_pointer()
+                .text_color(crate::settings_misc::danger())
+                .hover(|s| s.bg(theme::accent()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        this.remove_environment(ix, cx);
+                        // Armed → stay open for the confirm click; removed
+                        // (or refused) → close.
+                        if this.env_state.confirm_remove != Some(ix) {
+                            this.settings_state.env_menu_open = None;
+                        }
+                        cx.notify();
+                    }),
+                )
+        };
+        menu_list = menu_list.child(remove_item);
+
+        let menu_button = div().relative().flex_none().child(
             div()
+                .id(("env-menu", ix))
+                .w(px(28.))
+                .h(px(28.))
                 .flex()
                 .items_center()
-                .gap_2()
-                .py_1p5()
-                .text_sm()
-                .child(
-                    div()
-                        .w(px(8.))
-                        .h(px(8.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(dot_color),
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(theme::fg_muted())
+                .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        this.settings_state.env_menu_open =
+                            if this.settings_state.env_menu_open == Some(ix) {
+                                None
+                            } else {
+                                Some(ix)
+                            };
+                        this.env_state.confirm_remove = None;
+                        cx.notify();
+                    }),
                 )
-                .child(div().text_color(theme::fg()).child(status_label))
-                .when_some(status_detail, |s, detail| {
-                    s.child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(detail),
-                    )
-                }),
+                .child(icon(Icon::Ellipsis, 14.).text_color(theme::fg_muted())),
         );
-
-        section = section
-            .child(group_label("Server"))
-            .child(info_row("Endpoint", self.endpoint_label.clone()))
-            .child(info_row("Status", status_label));
-
-        if in_process {
-            let reconnecting = matches!(self.state.connection, ConnectionStatus::Connecting);
-            section = section
-                .child(
+        let menu_button = menu_button.when(menu_open, |cell| {
+            cell.child(
+                deferred(
                     div()
-                        .pt_3()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id("reconnect-btn")
-                                .px_3()
-                                .py_1p5()
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .bg(theme::accent())
-                                .text_color(theme::fg())
-                                .hover(|s| s.bg(theme::hover()))
-                                .child(if reconnecting { "Connecting…" } else { "Reconnect now" })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        if let Some(commands) = &this.commands {
-                                            let _ = commands.send(ClientCommand::Reconnect);
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .child("Retries automatically; this skips the backoff wait."),
-                        ),
+                        .absolute()
+                        .top_full()
+                        .right_0()
+                        .pt_1()
+                        .child(menu_list),
                 )
-                .child(
-                    div()
-                        .pt_2()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child("Server is managed by the native launcher. Set C67_SERVER_URL and C67_TOKEN before start to connect elsewhere."),
-                );
-        }
+                .with_priority(2),
+            )
+        });
 
-        section
-    }
-
-    /// Environments page — the web `/settings/connections` environment list
-    /// with this device's live connection status folded in at the top
-    /// (the native-only "Connection" page's content).
-    fn render_environments_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
-            .flex_col()
-            .gap_6()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2p5()
             .child(
                 div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(icon(Icon::Server, 16.).text_color(theme::fg_muted())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .child(
-                        crate::settings_misc::settings_section_title("This device"),
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::fg())
+                            .child(env.label.clone()),
                     )
                     .child(
-                        crate::settings_misc::settings_card(vec![div()
-                            .px_4()
-                            .py_3()
-                            .child(self.render_connection_section(cx))]),
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(subtitle),
                     ),
             )
-            .child(self.render_envs_section(cx))
+            .child(switch)
+            .child(menu_button)
+    }
+
+    /// Environments page — the web `/settings/connections`: a "This app"
+    /// card with the Local environment switch, then the Environments list
+    /// (`EnvironmentRow` cards) with a "+ Add environment" header action.
+    fn render_environments_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let local_on = self.client_config.local_environment_enabled;
+
+        // Web `LocalEnvironmentSetting`: the switch mirrors the startup
+        // state; the persisted flag applies on next launch (the web
+        // restarts the app to apply it — the launcher reads the flag then).
+        let local_switch = div()
+            .id("env-local-switch")
+            .cursor_pointer()
+            .flex_none()
+            .child(switch_control(local_on))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.client_config.local_environment_enabled =
+                        !this.client_config.local_environment_enabled;
+                    this.client_config.save();
+                    cx.notify();
+                }),
+            );
+        let this_app = div()
+            .flex()
+            .flex_col()
+            .child(settings_section_title("This app"))
+            .child(settings_card(vec![setting_row(
+                "Local environment",
+                if local_on {
+                    "Run agents on this computer. Turn off to use 67 Code only with remote environments."
+                } else {
+                    "Turned off. Agents only run in remote environments."
+                },
+                local_switch,
+            )]));
+
+        // "Environments" heading + right-aligned add action (web
+        // `AddEnvironmentDialog` trigger).
+        let env_header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pr_4()
+            .child(settings_section_title("Environments"))
+            .child(
+                div()
+                    .id("env-add-open")
+                    .h(px(28.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_2()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                    .child("+ Add environment")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, window, cx| {
+                            this.open_env_form(window, cx);
+                        }),
+                    ),
+            );
+
+        let mut list = div().flex().flex_col().gap_2();
+        for ix in 0..self.client_config.environments.len() {
+            list = list.child(settings_card(vec![self.render_env_row(ix, cx)]));
+        }
+
+        // A live endpoint that no saved env covers — e.g. supplied via
+        // C67_SERVER_URL/C67_TOKEN — shows read-only. Loopback endpoints
+        // are this app's own server (the "Local environment" row above).
+        let live_url = self.active_endpoint.as_ref().map(|e| e.http_url.clone());
+        let live_is_saved = live_url.as_ref().is_some_and(|url| {
+            self.client_config
+                .environments
+                .iter()
+                .any(|e| &e.http_url == url)
+        });
+        let unsaved_live_url = live_url
+            .as_ref()
+            .filter(|url| !live_is_saved && !is_loopback_url(url));
+        if let Some(url) = unsaved_live_url {
+            let (_, status_label, _) = connection_status(&self.state.connection);
+            let subtitle: SharedString = format!(
+                "{} · {status_label} · Routes › · Permissions ›",
+                url_authority(&url)
+            )
+            .into();
+            list = list.child(settings_card(vec![
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2p5()
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .child(icon(Icon::Server, 16.).text_color(theme::fg_muted())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme::fg())
+                                    .child(url_authority(&url)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(switch_control(true)),
+            ]));
+        }
+
+        if self.client_config.environments.is_empty() && live_url.is_none() {
+            list = list.child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child(
+                        "No saved environments yet — add one to switch servers without restarting.",
+                    ),
+            );
+        }
+
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(this_app)
+            .child(div().flex().flex_col().child(env_header).child(list));
+
+        // The add form replaces the row list's trailing card while open
+        // (inline — the web dialog's contents).
+        if self.env_state.add_open {
+            page = page.child(settings_card(vec![
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("New environment"),
+                    )
+                    .child(self.render_env_add_form(cx)),
+            ]));
+        }
+
+        page
     }
 
     /// Keybindings page — the editable keybinding list plus the native-only
@@ -644,13 +963,12 @@ impl AppView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(
-                        crate::settings_misc::settings_section_title("Built-in shortcuts"),
-                    )
-                    .child(crate::settings_misc::settings_card(vec![div()
-                        .px_4()
-                        .py_3()
-                        .child(self.render_shortcuts_section())])),
+                    .child(crate::settings_misc::settings_section_title(
+                        "Built-in shortcuts",
+                    ))
+                    .child(crate::settings_misc::settings_card(vec![
+                        div().px_4().py_3().child(self.render_shortcuts_section()),
+                    ])),
             )
     }
 
@@ -693,30 +1011,432 @@ impl AppView {
         list
     }
 
-    fn render_about_section(&self) -> impl IntoElement {
-        div()
+    /// Fire the About page's `server.getNpmRelease` check. Gated by the
+    /// Cell flags so first render starts it and later renders no-op;
+    /// "Check for updates" clears `about_update_checked` first to re-run.
+    fn start_about_update_check(&self, cx: &mut Context<Self>) {
+        let state = &self.settings_state;
+        if state.about_update_checked.get() || state.about_update_checking.get() {
+            return;
+        }
+        let Some(rx) = self.send_query("server.getNpmRelease", json!({ "spec": "latest" })) else {
+            state.about_update_checked.set(true);
+            return;
+        };
+        state.about_update_checking.set(true);
+        cx.spawn(async move |this, cx| {
+            let reply = rx.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                let state = &mut this.settings_state;
+                state.about_update_checking.set(false);
+                state.about_update_checked.set(true);
+                state.about_latest = match reply {
+                    Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
+                        exit["value"]["version"].as_str().map(str::to_string)
+                    }
+                    _ => None,
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// About page — the web `AboutSettingsPanel`: an "App" card (Version +
+    /// update check, Update track select, `c67` command install row, Mobile
+    /// app store links, Welcome page) and a "Legal" card (privacy policy,
+    /// open-source licenses).
+    fn render_about_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.start_about_update_check(cx);
+
+        // ── Version + update check ───────────────────────────────────
+        // The release the check compares against is the server's (the
+        // launcher ships app + server together); fall back to this
+        // binary's version when no server reports one.
+        let version: SharedString = self
+            .misc_settings_state
+            .server_version
+            .clone()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+            .into();
+        let checking = self.settings_state.about_update_checking.get();
+        let checked = self.settings_state.about_update_checked.get();
+        let latest = self.settings_state.about_latest.clone();
+        let update_available = latest
+            .as_ref()
+            .is_some_and(|l| l.trim_start_matches('v') != version.trim_start_matches('v'));
+        let connected = self.commands.is_some();
+
+        let update_desc: SharedString = if checking {
+            "Checking for updates…".into()
+        } else if update_available {
+            "Update available.".into()
+        } else if checked && latest.is_none() && !connected {
+            "Update checks need a connected server.".into()
+        } else if checked && latest.is_none() {
+            "No release info from the registry.".into()
+        } else {
+            "Current version of the application.".into()
+        };
+
+        // Web `resolveDesktopUpdateButtonAction` + labels: Download when a
+        // newer release exists, "Up to Date" when current, otherwise a
+        // manual "Check for updates".
+        let version_control: gpui::AnyElement = if checking {
+            outline_button("about-update-btn", "Checking…", None)
+                .opacity(0.5)
+                .into_any_element()
+        } else if update_available {
+            outline_button("about-update-btn", "Download", None)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _ev, _window, _cx| {
+                        crate::explorer::open_external(&format!("{REPO_URL}/releases"));
+                    }),
+                )
+                .into_any_element()
+        } else if checked && latest.is_some() {
+            outline_button("about-update-btn", "Up to Date", None)
+                .opacity(0.5)
+                .into_any_element()
+        } else {
+            let btn = outline_button("about-update-btn", "Check for updates", None);
+            let btn = if connected {
+                btn.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.settings_state.about_update_checked.set(false);
+                        this.settings_state.about_latest = None;
+                        this.start_about_update_check(cx);
+                    }),
+                )
+            } else {
+                btn.opacity(0.5)
+            };
+            btn.into_any_element()
+        };
+
+        let version_title = div()
+            .flex()
+            .items_baseline()
+            .gap_2()
+            .child("Version")
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::fg_muted())
+                    .child(version),
+            );
+
+        // ── Update track ─────────────────────────────────────────────
+        let track = if self.client_config.update_track == "stable" {
+            "Stable"
+        } else {
+            "Nightly"
+        };
+        let mut track_list = div()
+            .min_w(px(180.))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::raised())
+            .shadow_2xl()
+            .flex()
+            .flex_col();
+        for (index, (value, label)) in [("stable", "Stable"), ("nightly", "Nightly")]
+            .into_iter()
+            .enumerate()
+        {
+            let selected = value == self.client_config.update_track;
+            track_list = track_list.child(
+                div()
+                    .id(("about-track", index))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .min_h(px(28.))
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg())
+                    .when(selected, |s| s.bg(theme::selected()))
+                    .when(!selected, |s| s.hover(|s| s.bg(theme::accent())))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.client_config.update_track = value.to_string();
+                            this.client_config.save();
+                            this.settings_state.about_track_open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        let track_cell =
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    div()
+                        .id("about-track-select")
+                        .min_w(px(160.))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::input())
+                        .bg(theme::field_surface())
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::accent()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme::fg())
+                                .child(track),
+                        )
+                        .child(
+                            div().flex_none().flex().items_center().child(
+                                icon(Icon::ChevronDown, 12.).text_color(theme::icon_muted()),
+                            ),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.settings_state.about_track_open =
+                                    !this.settings_state.about_track_open;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .when(self.settings_state.about_track_open, |cell| {
+                    cell.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top_full()
+                                .right_0()
+                                .pt_1()
+                                .child(track_list),
+                        )
+                        .with_priority(2),
+                    )
+                });
+
+        // ── c67 command (web `CliCommandSettingsRow`) ─────────────────
+        // Install target is `~/.local/bin/c67` → the running binary; a
+        // different `c67` earlier on PATH is "shadowed by".
+        let home = std::env::var("HOME").unwrap_or_default();
+        let install_path = format!("{home}/.local/bin/c67");
+        let installed = std::fs::symlink_metadata(&install_path).is_ok();
+        let path_dirs: Vec<std::path::PathBuf> = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect();
+        let install_dir = format!("{home}/.local/bin");
+        let on_path = path_dirs
+            .iter()
+            .any(|d| d.as_os_str() == install_dir.as_str());
+        let which_c67 = path_dirs.iter().find_map(|d| {
+            let candidate = d.join("c67");
+            let meta = std::fs::metadata(&candidate).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    return Some(candidate.display().to_string());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if meta.is_file() {
+                    return Some(candidate.display().to_string());
+                }
+            }
+            None
+        });
+        let shadowed_by = which_c67.filter(|p| p != &install_path);
+
+        let cli_desc: SharedString = if let Some(shadowed) = &shadowed_by {
+            format!(
+                "Another c67 at {shadowed} runs first in a new terminal. Remove it to use 67 Code's."
+            )
+            .into()
+        } else if !installed {
+            "Run 67 Code's CLI as `c67` from any terminal.".into()
+        } else if on_path {
+            format!("Installed at {install_path}. Open a new terminal to use it.").into()
+        } else {
+            format!(
+                "Installed at {install_path}, which is not on your PATH yet. Add its folder to your PATH to run `c67`."
+            )
+            .into()
+        };
+        let cli_desc_el = div()
             .flex()
             .flex_col()
             .gap_1()
+            .child(cli_desc)
+            .when_some(self.settings_state.cli_message.clone(), |col, msg| {
+                col.child(div().text_xs().text_color(theme::fg_muted()).child(msg))
+            });
+
+        let cli_control: gpui::AnyElement = if installed {
+            outline_button("about-cli-btn", "Remove", None)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        let path = install_path.clone();
+                        this.settings_state.cli_message = Some(match std::fs::remove_file(&path) {
+                            Ok(()) => format!("Removed {path}.").into(),
+                            Err(e) => format!("Could not remove {path}: {e}.").into(),
+                        });
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+        } else {
+            let btn = outline_button("about-cli-btn", "Install", None);
+            let btn = if shadowed_by.is_some() {
+                // Web disables install while another binary shadows the
+                // command — installing wouldn't put ours first anyway.
+                btn.opacity(0.5)
+            } else {
+                btn.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        let message: SharedString = 'install: {
+                            let Some(dir) = std::path::Path::new(&install_path).parent() else {
+                                break 'install "Install path has no parent.".into();
+                            };
+                            if let Err(e) = std::fs::create_dir_all(dir) {
+                                break 'install format!("Could not create {}: {e}.", dir.display())
+                                    .into();
+                            }
+                            let Ok(exe) = std::env::current_exe() else {
+                                break 'install "Could not locate the app binary.".into();
+                            };
+                            let _ = std::fs::remove_file(&install_path);
+                            match std::os::unix::fs::symlink(&exe, &install_path) {
+                                Ok(()) => format!(
+                                    "Installed at {install_path}. Open a new terminal to use it."
+                                )
+                                .into(),
+                                Err(e) => format!("Could not install: {e}.").into(),
+                            }
+                        };
+                        this.settings_state.cli_message = Some(message);
+                        cx.notify();
+                    }),
+                )
+            };
+            btn.into_any_element()
+        };
+
+        // ── Assemble cards ───────────────────────────────────────────
+        let app_card = settings_card(vec![
+            about_row(version_title, update_desc, version_control),
+            about_row(
+                "Update track",
+                "Switches this app and every connected machine whose database the target release supports.",
+                track_cell,
+            ),
+            about_row("c67 command", cli_desc_el, cli_control),
+            about_row(
+                "Mobile app",
+                "Connect to your server from your phone or tablet.",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        outline_button("about-mobile-ios", "iPhone and iPad", Some(Icon::Apple))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _ev, _window, _cx| {
+                                    crate::explorer::open_external(REPO_URL);
+                                }),
+                            ),
+                    )
+                    .child(
+                        outline_button("about-mobile-android", "Android", Some(Icon::Android))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _ev, _window, _cx| {
+                                    crate::explorer::open_external(REPO_URL);
+                                }),
+                            ),
+                    ),
+            ),
+            about_row(
+                "Welcome page",
+                "See your agents, import projects, and set up your phone.",
+                outline_button("about-welcome-open", "Open", None).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.welcome_state.open = true;
+                        this.settings_state.open = false;
+                        cx.notify();
+                    }),
+                ),
+            ),
+        ]);
+
+        let legal_card = settings_card(vec![
+            about_row(
+                "Privacy policy",
+                "How we handle your data, including the anonymous usage data 67 Code collects.",
+                outline_button("about-privacy", "View policy", None).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _ev, _window, _cx| {
+                        crate::explorer::open_external(REPO_URL);
+                    }),
+                ),
+            ),
+            about_row(
+                "Open source licenses",
+                "Notices for dependencies, assets, and optional tools used by 67 Code.",
+                outline_button("about-licenses", "View licenses", None).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _ev, _window, _cx| {
+                        crate::explorer::open_external(&format!(
+                            "{REPO_URL}/tree/main/third-party-licenses"
+                        ));
+                    }),
+                ),
+            ),
+        ]);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
             .child(
                 div()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::fg())
-                    .child("67 Code"),
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("App"))
+                    .child(app_card),
             )
             .child(
                 div()
-                    .text_sm()
-                    .text_color(theme::fg_muted())
-                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-            )
-            .child(
-                div()
-                    .pt_3()
-                    .text_sm()
-                    .text_color(theme::fg_muted())
-                    .child("Native GPUI client · Rust orchestration server"),
+                    .flex()
+                    .flex_col()
+                    .child(settings_section_title("Legal"))
+                    .child(legal_card),
             )
     }
 
@@ -797,7 +1517,7 @@ impl AppView {
                 "Threads",
                 self.render_threads_section(cx).into_any_element(),
             ),
-            Section::About => ("About", self.render_about_section().into_any_element()),
+            Section::About => ("About", self.render_about_section(cx).into_any_element()),
         };
 
         // Web header: h-12 border-b ps-5 pe-2 with a "Settings / <section>"
