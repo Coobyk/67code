@@ -69,7 +69,7 @@ const TIME_FORMATS: &[(&str, &str)] = &[
 
 /// `defaultRuntimeMode` options — labels/descriptions from
 /// apps/web/src/components/chat/runtimeModeConfig.ts.
-const RUNTIME_MODES: &[(&str, &str, &str)] = &[
+pub(crate) const RUNTIME_MODES: &[(&str, &str, &str)] = &[
     (
         "approval-required",
         "Supervised",
@@ -94,7 +94,8 @@ const RUNTIME_MODES: &[(&str, &str, &str)] = &[
 
 /// `defaultThreadEnvMode` options — labels from
 /// `resolveEnvModeLabel` in apps/web/src/components/BranchToolbar.logic.ts.
-const ENV_MODES: &[(&str, &str)] = &[("local", "Current checkout"), ("worktree", "New worktree")];
+pub(crate) const ENV_MODES: &[(&str, &str)] =
+    &[("local", "Current checkout"), ("worktree", "New worktree")];
 
 /// `ProjectScript.icon` literals — the enum in
 /// packages/contracts/src/project.ts.
@@ -140,6 +141,29 @@ pub(crate) enum OpenList {
     ResponseStreaming,
     ScWritingMode,
     ScWriterModel,
+    // New canonical pages (Chat / Diffs / Voice / SnapShots / Browser /
+    // Worktrees / Providers) — client-local unless noted:
+    SendShortcut,
+    FollowUpBehavior,
+    ToolCallVisibility,
+    ScreenReader,
+    DiffColors,
+    VoiceShortcut,
+    SpeechLanguage,
+    SnapShortcut,
+    SnapSound,
+    BrowserLink,
+    BrowserEngine,
+    IdleCompaction,
+    BranchNamingMode,
+    MergeMethod,
+    WorktreeCleanup,
+    BackgroundProfile,
+    /// Per-row snooze preset "when" select (row index payload — triggers
+    /// render with row-scoped ids, not `select_trigger`).
+    SnoozeWhen(usize),
+    /// Per-row snooze preset "unit" select for `after` presets.
+    SnoozeUnit(usize),
 }
 
 impl State {
@@ -179,6 +203,24 @@ impl OpenList {
             OpenList::ResponseStreaming => "extra-resp-streaming",
             OpenList::ScWritingMode => "extra-sc-writing-mode",
             OpenList::ScWriterModel => "extra-sc-writer-model",
+            OpenList::SendShortcut => "extra-send-shortcut",
+            OpenList::FollowUpBehavior => "extra-followup-behavior",
+            OpenList::ToolCallVisibility => "extra-tool-visibility",
+            OpenList::ScreenReader => "extra-screen-reader",
+            OpenList::DiffColors => "extra-diff-colors",
+            OpenList::VoiceShortcut => "extra-voice-shortcut",
+            OpenList::SpeechLanguage => "extra-speech-language",
+            OpenList::SnapShortcut => "extra-snap-shortcut",
+            OpenList::SnapSound => "extra-snap-sound",
+            OpenList::BrowserLink => "extra-browser-link",
+            OpenList::BrowserEngine => "extra-browser-engine",
+            OpenList::IdleCompaction => "extra-idle-compaction",
+            OpenList::BranchNamingMode => "extra-branch-naming",
+            OpenList::MergeMethod => "extra-merge-method",
+            OpenList::WorktreeCleanup => "extra-worktree-cleanup",
+            OpenList::BackgroundProfile => "extra-background-profile",
+            OpenList::SnoozeWhen(_) => "snooze-when",
+            OpenList::SnoozeUnit(_) => "snooze-unit",
         }
     }
 }
@@ -195,7 +237,7 @@ pub struct State {
     /// Last settings load/write failure, shown as a status line.
     pub(crate) settings_error: Option<String>,
     /// Expanded option list, if any.
-    open_list: Option<OpenList>,
+    pub(crate) open_list: Option<OpenList>,
     /// Settings scope: `Some(project_id)` makes scoped rows write
     /// `settings.projectSettingsOverrides[project_id]` instead of the global
     /// setting. Mirrors the web's Global/Project scope selector
@@ -204,6 +246,10 @@ pub struct State {
     pub(crate) scope_project: Option<String>,
     /// `server.getConfig → environment.serverVersion` (About & updates row).
     pub(crate) server_version: Option<String>,
+    /// `server.getConfig → providers` — the live provider-instance rows the
+    /// Providers page renders (status/version/availability). Same payload
+    /// the composer mirrors into `composer_state.config_providers`.
+    pub(crate) providers: Vec<Value>,
     /// Wave-3 sections (Keybindings / Source Control / Threads) — the
     /// AppView field list lives in lib.rs, so extra-section state hangs off
     /// this struct instead.
@@ -520,6 +566,11 @@ impl AppView {
                         match reply {
                             Ok(exit) if exit["_tag"].as_str() == Some("Success") => {
                                 state.settings = exit["value"]["settings"].clone();
+                                if let Some(providers) =
+                                    exit["value"]["providers"].as_array()
+                                {
+                                    state.providers = providers.clone();
+                                }
                                 state.server_version =
                                     exit["value"]["environment"]["serverVersion"]
                                         .as_str()
@@ -600,6 +651,27 @@ impl AppView {
                     if let Value::Object(dst) = dst {
                         for (pid, entry) in src {
                             dst.insert(pid.clone(), entry.clone());
+                        }
+                    }
+                    continue;
+                }
+                // `providerInstances`, `usageLimitSources` and
+                // `textGenerators` merge per entry on the server; a `null`
+                // entry removes it. Mirror the same semantics so the UI
+                // doesn't flicker before the reply lands.
+                if matches!(
+                    key.as_str(),
+                    "providerInstances" | "usageLimitSources" | "textGenerators"
+                ) && let Value::Object(src) = value
+                {
+                    let dst = settings.entry(key.clone()).or_insert_with(|| json!({}));
+                    if let Value::Object(dst) = dst {
+                        for (id, entry) in src {
+                            if entry.is_null() {
+                                dst.remove(id);
+                            } else {
+                                dst.insert(id.clone(), entry.clone());
+                            }
                         }
                     }
                     continue;
@@ -987,6 +1059,111 @@ impl AppView {
                 };
                 self.update_scoped_setting("sourceControlWriterModelSelection", selection, cx);
             }
+            // ── Client-local picks (ClientSettings mirrors → ClientConfig) ─
+            OpenList::SendShortcut => {
+                self.client_config.send_shortcut = value;
+                self.client_config.save();
+            }
+            OpenList::FollowUpBehavior => {
+                self.client_config.follow_up_behavior = value;
+                self.client_config.save();
+            }
+            OpenList::ToolCallVisibility => {
+                self.client_config.tool_call_visibility = value;
+                self.client_config.save();
+            }
+            OpenList::ScreenReader => {
+                self.client_config.screen_reader_announcements = value;
+                self.client_config.save();
+            }
+            OpenList::DiffColors => {
+                self.client_config.diff_color_scheme = value;
+                self.client_config.save();
+            }
+            OpenList::VoiceShortcut => {
+                self.client_config.voice_shortcut_mode = value;
+                self.client_config.save();
+            }
+            OpenList::SpeechLanguage => {
+                self.client_config.speech_language = value;
+                self.client_config.save();
+            }
+            OpenList::SnapShortcut => {
+                self.client_config.snap_shot_shortcut = value;
+                self.client_config.save();
+            }
+            OpenList::SnapSound => {
+                self.client_config.snap_shot_sound = value;
+                self.client_config.save();
+            }
+            OpenList::BrowserLink => {
+                self.client_config.browser_link_target = value;
+                self.client_config.save();
+            }
+            OpenList::BrowserEngine => {
+                self.client_config.browser_search_engine = value;
+                self.client_config.save();
+            }
+            OpenList::IdleCompaction => {
+                // `idleCompactionPatch`: send the mode plus the legacy boolean
+                // older servers still read (`withIdleCompaction`).
+                self.update_server_settings(
+                    json!({
+                        "idleCompaction": value,
+                        "compactIdleThreads": value == "beforeCacheExpires",
+                    }),
+                    cx,
+                );
+            }
+            OpenList::BranchNamingMode => {
+                self.update_scoped_setting("branchNamingMode", Value::String(value), cx);
+            }
+            OpenList::MergeMethod => {
+                let method = if value == "last" {
+                    Value::Null
+                } else {
+                    Value::String(value)
+                };
+                self.update_scoped_setting("pullRequestMergeMethod", method, cx);
+            }
+            OpenList::WorktreeCleanup => {
+                // String select → the nullable {mode,rules} union; "custom"
+                // writes the contract's default rule set (the web then edits
+                // rules individually — not modeled natively).
+                let cleanup = match value.as_str() {
+                    "off" => json!({ "mode": "off" }),
+                    "custom" => json!({
+                        "mode": "custom",
+                        "rules": {
+                            "worktreeKeepWhen": "uncommitted-changes",
+                            "worktreeAfterDays": 30,
+                            "worktreeSettledAfterDays": null,
+                            "worktreeOnMerge": true,
+                            "worktreeOnDelete": true,
+                            "worktreeUnchanged": false,
+                        },
+                    }),
+                    _ => Value::Null,
+                };
+                self.update_scoped_setting("worktreeCleanup", cleanup, cx);
+            }
+            OpenList::BackgroundProfile => {
+                // Merge into the stored object so `baseProfile`/`overrides`
+                // survive the profile switch.
+                let mut activity = self.misc_settings_state.settings["backgroundActivity"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                activity.insert("profile".into(), json!(value));
+                self.update_server_settings(
+                    json!({ "backgroundActivity": Value::Object(activity) }),
+                    cx,
+                );
+            }
+            // Snooze row picks are handled in settings_extra.rs — the pick
+            // arrives here because `misc_pick` is the shared sink; delegate.
+            OpenList::SnoozeWhen(row) => self.snooze_pick_when(row, &value, cx),
+            OpenList::SnoozeUnit(row) => self.snooze_pick_unit(row, &value, cx),
         }
         cx.notify();
     }
@@ -1397,208 +1574,6 @@ impl AppView {
                     }),
                 ),
         )
-    }
-
-    // ─── Chat defaults ────────────────────────────────────────────────────
-
-    pub(crate) fn render_chat_defaults_section(&self, cx: &mut Context<Self>) -> gpui::Div {
-        self.maybe_load_misc_settings(cx);
-        let state = &self.misc_settings_state;
-        let settings = &state.settings;
-        let connected = self.commands.is_some();
-        let mut section = div().flex().flex_col();
-
-        if !connected {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Connect to a server to change chat defaults."),
-            );
-        } else if state.settings_loading.get() && !state.settings_loaded.get() {
-            section = section.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child(icon(Icon::LoaderCircle, 12.).text_color(theme::fg_muted()))
-                    .child("Loading settings…"),
-            );
-        }
-        if let Some(error) = &state.settings_error {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(danger())
-                    .child(error.clone()),
-            );
-        }
-
-        if connected {
-            section = section.child(self.render_scope_selector(cx));
-        }
-
-        // ── Default model (defaultModelSelection, scoped) ────────────────
-        // `apply_server_defaults` pushes the global value into the composer
-        // whenever the user hasn't explicitly picked a model — the chip then
-        // shows the server default for new threads.
-        let default_selection = self.scoped_value("defaultModelSelection");
-        let default_selection = &default_selection;
-        let default_value = if default_selection.is_null() {
-            AUTO_VALUE.to_string()
-        } else {
-            pack_model(
-                default_selection["instanceId"]
-                    .as_str()
-                    .or_else(|| default_selection["provider"].as_str())
-                    .unwrap_or_default(),
-                default_selection["model"].as_str().unwrap_or_default(),
-            )
-        };
-        let mut model_options = vec![(
-            AUTO_VALUE.to_string(),
-            "Automatic".to_string(),
-            Some("Picked from the thread's provider.".to_string()),
-        )];
-        for (instance, model, label) in MODEL_CATALOG {
-            model_options.push((
-                pack_model(instance, model),
-                (*label).to_string(),
-                Some(format!("{instance}/{model}")),
-            ));
-        }
-        let default_label: SharedString = if default_selection.is_null() {
-            "Automatic".into()
-        } else {
-            Self::selection_label(default_selection).into()
-        };
-        section = section.child(self.scoped_select_setting(
-            "Model",
-            "Default model for new threads. Projects can override it.",
-            OpenList::DefaultModel,
-            "defaultModelSelection",
-            default_label,
-            &default_value,
-            model_options,
-            cx,
-        ));
-
-        // ── Fallback model (fallbackModelSelection) ──────────────────────
-        let fallback_selection = &settings["fallbackModelSelection"];
-        let fallback_value = if fallback_selection.is_null() {
-            AUTO_VALUE.to_string()
-        } else {
-            pack_model(
-                fallback_selection["instanceId"]
-                    .as_str()
-                    .or_else(|| fallback_selection["provider"].as_str())
-                    .unwrap_or_default(),
-                fallback_selection["model"].as_str().unwrap_or_default(),
-            )
-        };
-        let mut fallback_options = vec![(AUTO_VALUE.to_string(), "None".to_string(), None)];
-        for (instance, model, label) in MODEL_CATALOG {
-            fallback_options.push((
-                pack_model(instance, model),
-                (*label).to_string(),
-                Some(format!("{instance}/{model}")),
-            ));
-        }
-        let fallback_label: SharedString = if fallback_selection.is_null() {
-            "None".into()
-        } else {
-            Self::selection_label(fallback_selection).into()
-        };
-        section = section.child(self.select_setting(
-            "Fallback model",
-            "Used for new threads when the default model's provider is out of usage.",
-            OpenList::FallbackModel,
-            fallback_label,
-            &fallback_value,
-            fallback_options,
-            cx,
-        ));
-
-        // ── Default permissions (defaultRuntimeMode, scoped) ─────────────
-        let runtime_mode = self
-            .scoped_value("defaultRuntimeMode")
-            .as_str()
-            .unwrap_or("full-access")
-            .to_string();
-        let runtime_label = RUNTIME_MODES
-            .iter()
-            .find(|(value, _, _)| *value == runtime_mode.as_str())
-            .map(|(_, label, _)| (*label).to_string())
-            .unwrap_or_else(|| runtime_mode.clone());
-        section = section.child(
-            self.scoped_select_setting(
-                "Default permissions",
-                "Default permissions for new threads. Projects can override them.",
-                OpenList::RuntimeMode,
-                "defaultRuntimeMode",
-                runtime_label.into(),
-                &runtime_mode,
-                RUNTIME_MODES
-                    .iter()
-                    .map(|(value, label, detail)| {
-                        (
-                            value.to_string(),
-                            label.to_string(),
-                            Some(detail.to_string()),
-                        )
-                    })
-                    .collect(),
-                cx,
-            ),
-        );
-
-        // ── Workspace (defaultThreadEnvMode; null inherits, scoped) ──────
-        let env_mode = self
-            .scoped_value("defaultThreadEnvMode")
-            .as_str()
-            .map(str::to_string);
-        let env_mode = env_mode.as_deref();
-        let env_value = env_mode.unwrap_or("inherit");
-        let env_label = match env_mode {
-            None => "Inherit",
-            Some("local") => "Current checkout",
-            Some("worktree") => "New worktree",
-            Some(other) => other,
-        };
-        let mut env_options = vec![(
-            "inherit".to_string(),
-            "Inherit".to_string(),
-            Some("Follow the project's t3.json, then local.".to_string()),
-        )];
-        for (value, label) in ENV_MODES {
-            env_options.push((value.to_string(), label.to_string(), None));
-        }
-        section = section.child(self.scoped_select_setting(
-            "Workspace",
-            "Where new threads start. Projects and their t3.json can override it.",
-            OpenList::EnvMode,
-            "defaultThreadEnvMode",
-            env_label.into(),
-            env_value,
-            env_options,
-            cx,
-        ));
-
-        // ── Automatically pull (defaultAutoPull, scoped) ─────────────────
-        section = section.child(self.scoped_switch_row(
-            "Automatically pull",
-            "Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.",
-            "defaultAutoPull",
-            "misc-autopull-switch",
-            cx,
-        ));
-
-        section
     }
 
     // ─── Projects ─────────────────────────────────────────────────────────

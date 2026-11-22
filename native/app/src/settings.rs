@@ -1,21 +1,28 @@
-//! Settings surface (P1): modal panel toggled with cmd-, or via palette.
+//! Settings surface: modal panel toggled with cmd-, or via palette.
 //!
-//! Left nav + right content layout mirroring the web settings dialogs.
-//! Connection shows the live endpoint/status, Providers mirrors the composer
-//! model catalog (also selectable here — same `provider`/`model` fields the
-//! composer picker writes), Shortcuts is a static reference, About carries
-//! version/branding.
+//! Left nav + right content layout mirroring the web settings dialogs —
+//! the canonical `SETTINGS_NAV_GROUPS` from apps/web (General … SnapShots,
+//! Agents, Code, Connections, Maintenance/Labs/About/Archive) with the
+//! bottom-left avatar chip the web's `SidebarFooter` renders. Page
+//! renderers live in settings_misc/settings_extra/settings_backend plus
+//! the per-area modules (appearance, envs, clients, acp, integrations,
+//! archived).
 
 use gpui::{Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px, rgb};
 
-use crate::composer::MODEL_CATALOG;
 use crate::icons::{Icon, icon};
 use crate::model::ConnectionStatus;
 use crate::net::ClientCommand;
 use crate::theme;
 use crate::{AppView, ToggleSettings};
 
-/// Sections listed in the settings left nav.
+/// Sections listed in the settings left nav — the canonical web nav
+/// (`SETTINGS_NAV_GROUPS` in apps/web settingsSearch.ts), one variant per
+/// `/settings/<path>` page. Native-only sections were folded into the
+/// matching web page: Connection → Environments, Authorized Clients →
+/// Sharing & access, Diagnostics + Usage → Maintenance, Keyboard
+/// Shortcuts → Keybindings, ACP Sessions → Providers, Integrations →
+/// Browser.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Section {
     /// The web's `/settings/general` page — notification preferences and
@@ -24,43 +31,50 @@ pub enum Section {
     #[default]
     General,
     Appearance,
-    Connection,
-    Environments,
-    Providers,
-    AcpSessions,
-    Clients,
-    ArchivedThreads,
-    ChatDefaults,
-    Projects,
-    ScheduledTasks,
-    Secrets,
-    Diagnostics,
-    Usage,
-    Shortcuts,
+    /// Web `/settings/chat` — composer, follow-ups, and activity prefs.
+    Chat,
+    /// Web `/settings/diffs` — "Diffs & pull requests".
+    Diffs,
     Keybindings,
-    SourceControl,
-    Integrations,
+    Voice,
+    SnapShots,
+    Providers,
     Threads,
+    Browser,
+    Devices,
+    ScheduledTasks,
+    Projects,
+    SourceControl,
+    Worktrees,
+    /// Web `/settings/connections` — the environment list plus this
+    /// device's live connection status.
+    Environments,
+    /// Web `/settings/access` — authorized clients / sharing.
+    SharingAccess,
+    Secrets,
+    /// Web `/settings/maintenance` — updates, background activity, plus
+    /// the native diagnostics and usage panels folded in.
+    Maintenance,
+    Labs,
     About,
+    /// Web `/settings/archived`.
+    Archive,
 }
 
-/// Left-nav groups (heading, sections) mirroring `SETTINGS_NAV_GROUPS` in
-/// apps/web settingsSearch.ts: an unheaded block (General … SnapShots),
-/// Agents, Code, Connections, and a trailing unheaded block. Sections the
-/// web has but native doesn't implement (Diffs & pull requests, Voice,
-/// SnapShots, Browser, Devices, Worktrees, Maintenance, Labs) are omitted
-/// rather than stubbed; native-only sections (Keyboard Shortcuts,
-/// ACP Sessions, Connection, Authorized Clients, Diagnostics, Usage)
-/// stay in the nearest matching group.
+/// Left-nav groups (heading, sections) — identical to the web
+/// `SETTINGS_NAV_GROUPS`: an unheaded block (General … SnapShots),
+/// Agents, Code, Connections, and a trailing unheaded block.
 const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
     (
         None,
         &[
             (Section::General, "General"),
             (Section::Appearance, "Appearance"),
-            (Section::ChatDefaults, "Chat"),
+            (Section::Chat, "Chat"),
+            (Section::Diffs, "Diffs & pull requests"),
             (Section::Keybindings, "Keybindings"),
-            (Section::Shortcuts, "Keyboard Shortcuts"),
+            (Section::Voice, "Voice"),
+            (Section::SnapShots, "SnapShots"),
         ],
     ),
     (
@@ -68,7 +82,8 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
         &[
             (Section::Providers, "Providers"),
             (Section::Threads, "Threads"),
-            (Section::AcpSessions, "ACP Sessions"),
+            (Section::Browser, "Browser"),
+            (Section::Devices, "Devices"),
             (Section::ScheduledTasks, "Scheduled tasks"),
         ],
     ),
@@ -77,25 +92,24 @@ const NAV_GROUPS: &[(Option<&str>, &[(Section, &str)])] = &[
         &[
             (Section::Projects, "Projects"),
             (Section::SourceControl, "Source control"),
-            (Section::Integrations, "Integrations"),
+            (Section::Worktrees, "Worktrees"),
         ],
     ),
     (
         Some("Connections"),
         &[
-            (Section::Connection, "Connection"),
             (Section::Environments, "Environments"),
-            (Section::Clients, "Authorized clients"),
+            (Section::SharingAccess, "Sharing & access"),
             (Section::Secrets, "Secrets"),
         ],
     ),
     (
         None,
         &[
-            (Section::Diagnostics, "Diagnostics"),
-            (Section::Usage, "Usage Limits"),
+            (Section::Maintenance, "Maintenance"),
+            (Section::Labs, "Labs"),
             (Section::About, "About"),
-            (Section::ArchivedThreads, "Archive"),
+            (Section::Archive, "Archive"),
         ],
     ),
 ];
@@ -106,24 +120,26 @@ fn section_icon(section: Section) -> Icon {
     match section {
         Section::General => Icon::Settings2,
         Section::Appearance => Icon::Palette,
-        Section::ChatDefaults => Icon::MessageSquareText,
+        Section::Chat => Icon::MessageSquareText,
+        Section::Diffs => Icon::FileDiff,
         Section::Keybindings => Icon::Keyboard,
-        Section::Shortcuts => Icon::ScrollText,
+        Section::Voice => Icon::Mic,
+        Section::SnapShots => Icon::SnapShot,
         Section::Providers => Icon::Bot,
-        Section::AcpSessions => Icon::Activity,
         Section::Threads => Icon::MessagesSquare,
+        Section::Browser => Icon::Globe,
+        Section::Devices => Icon::Smartphone,
         Section::ScheduledTasks => Icon::CalendarClock,
         Section::Projects => Icon::PanelsTopLeft,
         Section::SourceControl => Icon::GitBranch,
-        Section::Integrations => Icon::Link,
-        Section::Connection => Icon::Globe,
+        Section::Worktrees => Icon::FolderTree,
         Section::Environments => Icon::Server,
-        Section::Clients => Icon::ShieldCheck,
+        Section::SharingAccess => Icon::ShieldCheck,
         Section::Secrets => Icon::KeyRound,
-        Section::Diagnostics => Icon::Wrench,
-        Section::Usage => Icon::ChartNoAxesColumn,
-        Section::ArchivedThreads => Icon::Archive,
+        Section::Maintenance => Icon::Wrench,
+        Section::Labs => Icon::FlaskConical,
         Section::About => Icon::Info,
+        Section::Archive => Icon::Archive,
     }
 }
 
@@ -257,13 +273,9 @@ impl AppView {
                 .id("settings-nav-scroll")
                 .flex()
                 .flex_col()
-                .w(px(240.))
-                .flex_none()
-                .h_full()
+                .flex_1()
+                .min_h_0()
                 .overflow_y_scroll()
-                .border_r_1()
-                .border_color(theme::border())
-                .bg(theme::sidebar())
                 .px_2()
                 .py_3()
                 .gap_1()
@@ -396,7 +408,7 @@ impl AppView {
                         .child("No settings found"),
                 );
             }
-            return nav;
+            return self.settings_nav_shell(nav);
         }
 
         let mut index = 0usize;
@@ -456,7 +468,55 @@ impl AppView {
                     .when(group_ix + 1 < NAV_GROUPS.len(), |g| g.mb_3()),
             );
         }
-        nav
+        self.settings_nav_shell(nav)
+    }
+
+    /// Sidebar shell: the scrollable nav on top and the `SidebarFooter`
+    /// avatar chip pinned bottom-left (web `T3ConnectSidebarAvatar` — a
+    /// size-6 rounded-full user mark; native has no account, so it shows the
+    /// connected environment's initial).
+    fn settings_nav_shell(&self, nav: gpui::Stateful<gpui::Div>) -> gpui::Div {
+        let initial: SharedString = self
+            .endpoint_label
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "T".to_string())
+            .into();
+        div()
+            .flex()
+            .flex_col()
+            .w(px(240.))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(theme::border())
+            .bg(theme::sidebar())
+            .child(nav)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .flex_none()
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::primary())
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::canvas())
+                            .child(initial),
+                    ),
+            )
     }
 
     fn render_connection_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -547,59 +607,51 @@ impl AppView {
         section
     }
 
-    fn render_providers_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div()
+    /// Environments page — the web `/settings/connections` environment list
+    /// with this device's live connection status folded in at the top
+    /// (the native-only "Connection" page's content).
+    fn render_environments_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
             .flex()
             .flex_col()
-            .child(group_label("Model used for new threads and messages"));
-        for (index, (instance, model, label)) in MODEL_CATALOG.iter().enumerate() {
-            let active = self.provider == *instance && self.model == *model;
-            list = list.child(
+            .gap_6()
+            .child(
                 div()
-                    .id(("provider", index))
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(active, |s| s.bg(theme::selected()).text_color(theme::fg()))
-                    .when(!active, |s| {
-                        s.text_color(theme::fg()).hover(|s| s.bg(theme::hover()))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            this.provider = (*instance).to_string();
-                            this.model = (*model).to_string();
-                            cx.notify();
-                        }),
+                    .flex_col()
+                    .child(
+                        crate::settings_misc::settings_section_title("This device"),
                     )
                     .child(
-                        div()
-                            .w(px(14.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .when(active, |el| {
-                                el.child(icon(Icon::Check, 12.).text_color(theme::primary()))
-                            }),
-                    )
-                    .child(div().flex_none().child(*label))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme::fg_muted())
-                            .child(format!("{instance}/{model}")),
+                        crate::settings_misc::settings_card(vec![div()
+                            .px_4()
+                            .py_3()
+                            .child(self.render_connection_section(cx))]),
                     ),
-            );
-        }
-        list
+            )
+            .child(self.render_envs_section(cx))
+    }
+
+    /// Keybindings page — the editable keybinding list plus the native-only
+    /// "Keyboard Shortcuts" static reference folded in at the bottom.
+    fn render_keybindings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(self.render_keybindings_section(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        crate::settings_misc::settings_section_title("Built-in shortcuts"),
+                    )
+                    .child(crate::settings_misc::settings_card(vec![div()
+                        .px_4()
+                        .py_3()
+                        .child(self.render_shortcuts_section())])),
+            )
     }
 
     fn render_shortcuts_section(&self) -> impl IntoElement {
@@ -674,73 +726,72 @@ impl AppView {
                 "Appearance",
                 self.render_appearance_section(cx).into_any_element(),
             ),
-            Section::Connection => (
-                "Connection",
-                self.render_connection_section(cx).into_any_element(),
-            ),
             Section::Environments => (
                 "Environments",
-                self.render_envs_section(cx).into_any_element(),
+                self.render_environments_page(cx).into_any_element(),
             ),
             Section::Providers => (
                 "Providers",
                 self.render_providers_section(cx).into_any_element(),
             ),
-            Section::AcpSessions => (
-                "ACP Sessions",
-                self.render_acp_section(cx).into_any_element(),
-            ),
-            Section::Clients => (
-                "Authorized Clients",
+            Section::SharingAccess => (
+                "Sharing & access",
                 self.render_clients_section(cx).into_any_element(),
             ),
-            Section::ArchivedThreads => (
-                "Archived Threads",
+            Section::Archive => (
+                "Archive",
                 self.render_archived_section(cx).into_any_element(),
             ),
             Section::General => (
                 "General",
                 self.render_notifications_section(cx).into_any_element(),
             ),
-            Section::ChatDefaults => (
-                "Chat",
-                self.render_chat_defaults_section(cx).into_any_element(),
+            Section::Chat => ("Chat", self.render_chat_section(cx).into_any_element()),
+            Section::Diffs => (
+                "Diffs & pull requests",
+                self.render_diffs_section(cx).into_any_element(),
             ),
+            Section::Voice => ("Voice", self.render_voice_section(cx).into_any_element()),
+            Section::SnapShots => (
+                "SnapShots",
+                self.render_snapshots_section(cx).into_any_element(),
+            ),
+            Section::Browser => (
+                "Browser",
+                self.render_browser_section(cx).into_any_element(),
+            ),
+            Section::Devices => (
+                "Devices",
+                self.render_devices_section(cx).into_any_element(),
+            ),
+            Section::Worktrees => (
+                "Worktrees",
+                self.render_worktrees_section(cx).into_any_element(),
+            ),
+            Section::Maintenance => (
+                "Maintenance",
+                self.render_maintenance_section(cx).into_any_element(),
+            ),
+            Section::Labs => ("Labs", self.render_labs_section(cx).into_any_element()),
             Section::Projects => (
                 "Projects",
                 self.render_projects_section(cx).into_any_element(),
             ),
             Section::ScheduledTasks => (
-                "Scheduled Tasks",
+                "Scheduled tasks",
                 self.render_tasks_section(cx).into_any_element(),
             ),
             Section::Secrets => (
                 "Secrets",
                 self.render_secrets_section(cx).into_any_element(),
             ),
-            Section::Diagnostics => (
-                "Diagnostics",
-                self.render_diagnostics_section(cx).into_any_element(),
-            ),
-            Section::Usage => (
-                "Usage Limits",
-                self.render_usage_section(cx).into_any_element(),
-            ),
-            Section::Shortcuts => (
-                "Keyboard Shortcuts",
-                self.render_shortcuts_section().into_any_element(),
-            ),
             Section::Keybindings => (
                 "Keybindings",
-                self.render_keybindings_section(cx).into_any_element(),
+                self.render_keybindings_page(cx).into_any_element(),
             ),
             Section::SourceControl => (
-                "Source Control",
+                "Source control",
                 self.render_source_control_section(cx).into_any_element(),
-            ),
-            Section::Integrations => (
-                "Integrations",
-                self.render_integrations_section(cx).into_any_element(),
             ),
             Section::Threads => (
                 "Threads",
