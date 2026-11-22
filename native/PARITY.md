@@ -217,15 +217,19 @@ Remaining divergences (all evidence-based):
 - Sidebar "Searching thread messages…" pending state is unreachable —
   native search is synchronous local filtering.
 - Sidebar cards: line-2 right glyph is the status icon (web renders a
-  provider badge — no provider artwork bundled); "No project" uses a
-  solid `message-square` (no dashed variant bundled); unpin keeps the
-  Pin glyph brightened (no `pin-off` asset); snooze applies the first
-  preset instantly instead of opening the preset menu; pinned
-  drag-reorder is not implemented; "Working Nm" live-status line is
-  not rendered (no live-status thread in the wire model).
+  provider badge — no provider artwork bundled); pinned drag-reorder
+  is not implemented; "Working Nm" live-status line is not rendered
+  (no live-status thread in the wire model).
 - Composer send uses a simplified 2-stop gradient vs the web's
   stage-backdrop art; the footer does not collapse to an ellipsis at
   narrow widths.
 - A few semantic colors (destructive reds, warning ambers) in
   settings/archived/notifications are literal hex rather than theme
   tokens — visually identical in both themes, just not token-driven.
+- Model picker structure is the web's 3-pane popover; on environments
+  without provider optionDescriptors the effort pane shows the static
+  Default/Low/Medium/High fallback, matching the web's empty state.
+- Settings nav matches the web's groups/order/labels; sections the
+  server can't fully drive (Voice transcription models, SnapShots
+  capture, Browser remote sessions) render their web-shaped cards
+  with the data the wire exposes.
