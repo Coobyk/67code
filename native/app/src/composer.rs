@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     BoxShadow, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler, ExternalPaths,
-    Focusable, FontWeight, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, SharedString,
-    Subscription, Window, div, img, prelude::*, px, rgb, rgba,
+    Focusable, FontWeight, Hsla, KeystrokeEvent, MouseButton, ObjectFit, RenderImage, SharedString,
+    Subscription, Window, div, fill, img, prelude::*, px, rgb, rgba,
 };
 use serde_json::json;
 
@@ -58,6 +58,31 @@ pub struct State {
     /// User explicitly picked a permission mode; blocks
     /// `defaultRuntimeMode` from reseeding `runtime_mode`.
     pub runtime_mode_picked: bool,
+    /// Model picker left-rail tab: "favorites" or a provider instanceId.
+    pub model_picker_tab: String,
+    /// Inline search field while the model picker is open.
+    pub model_search: Option<Entity<TextField>>,
+    /// The search field's focus handle, stored at open so the focus underline
+    /// canvas can query `is_focused` during paint (render has `&self` only).
+    pub model_search_focus: Option<gpui::FocusHandle>,
+    /// Mirror of the search field's content, synced after each keystroke —
+    /// drives the model-row filter (rendering has `&self` only).
+    pub model_search_text: String,
+    /// Highlighted model row for Up/Down + Enter selection.
+    pub model_picker_highlight: usize,
+    /// Favourited models (`"instanceId|slug"` keys) — the rail's star tab.
+    pub model_favorites: std::collections::HashSet<String>,
+    /// Provider instanceIds whose legacy-model section is expanded
+    /// (web "Show more" toggle).
+    pub model_legacy_expanded: std::collections::HashSet<String>,
+    /// Footer sub-menu open inside the model picker: "" | "permissions" | "overflow".
+    pub model_footer_menu: String,
+    /// Option-descriptor id `effort` belongs to — emitted as the option's
+    /// `id` (web models call it `reasoningEffort`/`effort`/agent-specific ids).
+    pub effort_option: String,
+    /// Non-effort provider-option picks made in the effort column/footer
+    /// (descriptor id → value; merged into `modelSelection.options`).
+    pub extra_model_options: std::collections::HashMap<String, serde_json::Value>,
     /// Run-options pick for the next dispatch on a busy thread —
     /// `steer_active`/`restart_active`/`queue_after_active`. Consumed by
     /// `on_prompt_submitted` in lib.rs; None = default queue behavior.
@@ -171,6 +196,16 @@ impl Default for State {
             effort: String::new(),
             model_picked: false,
             runtime_mode_picked: false,
+            model_picker_tab: String::new(),
+            model_search: None,
+            model_search_focus: None,
+            model_search_text: String::new(),
+            model_picker_highlight: 0,
+            model_favorites: std::collections::HashSet::new(),
+            model_legacy_expanded: std::collections::HashSet::new(),
+            model_footer_menu: String::new(),
+            effort_option: "effort".to_string(),
+            extra_model_options: std::collections::HashMap::new(),
             dispatch_override: None,
             history_index: None,
             history_draft: String::new(),
@@ -420,9 +455,30 @@ const RUNTIME_MODES: &[(&str, &str)] = &[
     ("approval-required", "Supervised"),
 ];
 
-/// Reasoning-effort cycle for the footer chip; `""` emits no option so the
-/// provider applies its own default.
-const EFFORT_LEVELS: &[&str] = &["", "low", "medium", "high"];
+/// `(mode, label, description)` in `runtimeModeConfig` order — the model
+/// picker's permissions segment renders these left to right.
+const RUNTIME_MODE_DEFS: &[(&str, &str, &str)] = &[
+    (
+        "approval-required",
+        "Supervised",
+        "Ask before commands and file changes.",
+    ),
+    (
+        "auto-accept-edits",
+        "Auto-accept edits",
+        "Auto-approve edits, ask before other actions.",
+    ),
+    (
+        "auto",
+        "Auto",
+        "Supported providers approve routine actions; others still ask.",
+    ),
+    (
+        "full-access",
+        "Full access",
+        "Allow commands and edits without prompts.",
+    ),
+];
 
 fn effort_label(effort: &str) -> &'static str {
     match effort {
@@ -431,6 +487,239 @@ fn effort_label(effort: &str) -> &'static str {
         "high" => "High",
         _ => "Default",
     }
+}
+
+// ── Model picker data model (web ProviderModelPicker) ────────────────
+
+/// Special left-rail tab for favorited models (`selectedInstanceId === "favorites"`).
+const MODEL_TAB_FAVORITES: &str = "favorites";
+
+/// Reasoning-control descriptor ids — web `REASONING_EFFORT_OPTION_IDS`
+/// plus `thinking` (`REASONING_DESCRIPTOR_IDS` in client-runtime/modelTraits).
+const REASONING_DESCRIPTOR_IDS: &[&str] = &[
+    "reasoningEffort",
+    "effort",
+    "reasoning",
+    "variant",
+    "reasoning_effort",
+    "thinking_level",
+    "thinking",
+];
+
+/// Descriptors routed to the footer instead of the effort column
+/// (web `splitSpeed`): `serviceTier` select, `fastMode`/`ultracode` toggles.
+const SPEED_SELECT_ID: &str = "serviceTier";
+const FAST_TOGGLE_ID: &str = "fastMode";
+const ULTRACODE_TOGGLE_ID: &str = "ultracode";
+
+/// One provider entry in the left rail — web `ProviderInstanceEntry`.
+#[derive(Clone)]
+struct PickerInstance {
+    instance_id: String,
+    driver: String,
+    display_name: String,
+    /// `status === "ready" && availability !== "unavailable"`.
+    ready: bool,
+}
+
+/// One model row in the middle pane.
+struct PickerModelRow {
+    instance_id: String,
+    driver: String,
+    slug: String,
+    /// Display name (`subProvider` qualifier stripped — `getDisplayModelName`).
+    name: String,
+    short_name: Option<String>,
+    sub_provider: Option<String>,
+    badge_new: bool,
+    is_legacy: bool,
+    /// Selected slug not present in the provider's catalog (web `Unavailable`).
+    is_unavailable: bool,
+    favorite: bool,
+    selected: bool,
+}
+
+/// `capabilities.optionDescriptors[]` parsed for rendering.
+#[derive(Clone)]
+struct OptChoice {
+    id: String,
+    label: String,
+    is_default: bool,
+}
+
+#[derive(Clone)]
+struct OptDescriptor {
+    id: String,
+    label: String,
+    is_select: bool,
+    is_reasoning: bool,
+    options: Vec<OptChoice>,
+    current_string: Option<String>,
+    current_bool: Option<bool>,
+    prompt_injected: std::collections::HashSet<String>,
+}
+
+/// Web `providerDisplayName` — `PROVIDER_DISPLAY_NAMES` for known drivers,
+/// else the humanized driver slug.
+fn driver_display_name(driver: &str) -> String {
+    match driver {
+        "codex" => "Codex".to_string(),
+        "claudeAgent" => "Claude".to_string(),
+        "cursor" => "Cursor".to_string(),
+        "grok" => "Grok".to_string(),
+        "fx" => "fx".to_string(),
+        "kiro" => "Kiro".to_string(),
+        "muse" => "Muse Code".to_string(),
+        "acpRegistry" => "ACP Registry".to_string(),
+        "pi" => "Pi".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "antigravity" => "Antigravity".to_string(),
+        _ => humanize_slug(driver),
+    }
+}
+
+/// `humanizeSlug` — camelCase/`_`/`-` splits into space-separated words,
+/// first letter uppercased.
+fn humanize_slug(slug: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in slug.chars() {
+        if c == '_' || c == '-' || c == ' ' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        word.push(c);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+        .iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `resolveInstanceDisplayName`: a non-default instance uses its trimmed
+/// `displayName` when distinct from the driver label, else its humanized
+/// instanceId; the default instance uses the driver (or provider name).
+fn instance_display_name(provider: &serde_json::Value) -> String {
+    let instance_id = provider["instanceId"].as_str().unwrap_or("");
+    let driver = provider["driver"].as_str().unwrap_or(instance_id);
+    let display = provider["displayName"]
+        .as_str()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if instance_id != driver {
+        match display {
+            Some(d) if d != driver_display_name(driver) => d.to_string(),
+            _ => humanize_slug(instance_id),
+        }
+    } else {
+        display
+            .map(str::to_string)
+            .or_else(|| provider["name"].as_str().map(str::to_string))
+            .unwrap_or_else(|| driver_display_name(driver))
+    }
+}
+
+/// Web `stripLeadingQualifier` — drops a leading `<qualifier>[.:/-] ` or
+/// `<qualifier> ` prefix (case-insensitive) from a model name.
+fn strip_leading_qualifier(name: &str, qualifier: Option<&str>) -> String {
+    let Some(q) = qualifier.map(str::trim).filter(|q| !q.is_empty()) else {
+        return name.to_string();
+    };
+    let lower = name.to_lowercase();
+    let ql = q.to_lowercase();
+    if !lower.starts_with(&ql) {
+        return name.to_string();
+    }
+    let rest = &name[q.len()..];
+    // `\s*[.:/-]\s*` or `\s+` must follow the qualifier.
+    let stripped = if let Some(after) = rest.trim_start().strip_prefix(|c: char| {
+        c == '.' || c == ':' || c == '/' || c == '-'
+    }) {
+        after.trim_start()
+    } else if rest.starts_with(char::is_whitespace) {
+        rest.trim_start()
+    } else {
+        return name.to_string();
+    };
+    if stripped.is_empty() {
+        name.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// `providerInstanceInitials` extracted from a display/instance name.
+fn initials_for(name: &str) -> String {
+    let mut words = name
+        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+        .filter(|w| {
+            !w.trim_matches(|c: char| c == '\'' || c == '\u{2019}')
+                .is_empty()
+        });
+    match (words.next(), words.next()) {
+        (Some(only), None) => only.chars().take(2).collect::<String>().to_uppercase(),
+        (first, second) => [first, second]
+            .into_iter()
+            .flatten()
+            .filter_map(|word| word.chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .collect(),
+    }
+}
+
+/// Simple port of `scoreModelPickerSearch`: every whitespace-separated
+/// token must appear (case-insensitive) in one of the row's search fields;
+/// ranking prefers name/shortName matches, then favorites.
+fn model_row_score(row: &PickerModelRow, provider_name: &str, tokens: &[String]) -> Option<i64> {
+    let fields: Vec<String> = [
+        Some(row.name.as_str()),
+        row.short_name.as_deref(),
+        row.sub_provider.as_deref(),
+        Some(row.driver.as_str()),
+        Some(provider_name),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_lowercase)
+    .collect();
+    let combined = fields.join(" ");
+    let mut score: i64 = 0;
+    for token in tokens {
+        let mut best: Option<i64> = None;
+        for (index, field) in fields.iter().enumerate() {
+            if let Some(pos) = field.find(token.as_str()) {
+                let base = (index as i64) * 10;
+                let candidate = base + (pos as i64).min(50) / 5;
+                best = Some(best.map_or(candidate, |b| b.min(candidate)));
+            }
+        }
+        match best.or_else(|| combined.find(token.as_str()).map(|p| 50 + p as i64)) {
+            Some(s) => score += s,
+            None => return None,
+        }
+    }
+    if row.favorite {
+        score -= 24;
+    }
+    Some(score)
 }
 
 /// Decode image bytes into a gpui-renderable image. gpui's software buffers
@@ -706,12 +995,16 @@ fn ensure_composer_hooks(window: &mut Window, cx: &mut gpui::App) {
 
 fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut gpui::App) {
     // The text field applies this keystroke later in dispatch; re-read the
-    // draft on the next frame so the mirror (and slash menu) stays current.
+    // draft (and the model-picker search) on the next frame so the mirrors
+    // stay current.
     window.on_next_frame(|window, cx| {
         let Some(view) = app_view(window) else {
             return;
         };
-        view.update(cx, |this, cx| this.sync_composer_draft(window, cx));
+        view.update(cx, |this, cx| {
+            this.sync_composer_draft(window, cx);
+            this.sync_model_search(window, cx);
+        });
     });
 
     let Some(view) = app_view(window) else {
@@ -763,6 +1056,7 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
     let (
         slash_open,
         picker_open,
+        model_picker_open,
         attach_open,
         branch_open,
         browsing,
@@ -778,6 +1072,7 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
         (
             state.slash_open,
             state.picker.is_some(),
+            state.picker == Some(PickerKind::Model),
             state.attach_field.is_some(),
             state.branch_field.is_some(),
             state.history_index.is_some(),
@@ -818,6 +1113,7 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
                     || this.composer_state.attach_field.is_some()
                     || this.composer_state.branch_field.is_some()
                 {
+                    let model_was_open = this.composer_state.picker == Some(PickerKind::Model);
                     this.composer_state.mention_open = false;
                     this.composer_state.slash_open = false;
                     this.composer_state.picker = None;
@@ -825,7 +1121,11 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
                     this.composer_state.attach_subscription = None;
                     this.composer_state.branch_field = None;
                     this.composer_state.branch_subscription = None;
+                    this.clear_model_picker();
                     this.close_terminal_meta();
+                    if model_was_open {
+                        this.composer.read(cx).focus_handle(cx).focus(window, cx);
+                    }
                 } else {
                     return false;
                 }
@@ -890,6 +1190,24 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
             view.update(cx, |this, cx| this.submit_with_context(window, cx));
             cx.stop_propagation();
         }
+        // The model picker's Enter applies the highlighted row and keeps
+        // the picker open — docked semantics like the web combobox.
+        "enter" if model_picker_open => {
+            view.update(cx, |this, cx| {
+                let (rows, _) = this.visible_model_rows();
+                if rows.is_empty() {
+                    return;
+                }
+                let index = this
+                    .composer_state
+                    .model_picker_highlight
+                    .min(rows.len() - 1);
+                if let Some(row) = rows.get(index) {
+                    this.apply_model_pick(row.instance_id.clone(), row.slug.clone(), cx);
+                }
+            });
+            cx.stop_propagation();
+        }
         // Click-only pickers don't select on Enter — swallow it so a stray
         // Enter doesn't fire a prompt while a menu is open. The branch-name
         // field needs its own Enter (`PromptSubmitted` → `vcs.createRef`).
@@ -898,8 +1216,24 @@ fn on_composer_keystroke(event: &KeystrokeEvent, window: &mut Window, cx: &mut g
                 this.composer_state.picker = None;
                 this.composer_state.branch_field = None;
                 this.composer_state.branch_subscription = None;
+                this.clear_model_picker();
                 this.close_terminal_meta();
                 cx.notify();
+            });
+            cx.stop_propagation();
+        }
+        key @ ("up" | "down") if model_picker_open => {
+            view.update(cx, |this, cx| {
+                let (rows, _) = this.visible_model_rows();
+                if !rows.is_empty() {
+                    let selection = this.composer_state.model_picker_highlight;
+                    this.composer_state.model_picker_highlight = if key == "down" {
+                        (selection + 1) % rows.len()
+                    } else {
+                        selection.checked_sub(1).unwrap_or(rows.len() - 1)
+                    };
+                    cx.notify();
+                }
             });
             cx.stop_propagation();
         }
@@ -1364,11 +1698,48 @@ impl AppView {
             "instanceId": self.provider,
             "model": self.model,
         });
-        if !self.composer_state.effort.is_empty() {
-            selection["options"] = serde_json::json!([{
-                "id": "effort",
+        let mut options: Vec<serde_json::Value> = Vec::new();
+        // Extra option picks from the effort column/footer — emitted only
+        // for descriptors the selected model actually exposes (a stale pick
+        // from a previous model must not leak into the payload).
+        let descriptor_ids = self.selected_model_descriptor_ids();
+        if !self.composer_state.effort.is_empty()
+            && descriptor_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(self.composer_state.effort_option.as_str()))
+        {
+            options.push(serde_json::json!({
+                "id": self.composer_state.effort_option,
                 "value": self.composer_state.effort,
-            }]);
+            }));
+        }
+        let descriptors = self.model_descriptors();
+        let mut extras: Vec<(&String, &serde_json::Value)> = self
+            .composer_state
+            .extra_model_options
+            .iter()
+            .filter(|(id, _)| {
+                descriptor_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(id.as_str()))
+            })
+            .collect();
+        extras.sort_by(|a, b| a.0.cmp(b.0));
+        for (id, value) in extras {
+            options.push(serde_json::json!({ "id": id, "value": value }));
+        }
+        // `injectFastModeDefault`: a model exposing `fastMode` with no
+        // explicit pick dispatches `false` (web composerProviderState).
+        if descriptor_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(FAST_TOGGLE_ID))
+            && !self.composer_state.extra_model_options.contains_key(FAST_TOGGLE_ID)
+            && descriptors.iter().any(|d| d.id == FAST_TOGGLE_ID && !d.is_select)
+        {
+            options.push(serde_json::json!({ "id": FAST_TOGGLE_ID, "value": false }));
+        }
+        if !options.is_empty() {
+            selection["options"] = serde_json::json!(options);
         }
         selection
     }
@@ -1388,6 +1759,7 @@ impl AppView {
             Some(&self.composer),
             self.composer_state.attach_field.as_ref(),
             self.composer_state.branch_field.as_ref(),
+            self.composer_state.model_search.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1842,6 +2214,551 @@ impl AppView {
     }
 
     // ------------------------------------------------------------------
+    // Model picker data (web ProviderModelPicker / ModelPickerContent)
+    // ------------------------------------------------------------------
+
+    /// `providerInstanceEntriesFor` — enabled instances from the config
+    /// stream, grouped by driver in first-seen order with the default
+    /// instance (`instanceId === driver`) first in each group. Falls back to
+    /// the static catalog while `server.getConfig` has not delivered.
+    fn picker_instances(&self) -> Vec<PickerInstance> {
+        let providers = &self.composer_state.config_providers;
+        if providers.is_empty() {
+            let mut seen: Vec<String> = Vec::new();
+            let mut out: Vec<PickerInstance> = Vec::new();
+            for (instance, _model, _label) in MODEL_CATALOG {
+                if seen.iter().any(|s| s == instance) {
+                    continue;
+                }
+                seen.push((*instance).to_string());
+                out.push(PickerInstance {
+                    instance_id: (*instance).to_string(),
+                    driver: (*instance).to_string(),
+                    display_name: driver_display_name(instance),
+                    ready: true,
+                });
+            }
+            return out;
+        }
+        let entries: Vec<PickerInstance> = providers
+            .iter()
+            .filter(|p| p["enabled"].as_bool() != Some(false))
+            .filter(|p| p["instanceId"].as_str().is_some())
+            .map(|p| {
+                let instance_id = p["instanceId"].as_str().unwrap_or_default().to_string();
+                PickerInstance {
+                    driver: p["driver"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| instance_id.clone()),
+                    display_name: instance_display_name(p),
+                    ready: p["status"].as_str().unwrap_or("ready") == "ready"
+                        && p["availability"].as_str() != Some("unavailable"),
+                    instance_id,
+                }
+            })
+            .collect();
+        let mut drivers: Vec<String> = Vec::new();
+        for e in &entries {
+            if !drivers.contains(&e.driver) {
+                drivers.push(e.driver.clone());
+            }
+        }
+        let mut ordered: Vec<PickerInstance> = Vec::with_capacity(entries.len());
+        for driver in &drivers {
+            let mut group: Vec<PickerInstance> = entries
+                .iter()
+                .filter(|e| &e.driver == driver)
+                .cloned()
+                .collect();
+            group.sort_by_key(|e| usize::from(&e.instance_id != driver));
+            ordered.extend(group);
+        }
+        ordered
+    }
+
+    fn picker_instance(&self, instance_id: &str) -> Option<serde_json::Value> {
+        self.composer_state
+            .config_providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == Some(instance_id))
+            .cloned()
+    }
+
+    fn picker_instance_name(&self, instance_id: &str) -> String {
+        self.picker_instances()
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .map(|i| i.display_name.clone())
+            .unwrap_or_else(|| humanize_slug(instance_id))
+    }
+
+    /// Catalog rows for one instance; the selected model is appended as an
+    /// `Unavailable` row when the provider's catalog doesn't list it (web
+    /// `UnavailableModelOption`).
+    fn picker_rows_for(&self, inst: &PickerInstance) -> Vec<PickerModelRow> {
+        let s = &self.composer_state;
+        let mut rows: Vec<PickerModelRow> = Vec::new();
+        if let Some(provider) = self.picker_instance(&inst.instance_id) {
+            if let Some(models) = provider["models"].as_array() {
+                for m in models {
+                    let Some(slug) = m["slug"].as_str() else {
+                        continue;
+                    };
+                    let sub_provider = m["subProvider"].as_str().map(str::to_string);
+                    let name = strip_leading_qualifier(
+                        m["name"].as_str().unwrap_or(slug),
+                        sub_provider.as_deref(),
+                    );
+                    rows.push(PickerModelRow {
+                        instance_id: inst.instance_id.clone(),
+                        driver: inst.driver.clone(),
+                        slug: slug.to_string(),
+                        name,
+                        short_name: m["shortName"].as_str().map(str::to_string),
+                        sub_provider,
+                        badge_new: m["badge"].as_str() == Some("new"),
+                        is_legacy: m["isLegacy"].as_bool() == Some(true),
+                        is_unavailable: false,
+                        favorite: s
+                            .model_favorites
+                            .contains(&format!("{}|{}", inst.instance_id, slug)),
+                        selected: self.provider == inst.instance_id && self.model == slug,
+                    });
+                }
+            }
+        } else {
+            // Static-catalog fallback (config stream out).
+            for (instance, slug, label) in MODEL_CATALOG {
+                if *instance != inst.instance_id {
+                    continue;
+                }
+                let name = label
+                    .split('\u{00b7}')
+                    .nth(1)
+                    .map(str::trim)
+                    .unwrap_or(slug)
+                    .to_string();
+                rows.push(PickerModelRow {
+                    instance_id: inst.instance_id.clone(),
+                    driver: inst.driver.clone(),
+                    slug: (*slug).to_string(),
+                    name,
+                    short_name: None,
+                    sub_provider: None,
+                    badge_new: false,
+                    is_legacy: false,
+                    is_unavailable: false,
+                    favorite: s
+                        .model_favorites
+                        .contains(&format!("{}|{}", inst.instance_id, slug)),
+                    selected: self.provider == inst.instance_id && self.model == *slug,
+                });
+            }
+        }
+        if self.provider == inst.instance_id
+            && !self.model.is_empty()
+            && !rows.iter().any(|r| r.slug == self.model)
+        {
+            rows.push(PickerModelRow {
+                instance_id: inst.instance_id.clone(),
+                driver: inst.driver.clone(),
+                slug: self.model.clone(),
+                name: self.model_display_name(),
+                short_name: None,
+                sub_provider: None,
+                badge_new: false,
+                is_legacy: false,
+                is_unavailable: true,
+                favorite: s
+                    .model_favorites
+                    .contains(&format!("{}|{}", inst.instance_id, self.model)),
+                selected: true,
+            });
+        }
+        rows
+    }
+
+    /// `shouldIncludeModelPickerOption`: a ready instance lists all its
+    /// models; a non-ready one lists only the currently-selected model.
+    fn all_picker_rows(&self) -> Vec<PickerModelRow> {
+        let mut rows = Vec::new();
+        for inst in self.picker_instances() {
+            let mut inst_rows = self.picker_rows_for(&inst);
+            if !inst.ready {
+                inst_rows.retain(|r| r.selected);
+            }
+            rows.extend(inst_rows);
+        }
+        rows
+    }
+
+    /// Rows for the middle pane: search results across instances, the
+    /// favorites tab, or the selected instance (favorites first, legacy
+    /// collapsed behind Show more). Second return is the legacy toggle state
+    /// when a collapsed/expanded legacy section exists.
+    fn visible_model_rows(&self) -> (Vec<PickerModelRow>, Option<bool>) {
+        let s = &self.composer_state;
+        let query = s.model_search_text.trim().to_lowercase();
+        if !query.is_empty() {
+            let tokens: Vec<String> = query
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let mut scored: Vec<(i64, usize, PickerModelRow)> = self
+                .all_picker_rows()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(order, row)| {
+                    model_row_score(&row, &self.picker_instance_name(&row.instance_id), &tokens)
+                        .map(|score| (score, order, row))
+                })
+                .collect();
+            scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            return (scored.into_iter().map(|(_, _, r)| r).collect(), None);
+        }
+        if s.model_picker_tab == MODEL_TAB_FAVORITES {
+            return (
+                self.all_picker_rows()
+                    .into_iter()
+                    .filter(|r| r.favorite)
+                    .collect(),
+                None,
+            );
+        }
+        let tab = s.model_picker_tab.clone();
+        let inst = self
+            .picker_instances()
+            .into_iter()
+            .find(|i| i.instance_id == tab);
+        let Some(inst) = inst else {
+            return (Vec::new(), None);
+        };
+        let rows = self.picker_rows_for(&inst);
+        let expanded = s.model_legacy_expanded.contains(&inst.instance_id);
+        let mut current: Vec<PickerModelRow> = Vec::new();
+        let mut legacy: Vec<PickerModelRow> = Vec::new();
+        for row in rows {
+            if row.is_legacy && !row.favorite {
+                legacy.push(row);
+            } else {
+                current.push(row);
+            }
+        }
+        // `groupFavorites`: favorites of the instance sort first, then catalog order.
+        current.sort_by_key(|r| usize::from(!r.favorite));
+        let toggle = if legacy.is_empty() {
+            None
+        } else {
+            Some(expanded)
+        };
+        if expanded {
+            current.extend(legacy);
+        }
+        (current, toggle)
+    }
+
+    /// `capabilities.optionDescriptors` of the currently selected model —
+    /// parsed once for the effort column, footer speed controls, and
+    /// dispatch-option filtering.
+    fn model_descriptors(&self) -> Vec<OptDescriptor> {
+        let Some(provider) = self.picker_instance(&self.provider) else {
+            // Static-catalog fallback keeps the pre-descriptor effort ladder.
+            if self.composer_state.config_providers.is_empty() {
+                return vec![OptDescriptor {
+                    id: "effort".to_string(),
+                    label: "Effort".to_string(),
+                    is_select: true,
+                    is_reasoning: true,
+                    options: vec![
+                        OptChoice {
+                            id: String::new(),
+                            label: "Default".to_string(),
+                            is_default: true,
+                        },
+                        OptChoice {
+                            id: "low".to_string(),
+                            label: "Low".to_string(),
+                            is_default: false,
+                        },
+                        OptChoice {
+                            id: "medium".to_string(),
+                            label: "Medium".to_string(),
+                            is_default: false,
+                        },
+                        OptChoice {
+                            id: "high".to_string(),
+                            label: "High".to_string(),
+                            is_default: false,
+                        },
+                    ],
+                    current_string: None,
+                    current_bool: None,
+                    prompt_injected: std::collections::HashSet::new(),
+                }];
+            }
+            return Vec::new();
+        };
+        let Some(models) = provider["models"].as_array() else {
+            return Vec::new();
+        };
+        let Some(model) = models.iter().find(|m| {
+            m["slug"].as_str() == Some(self.model.as_str())
+                || m["id"].as_str() == Some(self.model.as_str())
+        }) else {
+            return Vec::new();
+        };
+        let Some(descriptors) = model["capabilities"]["optionDescriptors"].as_array() else {
+            return Vec::new();
+        };
+        descriptors
+            .iter()
+            .filter_map(|d| {
+                let id = d["id"].as_str()?.to_string();
+                let typ = d["type"].as_str().unwrap_or("select");
+                let is_select = typ == "select";
+                let is_reasoning = (is_select && d["role"].as_str() == Some("reasoning"))
+                    || REASONING_DESCRIPTOR_IDS.contains(&id.as_str());
+                Some(OptDescriptor {
+                    label: d["label"].as_str().unwrap_or(&id).to_string(),
+                    is_select,
+                    is_reasoning,
+                    options: d["options"]
+                        .as_array()
+                        .map(|opts| {
+                            opts.iter()
+                                .filter_map(|o| {
+                                    Some(OptChoice {
+                                        id: o["id"].as_str()?.to_string(),
+                                        label: o["label"]
+                                            .as_str()
+                                            .unwrap_or_else(|| o["id"].as_str().unwrap_or(""))
+                                            .to_string(),
+                                        is_default: o["isDefault"].as_bool() == Some(true),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    current_string: d["currentValue"].as_str().map(str::to_string),
+                    current_bool: d["currentValue"].as_bool(),
+                    prompt_injected: d["promptInjectedValues"]
+                        .as_array()
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    id,
+                })
+            })
+            .collect()
+    }
+
+    /// Descriptor ids on the selected model — `None` when the model isn't in
+    /// the config catalog (extras then emit unfiltered, as before).
+    fn selected_model_descriptor_ids(&self) -> Option<std::collections::HashSet<String>> {
+        let provider = self.picker_instance(&self.provider)?;
+        let models = provider["models"].as_array()?;
+        let model = models.iter().find(|m| {
+            m["slug"].as_str() == Some(self.model.as_str())
+                || m["id"].as_str() == Some(self.model.as_str())
+        })?;
+        Some(
+            model["capabilities"]["optionDescriptors"]
+                .as_array()
+                .map(|ds| {
+                    ds.iter()
+                        .filter_map(|d| d["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Web `columnControls`: selects minus `serviceTier` + toggles minus
+    /// `fastMode`/`ultracode`; the first reasoning control is the effort.
+    fn effort_column(&self) -> (Option<OptDescriptor>, Vec<OptDescriptor>) {
+        let descriptors = self.model_descriptors();
+        let mut controls: Vec<OptDescriptor> = descriptors
+            .iter()
+            .filter(|d| {
+                (d.is_select && d.id != SPEED_SELECT_ID)
+                    || (!d.is_select && d.id != FAST_TOGGLE_ID && d.id != ULTRACODE_TOGGLE_ID)
+            })
+            .cloned()
+            .collect();
+        let effort_idx = controls.iter().position(|d| d.is_reasoning);
+        let effort = effort_idx.map(|i| controls.remove(i));
+        (effort, controls)
+    }
+
+    /// Web `splitSpeed` — the descriptors that render in the footer instead
+    /// of the column.
+    fn speed_controls(&self) -> (Option<OptDescriptor>, Option<OptDescriptor>, Option<OptDescriptor>) {
+        let descriptors = self.model_descriptors();
+        (
+            descriptors
+                .iter()
+                .find(|d| d.is_select && d.id == SPEED_SELECT_ID)
+                .cloned(),
+            descriptors
+                .iter()
+                .find(|d| !d.is_select && d.id == FAST_TOGGLE_ID)
+                .cloned(),
+            descriptors
+                .iter()
+                .find(|d| !d.is_select && d.id == ULTRACODE_TOGGLE_ID)
+                .cloned(),
+        )
+    }
+
+    /// `selectableProviderOptionChoices` — prompt-injected levels (Ultrathink)
+    /// still work when typed but pickers do not offer them.
+    fn selectable_choices(d: &OptDescriptor) -> Vec<OptChoice> {
+        d.options
+            .iter()
+            .filter(|o| !d.prompt_injected.contains(&o.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Current select value: explicit extra pick → descriptor `currentValue`
+    /// → `isDefault` option (web `getProviderOptionCurrentValue`, minus the
+    /// reported-selection channel the native client doesn't track).
+    fn select_current(&self, d: &OptDescriptor) -> String {
+        if let Some(v) = self.composer_state.extra_model_options.get(&d.id) {
+            if let Some(s) = v.as_str() {
+                return s.to_string();
+            }
+        }
+        if let Some(cur) = &d.current_string {
+            return cur.clone();
+        }
+        d.options
+            .iter()
+            .find(|o| o.is_default)
+            .map(|o| o.id.clone())
+            .unwrap_or_default()
+    }
+
+    fn boolean_current(&self, d: &OptDescriptor) -> bool {
+        if let Some(v) = self.composer_state.extra_model_options.get(&d.id) {
+            if let Some(b) = v.as_bool() {
+                return b;
+            }
+        }
+        d.current_bool.unwrap_or(false)
+    }
+
+    /// Apply a model pick — docked semantics like the web (`!docked` would
+    /// close; here the picker stays open and the effort column follows).
+    fn apply_model_pick(&mut self, instance_id: String, slug: String, cx: &mut Context<Self>) {
+        if self.provider == instance_id && self.model == slug {
+            return;
+        }
+        self.provider = instance_id;
+        self.model = slug;
+        self.composer_state.model_picked = true;
+        cx.notify();
+    }
+
+    /// Open the model picker: seed the rail tab (favorites when any exist,
+    /// else the active instance), stage the search field and focus it — the
+    /// web auto-focuses the combobox input on open.
+    fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let instances = self.picker_instances();
+        let has_favorites = !self.composer_state.model_favorites.is_empty();
+        let tab = if has_favorites {
+            MODEL_TAB_FAVORITES.to_string()
+        } else if instances.iter().any(|i| i.instance_id == self.provider) {
+            self.provider.clone()
+        } else {
+            instances
+                .first()
+                .map(|i| i.instance_id.clone())
+                .unwrap_or_default()
+        };
+        {
+            let s = &mut self.composer_state;
+            s.picker = Some(PickerKind::Model);
+            s.model_picker_highlight = 0;
+            s.model_footer_menu.clear();
+            s.model_search_text.clear();
+            s.model_picker_tab = tab;
+        }
+        let field = cx.new(|cx| TextField::new("Search models...", cx));
+        let focus_handle = field.read(cx).focus_handle(cx);
+        focus_handle.focus(window, cx);
+        self.composer_state.model_search = Some(field);
+        self.composer_state.model_search_focus = Some(focus_handle);
+        // Refresh the catalog on open, like the web's modelCatalogOnly refresh.
+        self.fetch_provider_config(cx);
+        cx.notify();
+    }
+
+    fn clear_model_picker(&mut self) {
+        let s = &mut self.composer_state;
+        s.model_search = None;
+        s.model_search_focus = None;
+        s.model_search_text.clear();
+        s.model_footer_menu.clear();
+        s.model_picker_highlight = 0;
+    }
+
+    /// Mirror the search field's content after each keystroke (the field
+    /// applies keystrokes during dispatch; render reads `model_search_text`).
+    fn sync_model_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.composer_state.model_search.clone() else {
+            return;
+        };
+        let text = field.update(cx, |field, cx| {
+            let len = field.text_length_utf16(window, cx).unwrap_or(0);
+            field
+                .text_for_range(0..len, &mut None, window, cx)
+                .unwrap_or_default()
+        });
+        let s = &mut self.composer_state;
+        if s.model_search_text != text {
+            s.model_search_text = text;
+            s.model_picker_highlight = 0;
+            cx.notify();
+        }
+    }
+
+    /// Driver → bundled brand glyph for the rail/model rows (extends
+    /// `provider_icon`'s mapping beyond the selected provider).
+    fn driver_icon(driver: &str) -> Option<Icon> {
+        match driver {
+            "codex" | "openai" | "openaiCompatible" => Some(Icon::ProviderOpenAi),
+            "claudeAgent" | "anthropic" => Some(Icon::ProviderClaude),
+            _ => None,
+        }
+    }
+
+    /// The rail icon for one provider instance (brand mark or initials).
+    fn picker_instance_glyph(&self, inst: &PickerInstance, size: f32) -> gpui::Div {
+        if let Some(glyph) = Self::driver_icon(&inst.driver) {
+            let color = match glyph {
+                Icon::ProviderClaude => rgb(0xd97757),
+                _ => theme::fg_muted(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph, size).text_color(color))
+        } else {
+            div()
+                .text_size(theme::text_size::XS_3)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::fg_muted())
+                .child(initials_for(&inst.display_name))
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Share menu (guest link + hosted prompt link)
     // ------------------------------------------------------------------
 
@@ -2281,22 +3198,42 @@ impl AppView {
     // ------------------------------------------------------------------
 
     /// Toggle a footer picker, running open/close side effects (load refs,
-    /// open the terminal-metadata stream).
-    fn toggle_composer_picker(&mut self, kind: PickerKind, cx: &mut Context<Self>) {
+    /// open the terminal-metadata stream, stage the model-search field).
+    fn toggle_composer_picker(
+        &mut self,
+        kind: PickerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let opening = self.composer_state.picker != Some(kind);
-        self.composer_state.picker = if opening { Some(kind) } else { None };
-        if self.composer_state.picker != Some(PickerKind::Branch) {
+        if !opening {
+            self.composer_state.picker = None;
+            match kind {
+                PickerKind::Terminals => self.close_terminal_meta(),
+                PickerKind::Model => {
+                    self.clear_model_picker();
+                    // Closing drops the search field — hand focus back to the
+                    // composer like the web's focusComposer return path.
+                    self.composer.read(cx).focus_handle(cx).focus(window, cx);
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        self.composer_state.picker = Some(kind);
+        if kind != PickerKind::Branch {
             self.composer_state.branch_field = None;
             self.composer_state.branch_subscription = None;
         }
-        if opening {
-            match kind {
-                PickerKind::Branch => self.load_branch_refs(cx),
-                PickerKind::Terminals => self.open_terminal_meta(cx),
-                _ => {}
-            }
-        } else if kind == PickerKind::Terminals {
-            self.close_terminal_meta();
+        if kind != PickerKind::Model {
+            self.clear_model_picker();
+        }
+        match kind {
+            PickerKind::Branch => self.load_branch_refs(cx),
+            PickerKind::Terminals => self.open_terminal_meta(cx),
+            PickerKind::Model => self.open_model_picker(window, cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -2374,6 +3311,11 @@ impl AppView {
         {
             self.composer_state.branch_field = None;
             self.composer_state.branch_subscription = None;
+        }
+        if self.composer_state.picker != Some(PickerKind::Model)
+            && self.composer_state.model_search.is_some()
+        {
+            self.clear_model_picker();
         }
     }
 
@@ -3175,52 +4117,11 @@ impl AppView {
     }
 
     fn render_picker(&self, kind: PickerKind) -> impl IntoElement {
-        // The model picker caps only its rows so the `ComposerPickerFooter`
-        // controls below the list stay pinned and visible; every other
-        // picker caps the whole panel as before.
-        let mut panel = menu_panel().when(kind != PickerKind::Model, |s| {
-            s.max_h(px(280.)).overflow_y_hidden()
-        });
+        // `PickerKind::Model` never reaches this lane-level render — the
+        // three-pane picker anchors to its chip (`render_model_picker`).
+        let mut panel = menu_panel().max_h(px(280.)).overflow_y_hidden();
         match kind {
-            PickerKind::Model => {
-                let mut rows = div()
-                    .flex()
-                    .flex_col()
-                    .max_h(px(280.))
-                    .overflow_y_hidden();
-                for (index, (instance, model, label)) in MODEL_CATALOG.iter().enumerate() {
-                    let active = self.provider == *instance && self.model == *model;
-                    rows = rows.child(
-                        menu_row(
-                            ("model", index),
-                            *label,
-                            Some(format!("{instance}/{model}").into()),
-                            active,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            move |_event, window, cx| {
-                                let Some(view) = app_view(window) else {
-                                    return;
-                                };
-                                view.update(cx, |this, cx| {
-                                    this.provider = (*instance).to_string();
-                                    this.model = (*model).to_string();
-                                    this.composer_state.model_picked = true;
-                                    this.composer_state.picker = None;
-                                    cx.notify();
-                                });
-                            },
-                        ),
-                    );
-                }
-                // `ComposerPickerFooter` — the compact controls (mode,
-                // permissions, effort, …) live at the bottom of the model
-                // picker in the web, not behind a footer ellipsis.
-                panel = panel.child(rows);
-                panel = panel.child(div().h(px(1.)).mx_1().bg(theme::border()));
-                panel = self.overflow_rows(panel);
-            }
+            PickerKind::Model => {}
             PickerKind::InteractionMode => {
                 for (index, (value, label)) in INTERACTION_MODES.iter().enumerate() {
                     let active = self.composer_state.interaction_mode == *value;
@@ -3710,48 +4611,7 @@ impl AppView {
                     return;
                 };
                 view.update(cx, |this, cx| {
-                    this.toggle_composer_picker(PickerKind::InteractionMode, cx)
-                });
-            }),
-        );
-        panel = panel.child(
-            menu_row(
-                "ov-permissions",
-                "Permissions",
-                Some(runtime_mode_label(&s.runtime_mode).into()),
-                false,
-            )
-            .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                let Some(view) = app_view(window) else {
-                    return;
-                };
-                view.update(cx, |this, cx| {
-                    this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
-                });
-            }),
-        );
-        // Same Default → low → medium → high cycle as the model
-        // picker's effort column; the row's detail shows the pick.
-        panel = panel.child(
-            menu_row(
-                "ov-effort",
-                "Effort",
-                Some(effort_label(&s.effort).into()),
-                false,
-            )
-            .on_mouse_down(MouseButton::Left, |_event, window, cx| {
-                let Some(view) = app_view(window) else {
-                    return;
-                };
-                view.update(cx, |this, cx| {
-                    let current = EFFORT_LEVELS
-                        .iter()
-                        .position(|level| *level == this.composer_state.effort)
-                        .unwrap_or(0);
-                    this.composer_state.effort =
-                        EFFORT_LEVELS[(current + 1) % EFFORT_LEVELS.len()].to_string();
-                    this.composer_state.picker = None;
-                    cx.notify();
+                    this.toggle_composer_picker(PickerKind::InteractionMode, window, cx)
                 });
             }),
         );
@@ -3772,7 +4632,7 @@ impl AppView {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::Terminals, cx)
+                            this.toggle_composer_picker(PickerKind::Terminals, window, cx)
                         });
                     },
                 ),
@@ -3793,13 +4653,1139 @@ impl AppView {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::Share, cx)
+                            this.toggle_composer_picker(PickerKind::Share, window, cx)
                         });
                     },
                 ),
             );
         }
         panel
+    }
+
+    // ------------------------------------------------------------------
+    // Model picker — web `ProviderModelPicker` docked popover
+    // ------------------------------------------------------------------
+
+    /// A nested menu inside the picker footer — `MenuPopup side="top"
+    /// align="end"` anchored to its trigger.
+    fn picker_submenu() -> gpui::Div {
+        div()
+            .absolute()
+            .bottom_full()
+            .right_0()
+            .mb_1()
+            .w(px(288.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::popup_border())
+            .shadow(vec![popup_shadow()])
+            .p_1()
+            .occlude()
+    }
+
+    /// Popover: ~554×393, `side="top" align="end"` to the model chip —
+    /// 552px content + 2px border, 346px body + ~45px footer + 1px.
+    fn render_model_picker(&self) -> gpui::Div {
+        let s = &self.composer_state;
+        let searching = !s.model_search_text.trim().is_empty();
+        let instances = self.picker_instances();
+        // `showSidebar` — the rail hides while the search filters across providers.
+        let show_rail = !searching && !instances.is_empty();
+        let (rows, legacy_toggle) = self.visible_model_rows();
+        let highlight = s
+            .model_picker_highlight
+            .min(rows.len().saturating_sub(1));
+
+        let mut body = div().flex().h(px(346.));
+        if show_rail {
+            body = body.child(self.render_picker_rail(&instances));
+        }
+        body = body.child(
+            self.render_model_pane(show_rail, &rows, highlight, legacy_toggle),
+        );
+        body = body.child(self.render_effort_pane());
+
+        let mut popover = div()
+            .absolute()
+            .bottom_full()
+            .right_0()
+            .mb_1()
+            .w(px(552.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::popup_border())
+            .shadow(vec![popup_shadow()])
+            .overflow_hidden()
+            .occlude();
+        // Every tracked-focus element auto-focuses on mouse-down bubble, so
+        // tracking the search handle keeps it focused across clicks anywhere
+        // inside the popover (web: the combobox input never loses focus) and
+        // its prevent_default stops the app root's parked focus handle from
+        // stealing focus on the way out.
+        if let Some(handle) = s.model_search_focus.clone() {
+            popover = popover.track_focus(&handle);
+        }
+        popover
+            .child(body)
+            .child(self.render_picker_footer())
+    }
+
+    /// `ModelPickerSidebar` — w-11 (44px), `bg-muted/30`: favorites star,
+    /// divider, one square glyph button per provider instance, active tab
+    /// marked by the primary indicator bar.
+    fn render_picker_rail(&self, instances: &[PickerInstance]) -> gpui::Div {
+        let s = &self.composer_state;
+        let fav_active = s.model_picker_tab == MODEL_TAB_FAVORITES;
+        let active_provider = instances
+            .iter()
+            .position(|i| i.instance_id == s.model_picker_tab);
+
+        let mut items = div().flex().flex_col().min_h_full().gap_1().p_1();
+        items = items.child(
+            div()
+                .id("model-rail-favorites")
+                .w(px(36.))
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .when(fav_active, |d| d.bg(theme::fg_10()))
+                .when(!fav_active, |d| d.hover(|st| st.bg(theme::fg_10())))
+                .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state.model_picker_tab = MODEL_TAB_FAVORITES.to_string();
+                        this.composer_state.model_picker_highlight = 0;
+                        cx.notify();
+                    });
+                })
+                .child(icon(Icon::StarFilled, 20.).text_color(theme::fg())),
+        );
+        items = items.child(div().h(px(1.)).w_full().bg(theme::border()));
+        for (index, inst) in instances.iter().enumerate() {
+            let instance_id = inst.instance_id.clone();
+            let active = s.model_picker_tab == inst.instance_id;
+            let mut button = div()
+                .id(("model-rail-provider", index))
+                .w(px(36.))
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .when(!inst.ready, |d| d.opacity(0.5))
+                .when(inst.ready, |d| {
+                    d.cursor(gpui::CursorStyle::PointingHand)
+                        .when(active, |d| d.bg(theme::fg_10()))
+                        .when(!active, |d| d.hover(|st| st.bg(theme::fg_10())))
+                });
+            if inst.ready {
+                button = button.on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    let instance_id = instance_id.clone();
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state.model_picker_tab = instance_id;
+                        this.composer_state.model_picker_highlight = 0;
+                        cx.notify();
+                    });
+                });
+            }
+            items = items.child(button.child(self.picker_instance_glyph(inst, 20.)));
+        }
+
+        // The selected-tab indicator bar: absolute right-1, 3×20 primary pill.
+        // Row tops inside `p-1 gap-1`: favorites 4–40, divider at 41,
+        // provider j at 49 + 40j; the bar centers on the 36px button.
+        let indicator_top = if fav_active {
+            Some(12.)
+        } else {
+            active_provider.map(|j| 57. + 40. * j as f32)
+        };
+        let mut inner = div().relative().min_h_full().child(items);
+        if let Some(top) = indicator_top {
+            inner = inner.child(
+                div()
+                    .absolute()
+                    .right(px(4.))
+                    .top(px(top))
+                    .w(px(3.))
+                    .h(px(20.))
+                    .rounded_full()
+                    .bg(theme::primary()),
+            );
+        }
+        div().w(px(44.)).flex_none().bg(theme::muted_30()).child(
+            div()
+                .id("model-picker-rail")
+                .h_full()
+                .overflow_y_scroll()
+                .child(inner),
+        )
+    }
+
+    /// Middle pane — `flex-1 min-w-0`, `bg-muted/40`, `border-l
+    /// border-border/70`: the `px-3 pt-2.5` search header (h-8.25, pb-1.5,
+    /// bottom border, primary while focused) above the scrollable model rows.
+    fn render_model_pane(
+        &self,
+        show_rail: bool,
+        rows: &[PickerModelRow],
+        highlight: usize,
+        legacy_toggle: Option<bool>,
+    ) -> gpui::Div {
+        let s = &self.composer_state;
+        let mut pane = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .bg(theme::muted_40());
+        if show_rail {
+            pane = pane.border_l_1().border_color(theme::border_70());
+        }
+        // `focus-within:border-primary` — the `&self` render path cannot read
+        // the focused handle, so a 1px canvas repaints over the hairline in
+        // primary while the search field holds focus (checked each frame).
+        let mut search = div()
+            .relative()
+            .pb_1p5()
+            .border_b_1()
+            .border_color(theme::border());
+        if let Some(handle) = s.model_search_focus.clone() {
+            search = search.child(
+                gpui::canvas(
+                    move |_, window, _cx| handle.is_focused(window),
+                    |bounds, focused, window, _cx| {
+                        if focused {
+                            window.paint_quad(fill(bounds, theme::primary()));
+                        }
+                    },
+                )
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(1.)),
+            );
+        }
+        pane = pane.child(div().px_3().pt_2p5().child(
+            search
+                .child(
+                    div().absolute().left_0().top(px(6.)).child(
+                        icon(Icon::Search, 16.).text_color(theme::fg_muted_55()),
+                    ),
+                )
+                .child(
+                    div()
+                        .h(px(26.))
+                        .pl(px(20.))
+                        .flex()
+                        .items_center()
+                        .text_sm()
+                        .text_color(theme::fg())
+                        .when_some(s.model_search.clone(), |d, f| d.child(f)),
+                ),
+        ));
+
+        // Rows — web CommandList `py-1.5 pl-2 pr-px`, items h-7 + h-0.5 separators.
+        let mut list = div()
+            .id("model-picker-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py_1p5()
+            .pl_2()
+            .pr(px(1.));
+        if rows.is_empty() {
+            let message = if s.model_picker_tab == MODEL_TAB_FAVORITES
+                && s.model_search_text.trim().is_empty()
+            {
+                "No favorites yet"
+            } else {
+                "No models found"
+            };
+            list = list.child(
+                div()
+                    .p_2()
+                    .text_center()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .child(message),
+            );
+        } else {
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    list = list.child(div().h(px(2.)));
+                }
+                list = list.child(self.render_model_row(index, row, index == highlight));
+            }
+            if let Some(expanded) = legacy_toggle {
+                let instance_id = s.model_picker_tab.clone();
+                list = list
+                    .child(div().h(px(2.)))
+                    .child(
+                        div()
+                            .id("model-legacy-toggle")
+                            .flex()
+                            .items_center()
+                            .h(px(28.))
+                            .px_2()
+                            .text_sm()
+                            .text_color(theme::fg_muted())
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .hover(|d| d.text_color(theme::fg()))
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                let instance_id = instance_id.clone();
+                                let Some(view) = app_view(window) else {
+                                    return;
+                                };
+                                view.update(cx, |this, cx| {
+                                    let set = &mut this.composer_state.model_legacy_expanded;
+                                    if !set.remove(&instance_id) {
+                                        set.insert(instance_id);
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .child(if expanded { "Show less" } else { "Show more" }),
+                    );
+            }
+        }
+        pane.child(list)
+    }
+
+    /// `ModelListRow` — min-h-7 (28px), px-2, leading 16px provider glyph,
+    /// truncated name, check for the selected row, subProvider/`New`/
+    /// `Unavailable` badges, favorite star revealed on hover.
+    fn render_model_row(
+        &self,
+        index: usize,
+        row: &PickerModelRow,
+        highlighted: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let instance_id = row.instance_id.clone();
+        let slug = row.slug.clone();
+        let favorite_key = format!("{}|{}", row.instance_id, row.slug);
+
+        let mut glyph_cell = div()
+            .flex_none()
+            .w(px(16.))
+            .flex()
+            .items_center()
+            .justify_center();
+        if let Some(glyph) = Self::driver_icon(&row.driver) {
+            let color = match glyph {
+                Icon::ProviderClaude => rgb(0xd97757),
+                _ => theme::fg_muted(),
+            };
+            glyph_cell = glyph_cell.child(icon(glyph, 16.).text_color(color));
+        } else {
+            glyph_cell = glyph_cell.child(
+                div()
+                    .text_size(theme::text_size::XS_3)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_muted())
+                    .child(initials_for(&self.picker_instance_name(&row.instance_id))),
+            );
+        }
+
+        let mut name_cell = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(div().min_w_0().truncate().child(row.name.clone()));
+        if row.selected {
+            name_cell = name_cell.child(icon(Icon::Check, 14.).text_color(theme::fg()));
+        }
+        if let Some(sub) = &row.sub_provider {
+            name_cell = name_cell.child(
+                div()
+                    .flex_none()
+                    .max_w(px(90.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::fg_muted_soft())
+                    .child(sub.clone()),
+            );
+        }
+        if row.badge_new {
+            name_cell = name_cell.child(
+                div()
+                    .flex_none()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgba(0x60a5fa59))
+                    .bg(rgba(0x60a5fa26))
+                    .px(px(2.))
+                    .text_size(theme::text_size::XS_3)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::update_fg())
+                    .child("NEW"),
+            );
+        }
+        if row.is_unavailable {
+            name_cell = name_cell.child(
+                div()
+                    .flex_none()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border())
+                    .px(px(2.))
+                    .text_size(theme::text_size::XS_3)
+                    .text_color(theme::fg_muted())
+                    .child("UNAVAILABLE"),
+            );
+        }
+
+        let star_glyph = if row.favorite {
+            Icon::StarFilled
+        } else {
+            Icon::Star
+        };
+        let star_color = if row.favorite {
+            theme::warning()
+        } else {
+            theme::fg_muted()
+        };
+        div()
+            .id(("model-row", index))
+            .group("model-row")
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .rounded_sm()
+            .text_sm()
+            .text_color(theme::fg())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .when(highlighted, |d| d.bg(theme::command_highlight()))
+            .hover(|d| d.bg(theme::command_highlight()))
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                let instance_id = instance_id.clone();
+                let slug = slug.clone();
+                let Some(view) = app_view(window) else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    this.apply_model_pick(instance_id, slug, cx)
+                });
+            })
+            .child(glyph_cell)
+            .child(name_cell)
+            .child(
+                div()
+                    .id(("model-fav", index))
+                    .flex_none()
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .opacity(if row.favorite { 1. } else { 0. })
+                    .group_hover("model-row", |d| d.opacity(1.))
+                    .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                        let favorite_key = favorite_key.clone();
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        view.update(cx, |this, cx| {
+                            let favorites = &mut this.composer_state.model_favorites;
+                            if !favorites.remove(&favorite_key) {
+                                favorites.insert(favorite_key);
+                            }
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(icon(star_glyph, 14.).text_color(star_color)),
+            )
+    }
+
+    /// `ComposerEffortColumn` — w-48 (192px), `border-l border-border/70
+    /// bg-muted/40`: `px-3 pt-2.5` header (label + current model name), then
+    /// effort rows and a separated "other options" section.
+    fn render_effort_pane(&self) -> gpui::Div {
+        let s = &self.composer_state;
+        let (effort, others) = self.effort_column();
+        let has_controls = effort.is_some() || !others.is_empty();
+        let header = if effort.is_some() || !has_controls {
+            "Effort"
+        } else {
+            "Options"
+        };
+        let mut pane = div()
+            .w(px(192.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(theme::muted_40())
+            .border_l_1()
+            .border_color(theme::border_70());
+        pane = pane.child(div().px_3().pt_2p5().child(
+            div()
+                .h(px(33.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme::border())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::fg_muted())
+                        .child(header),
+                )
+                .child(
+                    div()
+                        .ml_auto()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child(self.model_display_name()),
+                ),
+        ));
+
+        let mut body = div()
+            .id("effort-column-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pt_2p5()
+            .pb_1p5()
+            .flex()
+            .flex_col()
+            .gap_0p5();
+        if !has_controls {
+            body = body.child(
+                div()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .child("No effort levels"),
+            );
+        } else {
+            if let Some(eff) = &effort {
+                body = self.effort_control_rows(body, eff, s);
+            }
+            if !others.is_empty() {
+                let mut section = div()
+                    .mt_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .flex_col()
+                    .gap_0p5();
+                for (index, other) in others.iter().enumerate() {
+                    section = section.child(self.other_option_row(index, other));
+                }
+                body = body.child(section);
+            }
+        }
+        pane.child(body)
+    }
+
+    /// Effort control rows — `ComboboxItem`-style h-8 rows with a check on
+    /// the current level (or "Default" on the unselected `isDefault` one);
+    /// a boolean reasoning control renders On/Off rows instead.
+    fn effort_control_rows(
+        &self,
+        mut body: gpui::Stateful<gpui::Div>,
+        eff: &OptDescriptor,
+        s: &State,
+    ) -> gpui::Stateful<gpui::Div> {
+        if eff.is_select {
+            let mut checked_id = if s.effort_option == eff.id {
+                s.effort.clone()
+            } else {
+                String::new()
+            };
+            if checked_id.is_empty() {
+                checked_id = eff
+                    .current_string
+                    .clone()
+                    .or_else(|| {
+                        eff.options
+                            .iter()
+                            .find(|o| o.is_default)
+                            .map(|o| o.id.clone())
+                    })
+                    .unwrap_or_default();
+            }
+            for (index, choice) in Self::selectable_choices(eff).into_iter().enumerate() {
+                let descriptor_id = eff.id.clone();
+                let choice_id = choice.id.clone();
+                let label = if choice.label.is_empty() {
+                    choice.id.clone()
+                } else {
+                    choice.label.clone()
+                };
+                let checked = checked_id == choice.id;
+                let is_default = choice.is_default;
+                body = body.child(
+                    div()
+                        .id(("effort", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(32.))
+                        .px_2()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(theme::fg())
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|d| d.bg(theme::command_highlight()))
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            let descriptor_id = descriptor_id.clone();
+                            let choice_id = choice_id.clone();
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| {
+                                this.composer_state.effort_option = descriptor_id;
+                                this.composer_state.effort = choice_id;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(if label.is_empty() {
+                                "Default".to_string()
+                            } else {
+                                label.clone()
+                            }),
+                        )
+                        .when(checked, |d| {
+                            d.child(icon(Icon::Check, 14.).text_color(theme::fg()))
+                        })
+                        .when(!checked && is_default, |d| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted_soft())
+                                    .child("Default"),
+                            )
+                        }),
+                );
+            }
+        } else {
+            // Boolean reasoning control (e.g. `thinking`): On/Off rows —
+            // values ride `extra_model_options` like other boolean options.
+            let descriptor_id = eff.id.clone();
+            let on = self.boolean_current(eff);
+            for (index, (value, label)) in
+                [(true, "On"), (false, "Off")].into_iter().enumerate()
+            {
+                let descriptor_id = descriptor_id.clone();
+                let checked = on == value;
+                body = body.child(
+                    div()
+                        .id(("effort-bool", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(32.))
+                        .px_2()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(theme::fg())
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|d| d.bg(theme::command_highlight()))
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            let descriptor_id = descriptor_id.clone();
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            view.update(cx, |this, cx| {
+                                this.composer_state
+                                    .extra_model_options
+                                    .insert(descriptor_id, serde_json::json!(value));
+                                cx.notify();
+                            });
+                        })
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when(checked, |d| {
+                            d.child(icon(Icon::Check, 14.).text_color(theme::fg()))
+                        }),
+                );
+            }
+        }
+        body
+    }
+
+    /// One non-effort provider option: two-line label/value row — selects
+    /// cycle their choices, booleans toggle, both ending with a trailing
+    /// affordance (chevron or mini switch).
+    fn other_option_row(&self, index: usize, d: &OptDescriptor) -> gpui::Stateful<gpui::Div> {
+        let descriptor_id = d.id.clone();
+        let label = d.label.clone();
+        if d.is_select {
+            let choices = Self::selectable_choices(d);
+            let current = self.select_current(d);
+            let current_label = choices
+                .iter()
+                .find(|o| o.id == current)
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            div()
+                .id(("option", index))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|d| d.bg(theme::command_highlight()))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    let descriptor_id = descriptor_id.clone();
+                    let choices = choices.clone();
+                    let current = current.clone();
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        if !choices.is_empty() {
+                            let position = choices
+                                .iter()
+                                .position(|o| o.id == current)
+                                .unwrap_or(0);
+                            let next = &choices[(position + 1) % choices.len()];
+                            this.composer_state
+                                .extra_model_options
+                                .insert(descriptor_id, serde_json::json!(next.id));
+                            cx.notify();
+                        }
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .text_color(theme::fg())
+                                .child(current_label),
+                        ),
+                )
+                .child(icon(Icon::ChevronRight, 14.).text_color(theme::fg_muted()))
+        } else {
+            let on = self.boolean_current(d);
+            div()
+                .id(("option", index))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|d| d.bg(theme::command_highlight()))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    let descriptor_id = descriptor_id.clone();
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state
+                            .extra_model_options
+                            .insert(descriptor_id, serde_json::json!(!on));
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .text_color(theme::fg())
+                                .child(if on { "On" } else { "Off" }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(28.))
+                        .h(px(16.))
+                        .rounded_full()
+                        .bg(if on { theme::primary() } else { theme::input() })
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .h(px(12.))
+                                .rounded_full()
+                                .bg(theme::switch_thumb_on())
+                                .ml(if on { px(14.) } else { px(2.) })
+                                .mt(px(2.)),
+                        ),
+                )
+        }
+    }
+
+    /// A footer segment (web `FOOTER_SEGMENT`): h-6 rounded-md px-2 text-xs;
+    /// the checked segment gets `bg-input/72` + foreground.
+    fn footer_segment(
+        id: impl Into<gpui::ElementId>,
+        checked: bool,
+        label: SharedString,
+        leading: Option<(Icon, Hsla)>,
+        on_pick: impl Fn(&mut Window, &mut gpui::App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut segment = div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(24.))
+            .px_2()
+            .rounded_md()
+            .text_xs()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .when(checked, |d| d.bg(theme::input_72()).text_color(theme::fg()))
+            .when(!checked, |d| {
+                d.text_color(theme::fg_muted())
+                    .hover(|d| d.text_color(theme::fg()))
+            })
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                on_pick(window, cx)
+            });
+        if let Some((glyph, color)) = leading {
+            segment = segment.child(icon(glyph, 12.).text_color(color));
+        }
+        segment.child(label)
+    }
+
+    /// `ComposerPickerFooter` — `border-t border-border/70 bg-muted/40 px-3
+    /// py-2`: speed + ultracode controls on the left, the compact overflow
+    /// and the permissions trigger (`label ^`) right-aligned.
+    fn render_picker_footer(&self) -> gpui::Div {
+        let s = &self.composer_state;
+        let (speed_select, fast_toggle, ultracode_toggle) = self.speed_controls();
+        let mut footer = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(theme::border_70())
+            .bg(theme::muted_40())
+            .px_3()
+            .py_2();
+
+        // SpeedControl — `serviceTier` segments, or Standard/Fast for `fastMode`.
+        if let Some(sel) = &speed_select {
+            let current = self.select_current(sel);
+            let descriptor_id = sel.id.clone();
+            let mut segments = div().flex().rounded_lg().bg(theme::input_40()).p_0p5();
+            for (seg_index, choice) in Self::selectable_choices(sel).into_iter().enumerate() {
+                let descriptor_id = descriptor_id.clone();
+                let choice_id = choice.id.clone();
+                segments = segments.child(Self::footer_segment(
+                    ("speed", seg_index),
+                    choice.id == current,
+                    SharedString::from(choice.label.clone()),
+                    None,
+                    move |window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        let descriptor_id = descriptor_id.clone();
+                        let choice_id = choice_id.clone();
+                        view.update(cx, |this, cx| {
+                            this.composer_state
+                                .extra_model_options
+                                .insert(descriptor_id, serde_json::json!(choice_id));
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+            footer = footer.child(segments);
+        } else if let Some(fast) = &fast_toggle {
+            let on = self.boolean_current(fast);
+            let descriptor_id = fast.id.clone();
+            let mut segments = div().flex().rounded_lg().bg(theme::input_40()).p_0p5();
+            for (value, label) in [(false, "Standard"), (true, "Fast")] {
+                let descriptor_id = descriptor_id.clone();
+                segments = segments.child(Self::footer_segment(
+                    if value { "speed-fast" } else { "speed-standard" },
+                    on == value,
+                    SharedString::from(label),
+                    if value {
+                        Some((Icon::Zap, theme::warning().into()))
+                    } else {
+                        None
+                    },
+                    move |window, cx| {
+                        let Some(view) = app_view(window) else {
+                            return;
+                        };
+                        let descriptor_id = descriptor_id.clone();
+                        view.update(cx, |this, cx| {
+                            this.composer_state
+                                .extra_model_options
+                                .insert(descriptor_id, serde_json::json!(value));
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+            footer = footer.child(segments);
+        }
+
+        // UltracodeControl — single segment with the Workflow glyph.
+        if let Some(ultra) = &ultracode_toggle {
+            let on = self.boolean_current(ultra);
+            let descriptor_id = ultra.id.clone();
+            let label = SharedString::from(ultra.label.clone());
+            footer = footer.child(
+                div().flex().rounded_lg().bg(theme::input_40()).p_0p5().child(
+                    Self::footer_segment(
+                        "speed-ultracode",
+                        on,
+                        label,
+                        Some((Icon::Workflow, theme::fg_muted().into())),
+                        move |window, cx| {
+                            let Some(view) = app_view(window) else {
+                                return;
+                            };
+                            let descriptor_id = descriptor_id.clone();
+                            view.update(cx, |this, cx| {
+                                this.composer_state
+                                    .extra_model_options
+                                    .insert(descriptor_id, serde_json::json!(!on));
+                                cx.notify();
+                            });
+                        },
+                    ),
+                ),
+            );
+        }
+
+        footer = footer.child(div().flex_1());
+
+        // Compact overflow (native keeps interaction-mode / terminal-context /
+        // share entries that the web nests per-provider).
+        let overflow_open = s.model_footer_menu == "overflow";
+        let mut overflow_wrap = div().relative().child(
+            div()
+                .id("model-footer-overflow")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(28.))
+                .h(px(28.))
+                .rounded_md()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .when(overflow_open, |d| {
+                    d.bg(theme::command_highlight()).text_color(theme::fg())
+                })
+                .when(!overflow_open, |d| {
+                    d.text_color(theme::fg_muted()).hover(|d| {
+                        d.bg(theme::command_highlight()).text_color(theme::fg())
+                    })
+                })
+                .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state.model_footer_menu =
+                            if this.composer_state.model_footer_menu == "overflow" {
+                                String::new()
+                            } else {
+                                "overflow".to_string()
+                            };
+                        cx.notify();
+                    });
+                })
+                .child(icon(Icon::Ellipsis, 14.).text_color(theme::fg_muted())),
+        );
+        if overflow_open {
+            overflow_wrap = overflow_wrap.child(self.overflow_rows(Self::picker_submenu()));
+        }
+        footer = footer.child(overflow_wrap);
+
+        // PermissionsMenu — `ms-auto h-7 px-2 text-xs` trigger with the
+        // current mode's icon + label + ChevronUp; nested section above.
+        let mode = s.runtime_mode.clone();
+        let mode_icon = Self::runtime_mode_icon(&mode);
+        let mode_label = runtime_mode_label(&mode);
+        let permissions_open = s.model_footer_menu == "permissions";
+        let mut permissions_wrap = div().relative().child(
+            div()
+                .id("model-footer-permissions")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .text_xs()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .when(permissions_open, |d| {
+                    d.bg(theme::command_highlight()).text_color(theme::fg())
+                })
+                .when(!permissions_open, |d| {
+                    d.text_color(theme::fg_muted()).hover(|d| {
+                        d.bg(theme::command_highlight()).text_color(theme::fg())
+                    })
+                })
+                .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state.model_footer_menu =
+                            if this.composer_state.model_footer_menu == "permissions" {
+                                String::new()
+                            } else {
+                                "permissions".to_string()
+                            };
+                        cx.notify();
+                    });
+                })
+                .child(icon(mode_icon, 14.).text_color(theme::fg_muted()))
+                .child(mode_label)
+                .child(icon(Icon::ChevronUp, 12.).text_color(theme::fg_muted())),
+        );
+        if permissions_open {
+            permissions_wrap = permissions_wrap.child(self.render_permissions_section());
+        }
+        footer.child(permissions_wrap)
+    }
+
+    /// `ComposerPermissionsSection` — `grid w-72 gap-1.5 px-2 py-1.5`: label,
+    /// the four-mode segmented radio, then the mode name + description.
+    fn render_permissions_section(&self) -> gpui::Div {
+        let mode = self.composer_state.runtime_mode.clone();
+        let mut segments = div().flex().rounded_lg().bg(theme::input_40()).p_0p5();
+        for (index, (value, label, _desc)) in RUNTIME_MODE_DEFS.iter().enumerate() {
+            let value = (*value).to_string();
+            let checked = mode == *value;
+            let glyph = Self::runtime_mode_icon(value.as_str());
+            let segment = div()
+                .id(("perm-mode", index))
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .h(px(24.))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .when(index == 0, |d| d.rounded_l_md())
+                .when(index == RUNTIME_MODE_DEFS.len() - 1, |d| {
+                    d.rounded_r_md()
+                })
+                .when(checked, |d| d.bg(theme::input_72()).text_color(theme::fg()))
+                .when(!checked, |d| d.text_color(theme::fg_muted()))
+                .tooltip(tooltip((*label).to_string()))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    let value = value.clone();
+                    let Some(view) = app_view(window) else {
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        this.composer_state.runtime_mode = value;
+                        this.composer_state.runtime_mode_picked = true;
+                        this.composer_state.model_footer_menu.clear();
+                        this.set_thread_modes();
+                        cx.notify();
+                    });
+                })
+                .child(icon(glyph, 14.).text_color(theme::fg()));
+            segments = segments.child(segment);
+        }
+        let (_, label, description) = RUNTIME_MODE_DEFS
+            .iter()
+            .find(|(value, _, _)| *value == mode)
+            .copied()
+            .unwrap_or(RUNTIME_MODE_DEFS[3]);
+        Self::picker_submenu().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .px_2()
+                .py_1p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::fg_muted())
+                        .child("Permissions"),
+                )
+                .child(segments)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_sm().text_color(theme::fg()).child(label))
+                        .child(
+                            div()
+                                .min_h(px(32.))
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(description),
+                        ),
+                ),
+        )
+    }
+
+    /// `runtimeModeConfig[mode].icon`.
+    fn runtime_mode_icon(mode: &str) -> Icon {
+        match mode {
+            "approval-required" => Icon::Lock,
+            "auto-accept-edits" => Icon::PenLine,
+            "auto" => Icon::ShieldCheck,
+            _ => Icon::ShieldOff,
+        }
     }
 
     /// Small remove affordance used on staged chips — an 18px muted hit
@@ -4075,7 +6061,11 @@ impl AppView {
             lane = lane.child(self.render_slash_menu());
         }
         if let Some(kind) = state.picker {
-            lane = lane.child(self.render_picker(kind));
+            // The model picker anchors to its chip inside the card footer —
+            // not the lane — so it renders with the chip below.
+            if kind != PickerKind::Model {
+                lane = lane.child(self.render_picker(kind));
+            }
         }
 
         // Attached `ComposerBanner` dock — the usage notice sits flush on the
@@ -4198,7 +6188,7 @@ impl AppView {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::Attach, cx);
+                            this.toggle_composer_picker(PickerKind::Attach, window, cx);
                         });
                     })
                     .child(hover_icon(
@@ -4278,8 +6268,12 @@ impl AppView {
                         return;
                     };
                     view.update(cx, |this, cx| {
-                        this.toggle_composer_picker(PickerKind::Model, cx)
+                        this.toggle_composer_picker(PickerKind::Model, window, cx)
                     });
+                    // The toggle already assigned focus (search field on
+                    // open, composer on close) — keep the app root's parked
+                    // focus handle from stealing it further down the bubble.
+                    window.prevent_default();
                 });
             if let Some(glyph) = self.provider_icon() {
                 let color = match glyph {
@@ -4303,14 +6297,25 @@ impl AppView {
                 }
             }
             model_chip = model_chip.child(self.model_display_name());
-            if !state.effort.is_empty() {
+            if !state.effort.is_empty()
+                && self
+                    .model_descriptors()
+                    .iter()
+                    .any(|d| d.id == state.effort_option)
+            {
                 model_chip = model_chip.child(
                     div()
                         .text_color(theme::fg_muted())
                         .child(effort_label(&state.effort)),
                 );
             }
-            controls = controls.child(model_chip);
+            // The popover anchors `side="top" align="end"` to this chip —
+            // the relative wrapper gives `bottom_full`/`right_0` their box.
+            let mut model_anchor = div().relative().child(model_chip);
+            if model_open {
+                model_anchor = model_anchor.child(self.render_model_picker());
+            }
+            controls = controls.child(model_anchor);
 
             // `ComposerFooterModeControls` — the permissions chip only rests
             // when the mode differs from the default (native has no
@@ -4344,7 +6349,7 @@ impl AppView {
                                 return;
                             };
                             view.update(cx, |this, cx| {
-                                this.toggle_composer_picker(PickerKind::RuntimeMode, cx)
+                                this.toggle_composer_picker(PickerKind::RuntimeMode, window, cx)
                             });
                         })
                         .child(hover_icon(
@@ -4443,7 +6448,7 @@ impl AppView {
                             return;
                         };
                         view.update(cx, |this, cx| {
-                            this.toggle_composer_picker(PickerKind::RunOptions, cx);
+                            this.toggle_composer_picker(PickerKind::RunOptions, window, cx);
                         });
                     })
                     .child(run_label)
@@ -4637,7 +6642,7 @@ impl AppView {
                                 return;
                             };
                             view.update(cx, |this, cx| {
-                                this.toggle_composer_picker(PickerKind::Branch, cx);
+                                this.toggle_composer_picker(PickerKind::Branch, window, cx);
                             });
                         })
                         // Web branch chip: `GitBranchIcon` size-3 muted + the
