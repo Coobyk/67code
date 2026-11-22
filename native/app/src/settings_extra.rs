@@ -33,7 +33,7 @@
 //!   and the ACP sessions fold).
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     Context, Div, Entity, EntityInputHandler, FocusHandle, Focusable, MouseButton, SharedString,
@@ -254,7 +254,11 @@ fn default_snooze_presets() -> Vec<Value> {
 fn format_minutes(minutes: u64) -> String {
     if minutes % 1440 == 0 {
         let days = minutes / 1440;
-        if days == 1 { "1 day".into() } else { format!("{days} days") }
+        if days == 1 {
+            "1 day".into()
+        } else {
+            format!("{days} days")
+        }
     } else if minutes % 60 == 0 {
         let hours = minutes / 60;
         if hours == 1 {
@@ -311,10 +315,7 @@ fn next_snooze_candidate(presets: &[Value]) -> Option<Value> {
 /// ("Ctrl" — the native client ships on non-Apple platforms).
 const SEND_SHORTCUTS: &[(&str, &str)] = &[
     ("enter", "Enter"),
-    (
-        "mod-enter-multiline",
-        "Ctrl + Enter for multiline prompts",
-    ),
+    ("mod-enter-multiline", "Ctrl + Enter for multiline prompts"),
     ("mod-enter", "Ctrl + Enter always"),
 ];
 
@@ -385,10 +386,8 @@ const SNAPSHOT_SOUNDS: &[(&str, &str)] = &[
 ];
 
 /// `browserLinkTarget` — `LINK_TARGET_LABELS`.
-const BROWSER_LINK_TARGETS: &[(&str, &str)] = &[
-    ("system", "Your default browser"),
-    ("app", "T3 Code"),
-];
+const BROWSER_LINK_TARGETS: &[(&str, &str)] =
+    &[("system", "Your default browser"), ("app", "T3 Code")];
 
 /// `browserSearchEngine` — `SEARCH_ENGINE_LABELS` minus "custom" (the
 /// custom-URL field is web-only).
@@ -442,6 +441,222 @@ const BACKGROUND_PROFILES: &[(&str, &str)] = &[
     ("custom", "Custom"),
 ];
 
+/// Browser "Default viewport" select values — `browserDefaultViewport`
+/// flattened to a string for the native mirror: `"fill"` / `"responsive"`
+/// (a freeform size the web edits with W×H fields) / a preset id from
+/// `PREVIEW_VIEWPORT_PRESET_DEFINITIONS`.
+const BROWSER_VIEWPORTS: &[(&str, &str, &str)] = &[
+    ("fill", "Fill panel", ""),
+    ("responsive", "Responsive", ""),
+    ("iphone-se", "iPhone SE", "375 × 667"),
+    ("iphone-xr", "iPhone XR", "414 × 896"),
+    ("iphone-12-pro", "iPhone 12 Pro", "390 × 844"),
+    ("iphone-14-pro-max", "iPhone 14 Pro Max", "430 × 932"),
+    ("pixel-7", "Pixel 7", "412 × 915"),
+    ("samsung-galaxy-s8-plus", "Samsung Galaxy S8+", "360 × 740"),
+    (
+        "samsung-galaxy-s20-ultra",
+        "Samsung Galaxy S20 Ultra",
+        "412 × 915",
+    ),
+    ("ipad-mini", "iPad Mini", "768 × 1024"),
+    ("ipad-air", "iPad Air", "820 × 1180"),
+    ("ipad-pro", "iPad Pro", "1024 × 1366"),
+    ("surface-pro-7", "Surface Pro 7", "912 × 1368"),
+    ("surface-duo", "Surface Duo", "540 × 720"),
+    ("galaxy-z-fold-5", "Galaxy Z Fold 5", "344 × 882"),
+    ("nest-hub", "Nest Hub", "1024 × 600"),
+    ("nest-hub-max", "Nest Hub Max", "1280 × 800"),
+];
+
+/// Browser "Default zoom" — `PREVIEW_ZOOM_LEVELS` as percent strings.
+const BROWSER_ZOOMS: &[(&str, &str)] = &[
+    ("50", "50%"),
+    ("67", "67%"),
+    ("75", "75%"),
+    ("80", "80%"),
+    ("90", "90%"),
+    ("100", "100%"),
+    ("110", "110%"),
+    ("125", "125%"),
+    ("150", "150%"),
+    ("175", "175%"),
+    ("200", "200%"),
+    ("250", "250%"),
+];
+
+/// Browser "Default appearance" — `PreviewAppearancePreference` literals.
+const BROWSER_APPEARANCES: &[(&str, &str)] =
+    &[("system", "System"), ("light", "Light"), ("dark", "Dark")];
+
+/// Browser "Recording frame rate" — `BROWSER_RECORDING_FRAME_RATES`.
+const BROWSER_FRAME_RATES: &[(&str, &str)] = &[("30", "30 fps"), ("60", "60 fps")];
+
+/// One runtime/config text field in the provider detail pane — derived
+/// from the `providerSettingsForm` annotations on each driver's settings
+/// schema (contracts `CodexSettings`/`ClaudeSettings`/`AntigravitySettings`
+/// and the `provider-*/src/settings.ts` files).
+struct ProviderFieldDef {
+    /// `providerInstances.{id}.config.{key}` the field writes.
+    key: &'static str,
+    title: &'static str,
+    description: &'static str,
+    placeholder: &'static str,
+    /// `control: "password"` — value shown masked; the stored string may
+    /// already be redacted server-side.
+    secret: bool,
+}
+
+const PROVIDER_CODEX_FIELDS: &[ProviderFieldDef] = &[
+    ProviderFieldDef {
+        key: "binaryPath",
+        title: "Binary path",
+        description: "Path to the Codex binary used by this instance.",
+        placeholder: "codex",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "homePath",
+        title: "CODEX_HOME path",
+        description: "Custom Codex home and config directory.",
+        placeholder: "~/.codex",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "shadowHomePath",
+        title: "Shadow home path",
+        description: "Account-specific Codex home. Keeps auth.json separate while sharing state from CODEX_HOME.",
+        placeholder: "~/.codex-t3/personal",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "launchArgs",
+        title: "Launch arguments",
+        description: "Additional CLI arguments passed to codex app-server on session start.",
+        placeholder: "",
+        secret: false,
+    },
+];
+
+const PROVIDER_CLAUDE_FIELDS: &[ProviderFieldDef] = &[
+    ProviderFieldDef {
+        key: "binaryPath",
+        title: "Binary path",
+        description: "Path to the Claude binary used by this instance.",
+        placeholder: "claude",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "homePath",
+        title: "CLAUDE_CONFIG_DIR path",
+        description: "Custom Claude home and config directory. Keeps .claude.json and .claude separate.",
+        placeholder: "~/.claude",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "autoCompactWindow",
+        title: "Auto-compact after",
+        description: "Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.",
+        placeholder: "e.g. 300000",
+        secret: false,
+    },
+    // `idleCompaction` renders as a select after this list — the schema
+    // order interleaves it before launchArgs.
+    ProviderFieldDef {
+        key: "launchArgs",
+        title: "Launch arguments",
+        description: "Additional CLI arguments passed on session start.",
+        placeholder: "e.g. --chrome",
+        secret: false,
+    },
+];
+
+const PROVIDER_ANTIGRAVITY_FIELDS: &[ProviderFieldDef] = &[
+    ProviderFieldDef {
+        key: "apiKey",
+        title: "API key",
+        description: "Gemini or Vertex AI express key. Stored separately on the host.",
+        placeholder: "Optional",
+        secret: true,
+    },
+    ProviderFieldDef {
+        key: "gcpProject",
+        title: "GCP project",
+        description: "Required for Gemini Enterprise. Agent Platform uses it when no API key is set.",
+        placeholder: "my-project-id",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "gcpLocation",
+        title: "GCP location",
+        description: "Region for Gemini Enterprise or Agent Platform.",
+        placeholder: "us-central1",
+        secret: false,
+    },
+    ProviderFieldDef {
+        key: "binaryPath",
+        title: "Binary path",
+        description: "Custom ACP executable. Leave empty to select automatically.",
+        placeholder: "Automatic",
+        secret: false,
+    },
+];
+
+/// `authMethod` select options — `ANTIGRAVITY_AUTH_METHODS`.
+const ANTIGRAVITY_AUTH_METHODS: &[(&str, &str)] = &[
+    ("oauth-personal", "Google account"),
+    ("oauth-business", "Gemini Enterprise"),
+    ("gemini-api-key", "Gemini API key"),
+    ("agent-platform", "Agent Platform (Vertex AI)"),
+];
+
+/// Per-instance `idleCompaction` select options — `INSTANCE_IDLE_COMPACTION_MODES`.
+const PROVIDER_IDLE_COMPACTION_MODES: &[(&str, &str)] = &[
+    ("default", "Use default"),
+    ("onReturn", "When you return"),
+    ("beforeCacheExpires", "Before the cache expires (beta)"),
+    ("off", "Never"),
+];
+
+/// Drivers offered by "+ Add provider" — `providerClients` order in the
+/// web panel, minus ACP-registry entries (managed separately).
+const PROVIDER_DRIVER_OPTIONS: &[(&str, &str)] = &[
+    ("codex", "Codex"),
+    ("claudeAgent", "Claude"),
+    ("opencode", "OpenCode"),
+    ("antigravity", "Antigravity"),
+    ("cursor", "Cursor"),
+    ("grok", "Grok"),
+    ("kiro", "Kiro"),
+    ("fx", "fx"),
+    ("muse", "Muse"),
+    ("pi", "Pi"),
+    ("kilo", "Kilo"),
+];
+
+/// `driverKind !== "antigravity"` — custom-model add is disabled for
+/// drivers the web excludes.
+fn driver_allows_custom(driver: &str) -> bool {
+    driver != "antigravity"
+}
+
+/// Source-control provider `kind` → brand mark; VCS `kind` uses the same
+/// map ("git"/"jj").
+fn source_control_icon(kind: &str) -> Icon {
+    match kind {
+        "git" => Icon::ScGit,
+        "jj" => Icon::ScJujutsu,
+        "github" => Icon::ScGithub,
+        "cursor-origin" => Icon::ScCursorOrigin,
+        "gitlab" => Icon::ScGitlab,
+        "gitcafe" => Icon::ScGitcafe,
+        "forgejo" => Icon::ScForgejo,
+        "bitbucket" => Icon::ScBitbucket,
+        "azure-devops" => Icon::ScAzureDevops,
+        _ => Icon::ScGit,
+    }
+}
+
 /// State for the sections in this file. It hangs off
 /// `settings_misc::State::extra` — the AppView field list lives in lib.rs.
 #[derive(Default)]
@@ -491,6 +706,9 @@ pub(crate) struct ExtraState {
     sc_busy: bool,
     /// Status line under the provider row (sign-in outcome or load error).
     sc_note: Option<String>,
+    /// Expanded detail folds for discovery rows (web `hasDetails` chevron)
+    /// — keyed by provider `kind` ("github", "gitcafe", …).
+    sc_expanded: HashSet<String>,
     sc_instructions_field: Option<Entity<TextField>>,
     sc_instructions_draft: String,
     /// True once the field was seeded from the settings mirror (don't
@@ -531,6 +749,36 @@ pub(crate) struct ExtraState {
     branch_instructions_field: Option<Entity<TextField>>,
     branch_instructions_draft: String,
     branch_instructions_seeded: bool,
+
+    // ── Providers page (web two-pane list + detail) ─────────────────────
+    /// Selected instance in the right-hand detail pane (defaults to the
+    /// first reported instance).
+    selected_provider: Option<String>,
+    /// One open select/menu on these pages at a time — string keys route
+    /// `extra_pick` ("scope:project", "browser:frame-rate",
+    /// "browser:profile-menu:<id>", "provider:add",
+    /// "provider:<iid>:idleCompaction", …). Kept separate from the shared
+    /// `OpenList` enum because settings_misc.rs is not editable here.
+    extra_open: Option<String>,
+    /// Per-instance TextFields keyed `"{instanceId}:{slot}"` — created in
+    /// `ensure_provider_fields` (needs `&mut Context`, so they spawn from
+    /// the select handler) and seeded once from the settings mirror.
+    provider_fields: HashMap<String, Entity<TextField>>,
+    provider_field_seeded: HashSet<String>,
+    provider_field_drafts: HashMap<String, String>,
+    /// Seeds whose `edit_field` write failed because creation ran inside a
+    /// window dispatch (listener) — flushed by the render-side spawn.
+    provider_field_pending_seeds: HashMap<String, String>,
+    provider_field_subs: Vec<Subscription>,
+    /// "+ Add variable" fold in the detail's Environment card.
+    provider_env_add: bool,
+    /// "+ Add custom model" fold in the detail's Models section.
+    provider_model_add: bool,
+
+    // ── Browser page ────────────────────────────────────────────────────
+    /// "> Advanced" disclosure inside the Browsing card (viewport / zoom /
+    /// appearance defaults).
+    browser_advanced: bool,
 
     // ── Maintenance (end of the page) ───────────────────────────────────
     /// Result of the last `server.getNpmRelease` check, rendered inline.
@@ -746,9 +994,8 @@ impl AppView {
         }
         // Client-local voice fields — PromptSubmitted writes ClientConfig.
         if state.speech_words_field.is_none() {
-            let field = cx.new(|cx| {
-                TextField::new("Words the recognizer should learn, comma separated", cx)
-            });
+            let field = cx
+                .new(|cx| TextField::new("Words the recognizer should learn, comma separated", cx));
             state.extra_subs.push(cx.observe(&field, |this, field, cx| {
                 this.misc_settings_state.extra.speech_words_draft =
                     settings_misc::field_text(&field, cx);
@@ -765,13 +1012,11 @@ impl AppView {
         }
         if state.speech_correction_field.is_none() {
             let field = cx.new(|cx| TextField::new("e.g. scratch that", cx));
-            state
-                .extra_subs
-                .push(cx.observe(&field, |this, field, cx| {
-                    this.misc_settings_state.extra.speech_correction_draft =
-                        settings_misc::field_text(&field, cx);
-                    cx.notify();
-                }));
+            state.extra_subs.push(cx.observe(&field, |this, field, cx| {
+                this.misc_settings_state.extra.speech_correction_draft =
+                    settings_misc::field_text(&field, cx);
+                cx.notify();
+            }));
             state.extra_subs.push(cx.subscribe(
                 &field,
                 |this, _field, event: &PromptSubmitted, _cx| {
@@ -811,11 +1056,7 @@ impl AppView {
             state.extra_subs.push(cx.subscribe(
                 &field,
                 |this, _field, event: &PromptSubmitted, cx| {
-                    this.update_scoped_setting(
-                        "branchNamePrefix",
-                        json!(event.0.trim()),
-                        cx,
-                    );
+                    this.update_scoped_setting("branchNamePrefix", json!(event.0.trim()), cx);
                 },
             ));
             state.branch_prefix_field = Some(field);
@@ -830,11 +1071,7 @@ impl AppView {
             state.extra_subs.push(cx.subscribe(
                 &field,
                 |this, _field, event: &PromptSubmitted, cx| {
-                    this.update_scoped_setting(
-                        "branchNameInstructions",
-                        json!(event.0.trim()),
-                        cx,
-                    );
+                    this.update_scoped_setting("branchNameInstructions", json!(event.0.trim()), cx);
                 },
             ));
             state.branch_instructions_field = Some(field);
@@ -956,12 +1193,7 @@ impl AppView {
                 state.branch_prefix_draft = branch_prefix_value.clone();
                 edit_field(&field, cx, |field, window, cx| {
                     field.reset(window, cx);
-                    field.replace_text_in_range(
-                        Some(0..0),
-                        &branch_prefix_value,
-                        window,
-                        cx,
-                    );
+                    field.replace_text_in_range(Some(0..0), &branch_prefix_value, window, cx);
                 });
             }
             state.branch_prefix_seeded = true;
@@ -973,12 +1205,7 @@ impl AppView {
                 state.branch_instructions_draft = branch_instructions_value.clone();
                 edit_field(&field, cx, |field, window, cx| {
                     field.reset(window, cx);
-                    field.replace_text_in_range(
-                        Some(0..0),
-                        &branch_instructions_value,
-                        window,
-                        cx,
-                    );
+                    field.replace_text_in_range(Some(0..0), &branch_instructions_value, window, cx);
                 });
             }
             state.branch_instructions_seeded = true;
@@ -1768,6 +1995,359 @@ impl AppView {
         section
     }
 
+    // ─── Shared extra-page widgets ──────────────────────────────────────
+
+    /// Toggle the string-keyed select/menu (`extra_open`) open/closed.
+    fn extra_toggle(&mut self, key: String, cx: &mut Context<Self>) {
+        let state = &mut self.misc_settings_state.extra;
+        state.extra_open = if state.extra_open.as_deref() == Some(key.as_str()) {
+            None
+        } else {
+            Some(key)
+        };
+        cx.notify();
+    }
+
+    /// Fold an extra-select pick into state — the `key` prefix routes the
+    /// write (scope chip, browser ClientConfig fields, profile menu
+    /// actions, provider config selects, "+ Add provider").
+    fn extra_pick(&mut self, key: String, value: String, cx: &mut Context<Self>) {
+        self.misc_settings_state.extra.extra_open = None;
+        if key == "scope:project" {
+            self.misc_settings_state.scope_project =
+                if value.is_empty() { None } else { Some(value) };
+            self.client_config.settings_scope_project =
+                self.misc_settings_state.scope_project.clone();
+            self.client_config.save();
+        } else if key == "browser:frame-rate" {
+            self.client_config.browser_recording_frame_rate = value.parse().unwrap_or(30);
+            self.client_config.save();
+        } else if key == "browser:viewport" {
+            self.client_config.browser_default_viewport = value;
+            self.client_config.save();
+        } else if key == "browser:zoom" {
+            self.client_config.browser_default_zoom = value;
+            self.client_config.save();
+        } else if key == "browser:appearance" {
+            self.client_config.browser_default_appearance = value;
+            self.client_config.save();
+        } else if let Some(profile_id) = key.strip_prefix("browser:profile-menu:") {
+            self.browser_profile_menu_pick(profile_id, &value, cx);
+        } else if key == "provider:add" {
+            self.add_provider_instance(&value, cx);
+        } else if let Some(rest) = key.strip_prefix("provider:") {
+            if let Some(instance_id) = rest.strip_suffix(":idleCompaction") {
+                self.provider_config_write(instance_id, "idleCompaction", &value, cx);
+            } else if let Some(instance_id) = rest.strip_suffix(":authMethod") {
+                self.provider_config_write(instance_id, "authMethod", &value, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Browser-profile ⋮ menu picks: make default / remove. Clearing
+    /// cookies/cache needs the embedded browser surface the native client
+    /// doesn't have, so the menu carries just these entries.
+    fn browser_profile_menu_pick(
+        &mut self,
+        profile_id: &str,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            "default" => {
+                self.client_config.browser_default_profile_id = profile_id.to_string();
+            }
+            "remove" => {
+                self.client_config
+                    .browser_profiles
+                    .retain(|profile| profile.id != profile_id);
+                if self.client_config.browser_default_profile_id == profile_id {
+                    self.client_config.browser_default_profile_id = "default".to_string();
+                }
+            }
+            _ => return,
+        }
+        self.client_config.save();
+        cx.notify();
+    }
+
+    /// The select trigger for an `extra_open` list — same look as
+    /// `select_trigger` but keyed by string so these pages don't need new
+    /// `OpenList` variants.
+    fn extra_trigger(
+        &self,
+        key: &str,
+        current: SharedString,
+        min_width: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let key = key.to_string();
+        div()
+            .id(format!("extra-trigger-{key}"))
+            .min_w(px(min_width))
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::input())
+            .bg(theme::field_surface())
+            .text_sm()
+            .cursor_pointer()
+            .text_color(theme::fg())
+            .hover(|s| s.bg(theme::accent()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::fg())
+                    .child(current),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(icon(Icon::ChevronDown, 12.).text_color(theme::icon_muted())),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.extra_toggle(key.clone(), cx);
+                }),
+            )
+    }
+
+    /// The deferred option popup for an `extra_open` list — same chrome as
+    /// the shared `select_options_list`; picking runs `extra_pick`.
+    fn extra_options_popup(
+        &self,
+        key: &str,
+        current_value: &str,
+        options: &[(String, String, Option<String>)],
+        cx: &mut Context<Self>,
+    ) -> gpui::Deferred {
+        let mut list_div = div()
+            .flex()
+            .flex_col()
+            .min_w(px(180.))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::raised())
+            .shadow_2xl();
+        for (index, (value, label, detail)) in options.iter().enumerate() {
+            let selected = *value == current_value;
+            let value = value.clone();
+            let key = key.to_string();
+            list_div = list_div.child(
+                div()
+                    .id(format!("extra-opt-{key}-{index}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .min_h(px(28.))
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg())
+                    .when(selected, |s| s.bg(theme::selected()))
+                    .when(!selected, |s| s.hover(|s| s.bg(theme::accent())))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.extra_pick(key.clone(), value.clone(), cx);
+                        }),
+                    )
+                    .child(div().flex_none().child(label.clone()))
+                    .when_some(detail.clone(), |s, detail| {
+                        s.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child(detail),
+                        )
+                    }),
+            );
+        }
+        deferred(div().absolute().top_full().right_0().pt_1().child(list_div)).with_priority(2)
+    }
+
+    /// Trigger + popup pair for an `extra_open` select.
+    fn extra_select_control(
+        &self,
+        key: &str,
+        current: SharedString,
+        current_value: &str,
+        options: Vec<(String, String, Option<String>)>,
+        min_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open = self.misc_settings_state.extra.extra_open.as_deref() == Some(key);
+        div()
+            .relative()
+            .flex_none()
+            .child(self.extra_trigger(key, current, min_width, cx))
+            .when(open, |cell| {
+                cell.child(self.extra_options_popup(key, current_value, &options, cx))
+            })
+    }
+
+    /// A whole `setting_row` whose control is an `extra_select_control`.
+    fn extra_select_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        key: &str,
+        current: SharedString,
+        current_value: &str,
+        options: Vec<(String, String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div().flex().flex_col().child(setting_row(
+            title,
+            description,
+            self.extra_select_control(key, current, current_value, options, 160., cx),
+        ))
+    }
+
+    /// The web `SettingsScopeSentence`: "Applying settings for
+    /// [project chip] {on|across} [env chip]". The project chip opens the
+    /// project list (same write as `OpenList::SettingsScope`); the env chip
+    /// is read-only — the native client edits the connected environment.
+    fn scope_sentence(&self, on_environment: bool, cx: &mut Context<Self>) -> Div {
+        let pid = self.scope_project_id().map(str::to_string);
+        let project_label: SharedString = match &pid {
+            Some(id) => self
+                .state
+                .projects
+                .iter()
+                .find(|p| p.id.as_ref() == id.as_str())
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| id.clone())
+                .into(),
+            None => "All projects".into(),
+        };
+        let current = pid.clone().unwrap_or_default();
+        let mut options = vec![(
+            String::new(),
+            "All projects".to_string(),
+            Some("Server-wide defaults every project inherits.".to_string()),
+        )];
+        for project in &self.state.projects {
+            options.push((
+                project.id.to_string(),
+                project.name.to_string(),
+                Some("Override the marked rows for this project.".to_string()),
+            ));
+        }
+        let open = self.misc_settings_state.extra.extra_open.as_deref() == Some("scope:project");
+        let chip =
+            |id: &'static str, label: SharedString, leading: Option<Icon>, interactive: bool| {
+                let mut el = div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(theme::field_surface())
+                    .border_1()
+                    .border_color(theme::input())
+                    .text_xs()
+                    .text_color(theme::fg());
+                if let Some(mark) = leading {
+                    el = el.child(icon(mark, 11.).text_color(theme::fg_muted()));
+                }
+                el = el.child(label);
+                if interactive {
+                    el = el
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::accent()))
+                        .child(icon(Icon::ChevronDown, 11.).text_color(theme::icon_muted()));
+                }
+                el
+            };
+        let env_label: SharedString = self
+            .client_config
+            .active_environment
+            .and_then(|ix| self.client_config.environments.get(ix))
+            .map(|env| env.label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| self.endpoint_label.clone())
+            .into();
+        let env_chip = if on_environment {
+            chip("scope-env-chip", env_label, Some(Icon::Monitor), false)
+        } else {
+            chip(
+                "scope-env-chip",
+                "All environments".into(),
+                Some(Icon::Monitor),
+                false,
+            )
+        };
+        let project_chip = chip("scope-project-chip", project_label, None, true).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev, _window, cx| {
+                this.extra_toggle("scope:project".to_string(), cx);
+            }),
+        );
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(theme::fg_muted())
+            .child("Applying settings for")
+            .child(div().relative().child(project_chip).when(open, |cell| {
+                cell.child(self.extra_options_popup("scope:project", &current, &options, cx))
+            }))
+            .child(if on_environment { "on" } else { "across" })
+            .child(env_chip)
+    }
+
+    /// Small ghost icon button — `SettingsSection` header actions and the
+    /// `SettingResetButton` (↺) affordance.
+    fn extra_icon_button(
+        &self,
+        element_id: String,
+        mark: Icon,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id(element_id)
+            .w(px(24.))
+            .h(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme::fg_muted())
+            .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+            .child(icon(mark, 13.))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    on_click(this, cx);
+                }),
+            )
+    }
+
     // ─── Source Control ─────────────────────────────────────────────────
 
     /// GitHub device-flow sign-in: `sourceControl.signInStart` returns the
@@ -1885,300 +2465,548 @@ impl AppView {
             .unwrap_or(Value::Null)
     }
 
+    /// One Repositories scoped switch with the web's `SettingResetButton`
+    /// (↺) beside the title while the value differs from `default_on`.
+    fn sc_reset_switch_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        scoped_key: &'static str,
+        element_id: &'static str,
+        default_on: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let on = self.scoped_value(scoped_key).as_bool() == Some(true);
+        let mut title_row = div().flex().items_center().gap_1p5().child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .child(title),
+        );
+        if on != default_on {
+            title_row = title_row.child(self.extra_icon_button(
+                format!("{element_id}-reset"),
+                Icon::Undo2,
+                cx,
+                move |this, cx| {
+                    this.update_scoped_setting(scoped_key, json!(default_on), cx);
+                },
+            ));
+        }
+        let mut control = div().flex().items_center().gap_2();
+        if let Some(chip) = self.scope_chip(scoped_key, cx) {
+            control = control.child(chip);
+        }
+        control = control.child(
+            div()
+                .id(element_id)
+                .cursor_pointer()
+                .child(switch_control(on))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        this.update_scoped_setting(scoped_key, json!(!on), cx);
+                    }),
+                ),
+        );
+        div()
+            .flex()
+            .items_center()
+            .gap_8()
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(title_row)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(description),
+                    ),
+            )
+            .child(control)
+    }
+
+    /// One discovery row — the web `DiscoveryItemRow`: status dot over the
+    /// brand mark, label + version code + badges on the first line, the
+    /// availability/auth summary on the second, chevron + availability
+    /// switch on the right.
+    fn sc_discovery_row(&self, item: &Value, is_vcs: bool, cx: &mut Context<Self>) -> Div {
+        let kind = item["kind"].as_str().unwrap_or_default().to_string();
+        let label = item["label"].as_str().unwrap_or("item").to_string();
+        let available = item["status"].as_str() == Some("available");
+        let implemented = item["implemented"].as_bool() != Some(false);
+        let version = item["version"].as_str().unwrap_or_default().to_string();
+        let auth_status = item["auth"]["status"].as_str().unwrap_or("unknown");
+        let signed_in = auth_status == "authenticated";
+        let unauthenticated = auth_status == "unauthenticated";
+        let has_cli = !item["executable"].as_str().unwrap_or_default().is_empty();
+        let install_hint = item["installHint"].as_str().unwrap_or_default();
+        let expanded = self.misc_settings_state.extra.sc_expanded.contains(&kind);
+
+        // Summary line — `useSourceControlItemSummaries` in the web.
+        let summary: String = if is_vcs {
+            if !implemented {
+                format!("Support for {label} is coming soon.")
+            } else if available {
+                "Available.".to_string()
+            } else {
+                format!("Not available on this server: {install_hint}")
+            }
+        } else if !has_cli && unauthenticated {
+            format!("Available. {install_hint}")
+        } else if !available {
+            format!("Not available on this server: {install_hint}")
+        } else if unauthenticated {
+            format!(
+                "{label} is not authenticated on this server. Sign in or configure credentials using the `{kind}` tool on the server host to enable change request features."
+            )
+        } else if signed_in {
+            match (
+                item["auth"]["account"].as_str(),
+                item["auth"]["host"].as_str(),
+            ) {
+                (Some(account), Some(host)) => {
+                    format!("Authenticated as {account} on {host}")
+                }
+                (Some(account), None) => format!("Authenticated as {account}"),
+                _ => "Authenticated".to_string(),
+            }
+        } else {
+            "Available. Status unknown.".to_string()
+        };
+
+        // Status dot: green when usable+authed, muted otherwise — the web
+        // `DiscoveryItemMark` (auth → green, available → foreground,
+        // missing → muted).
+        let dot = if (is_vcs && available && implemented) || (!is_vcs && available && signed_in) {
+            gpui::rgb(0x34d399)
+        } else if available {
+            theme::fg_muted()
+        } else {
+            theme::border()
+        };
+
+        // The web shows a chevron on rows whose definition carries extra
+        // settings (GitHub sign-in / GitCafe token) — `hasDetails`.
+        let has_details = !is_vcs && matches!(kind.as_str(), "github" | "gitcafe");
+
+        let mut first_line = div().flex().items_center().gap_2().min_w_0().child(
+            div()
+                .flex_none()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .child(label.clone()),
+        );
+        if !version.is_empty() && available {
+            first_line = first_line.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child(version.clone()),
+            );
+        }
+        if is_vcs && !implemented {
+            first_line = first_line.child(
+                div()
+                    .flex_none()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(theme::hover())
+                    .text_color(theme::fg_muted())
+                    .child("Coming Soon"),
+            );
+        }
+
+        let mark = div()
+            .relative()
+            .w(px(20.))
+            .h(px(20.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(source_control_icon(&kind), 15.).text_color(theme::fg()))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-3.))
+                    .left(px(-3.))
+                    .w(px(7.))
+                    .h(px(7.))
+                    .rounded_full()
+                    .bg(dot),
+            );
+
+        let kind_for_toggle = kind.clone();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .child(mark)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(first_line)
+                    .child(div().text_xs().text_color(theme::fg_muted()).child(summary)),
+            );
+        if has_details {
+            row = row.child(
+                div()
+                    .id(format!("sc-expand-{kind_for_toggle}"))
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()))
+                    .child(icon(
+                        if expanded {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        12.,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            let expanded = &mut this.misc_settings_state.extra.sc_expanded;
+                            if !expanded.remove(&kind_for_toggle) {
+                                expanded.insert(kind_for_toggle.clone());
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        // The availability switch is a read-out in the web (no handler);
+        // VCS rows without an implementation omit it entirely.
+        if !is_vcs || implemented {
+            row = row.child(div().flex_none().child(switch_control(
+                available && (is_vcs || !unauthenticated || signed_in || !has_cli),
+            )));
+        }
+        let mut cell = div().flex().flex_col().child(row);
+
+        // Expanded details — GitHub hosts the device-flow sign-in, GitCafe
+        // the token hint (token entry is web/desktop-only server-side; the
+        // install hint already names the `cafe` flow).
+        if expanded && kind == "github" {
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_4()
+                .pb_3()
+                .pt_1()
+                .border_t_1()
+                .border_color(theme::card_divider());
+            if signed_in {
+                details = details.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::fg_muted())
+                        .child("Signed in through the GitHub CLI on this server."),
+                );
+            } else {
+                let mut sign_in = div()
+                    .id("sc-sign-in")
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(theme::hover())
+                    .text_color(theme::fg())
+                    .hover(|s| s.bg(theme::selected()))
+                    .child(if self.misc_settings_state.extra.sc_busy {
+                        "Signing in…"
+                    } else {
+                        "Sign in with GitHub"
+                    });
+                if self.misc_settings_state.extra.sc_busy {
+                    sign_in = sign_in.opacity(0.4);
+                } else {
+                    sign_in = sign_in.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.source_control_sign_in(cx);
+                        }),
+                    );
+                }
+                details = details
+                    .child(div().text_xs().text_color(theme::fg_muted()).child(
+                        "Sign in on this device — the code authorizes the `gh` CLI on the server.",
+                    ))
+                    .child(div().flex().child(sign_in));
+            }
+            if let Some((code, uri)) = &self.misc_settings_state.extra.sc_signin_prompt {
+                details = details.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme::fg())
+                                        .child(format!("Enter code {code}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::fg_muted())
+                                        .truncate()
+                                        .child(uri.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("sc-signin-cancel")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(theme::hover())
+                                .text_color(theme::fg_muted())
+                                .hover(|s| s.bg(theme::selected()))
+                                .child("Cancel")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.source_control_sign_in_cancel(cx);
+                                    }),
+                                ),
+                        ),
+                );
+            }
+            cell = cell.child(details);
+        } else if expanded {
+            cell = cell.child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(theme::card_divider())
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("Token and account settings for this provider are managed in the desktop and web clients."),
+            );
+        }
+        cell
+    }
+
     pub(crate) fn render_source_control_section(&self, cx: &mut Context<Self>) -> Div {
         self.maybe_load_source_control(cx);
         self.maybe_load_misc_settings(cx);
         self.maybe_prepare_extra(cx);
         let state = &self.misc_settings_state.extra;
         let connected = self.commands.is_some();
-        let mut section = div().flex().flex_col();
+        let mut page = div().flex().flex_col().gap_8();
 
-        if !connected {
-            section = section.child(
+        if let Some(error) = &self.misc_settings_state.settings_error {
+            page = page.child(
                 div()
                     .py_1p5()
                     .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Connect to a server to see source control providers."),
+                    .text_color(danger())
+                    .child(error.clone()),
             );
-            return section;
         }
 
-        // ── Discovery (`server.discoverSourceControl`) ──────────────────
-        let discovery = state.sc_discovery.clone().unwrap_or(Value::Null);
-        section = section.child(
+        // Scope sentence — the web `SettingsScopeSentence` above the page
+        // ("… across All environments" for these server+VCS surfaces).
+        page = page.child(self.scope_sentence(false, cx));
+
+        // ── Repositories — web `ProjectDefaultsSettings` repo rows. ────
+        let mut repo_rows: Vec<Div> = Vec::new();
+        if connected {
+            repo_rows.push(self.sc_reset_switch_row(
+                "Automatically pull",
+                "Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.",
+                "defaultAutoPull",
+                "sc-auto-pull",
+                false,
+                cx,
+            ));
+            repo_rows.push(self.sc_reset_switch_row(
+                "Remove agent credits when merging",
+                "Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.",
+                "removeAgentCreditsOnMerge",
+                "sc-agent-credits",
+                false,
+                cx,
+            ));
+            let merge_method = self.scoped_value("pullRequestMergeMethod");
+            let merge_value = merge_method.as_str().unwrap_or("last");
+            let merge_label = match merge_value {
+                "merge" => "Merge commit",
+                "squash" => "Squash and merge",
+                "rebase" => "Rebase and merge",
+                _ => "Last selected",
+            };
+            repo_rows.push(self.scoped_select_setting(
+                "Default merge method",
+                "Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.",
+                OpenList::MergeMethod,
+                "pullRequestMergeMethod",
+                merge_label.into(),
+                merge_value,
+                vec![
+                    ("last".to_string(), "Last selected".to_string(), None),
+                    ("merge".to_string(), "Merge commit".to_string(), None),
+                    (
+                        "squash".to_string(),
+                        "Squash and merge".to_string(),
+                        None,
+                    ),
+                    (
+                        "rebase".to_string(),
+                        "Rebase and merge".to_string(),
+                        None,
+                    ),
+                ],
+                cx,
+            ));
+        } else {
+            repo_rows.push(setting_row(
+                "Repositories",
+                "Source control discovery runs on the connected environment.",
+                div()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .child("Not connected"),
+            ));
+        }
+        page = page.child(
             div()
                 .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(group_label("Version control — tools on the server")),
-                )
-                .child(
-                    div()
-                        .id("sc-rescan")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(theme::hover())
-                        .text_color(theme::fg_muted())
-                        .hover(|s| s.bg(theme::selected()))
-                        .child(if state.sc_disc_loading.get() {
-                            "Scanning…"
-                        } else {
-                            "Rescan"
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.rescan_source_control(cx);
-                            }),
-                        ),
-                ),
+                .flex_col()
+                .child(settings_section_title("Repositories"))
+                .child(settings_card(repo_rows)),
         );
 
-        if state.sc_disc_loading.get() && discovery.is_null() {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Scanning the server for git / jj / CLIs…"),
-            );
-        } else if discovery.is_null() {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No discovery result yet — Rescan to check the server's tools."),
-            );
-        }
-
-        // VcsDiscoveryItem rows: label, version+executable when available,
-        // installHint when missing. `implemented:false` kinds (e.g. jj on a
-        // git-only server) get a muted "not supported" tag instead.
-        if let Some(vcs) = discovery["versionControlSystems"].as_array() {
-            for item in vcs {
-                let label = item["label"].as_str().unwrap_or("tool").to_string();
-                let available = item["status"].as_str() == Some("available");
-                let implemented = item["implemented"].as_bool() != Some(false);
-                let detail = if available {
-                    let version = item["version"].as_str().unwrap_or_default();
-                    let exe = item["executable"].as_str().unwrap_or_default();
-                    if exe.is_empty() {
-                        version.to_string()
-                    } else {
-                        format!("{version} · {exe}")
-                    }
-                } else {
-                    item["installHint"]
-                        .as_str()
-                        .unwrap_or("Not installed on the server.")
-                        .to_string()
-                };
-                section = section.child(
+        // ── Version Control — `server.discoverSourceControl` VCS rows. ─
+        let discovery = state.sc_discovery.clone().unwrap_or(Value::Null);
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
                     div()
+                        .min_h(px(28.))
+                        .pb_2p5()
+                        .px_4()
                         .flex()
                         .items_center()
-                        .gap_3()
-                        .py_1p5()
-                        .text_sm()
-                        .child(div().w(px(8.)).h(px(8.)).flex_none().rounded_full().bg(
-                            if available {
-                                gpui::rgb(0x34d399)
-                            } else {
-                                theme::border()
-                            },
-                        ))
-                        .child(
-                            div()
-                                .w(px(120.))
-                                .flex_none()
-                                .text_color(theme::fg())
-                                .child(label),
-                        )
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .child(detail),
-                        )
-                        .when(!implemented, |s| {
-                            s.child(
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(theme::fg_muted())
-                                    .child("not supported"),
-                            )
-                        }),
-                );
-            }
-        }
-
-        // SourceControlProviderDiscoveryItem rows: label + auth state
-        // (authenticated account / unauthenticated / unknown) + installHint
-        // when the CLI is missing.
-        let providers = discovery["sourceControlProviders"].as_array().cloned();
-        if let Some(providers) = providers.filter(|p| !p.is_empty()) {
-            section = section.child(group_label("Source control providers"));
-            for item in providers {
-                let label = item["label"].as_str().unwrap_or("provider").to_string();
-                let available = item["status"].as_str() == Some("available");
-                let auth_status = item["auth"]["status"].as_str().unwrap_or("unknown");
-                let account = item["auth"]["account"].as_str();
-                let host = item["auth"]["host"].as_str();
-                let signed_in = auth_status == "authenticated";
-                let mut detail = if !available {
-                    item["installHint"]
-                        .as_str()
-                        .unwrap_or("CLI not installed on the server.")
-                        .to_string()
-                } else {
-                    match (signed_in, account) {
-                        (true, Some(account)) => match host {
-                            Some(host) => format!("Signed in as {account} on {host}"),
-                            None => format!("Signed in as {account}"),
-                        },
-                        _ => "Not signed in".to_string(),
-                    }
-                };
-                if let Some(extra) = item["detail"].as_str() {
-                    detail = format!("{detail} · {extra}");
-                }
-                let is_github = item["kind"].as_str() == Some("github");
-                let mut row =
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .py_1p5()
-                        .text_sm()
-                        .child(div().w(px(8.)).h(px(8.)).flex_none().rounded_full().bg(
-                            if signed_in {
-                                gpui::rgb(0x34d399)
-                            } else {
-                                theme::border()
-                            },
-                        ))
-                        .child(
-                            div()
-                                .w(px(120.))
-                                .flex_none()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme::fg())
-                                .child(label),
+                                .child("Version Control"),
                         )
-                        .child(
+                        .when(connected, |s| {
+                            s.child(self.extra_icon_button(
+                                "sc-rescan".to_string(),
+                                Icon::RefreshCw,
+                                cx,
+                                |this, cx| this.rescan_source_control(cx),
+                            ))
+                        }),
+                )
+                .child({
+                    let mut vcs_rows: Vec<Div> = Vec::new();
+                    if let Some(vcs) = discovery["versionControlSystems"].as_array() {
+                        for item in vcs {
+                            vcs_rows.push(self.sc_discovery_row(item, true, cx));
+                        }
+                    }
+                    if vcs_rows.is_empty() {
+                        vcs_rows.push(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
+                                .px_4()
+                                .py_3()
                                 .text_xs()
                                 .text_color(theme::fg_muted())
-                                .child(detail),
-                        );
-                // GitHub device-flow sign-in (appSignIn-capable providers —
-                // the web gates the button on `appSignIn === true`).
-                if is_github && available && !signed_in {
-                    let mut sign_in_btn = div()
-                        .id("sc-sign-in")
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(theme::hover())
-                        .text_color(theme::fg())
-                        .child(if state.sc_busy {
-                            "Signing in…"
-                        } else {
-                            "Sign in"
-                        });
-                    if state.sc_busy {
-                        sign_in_btn = sign_in_btn.opacity(0.4);
-                    }
-                    sign_in_btn = sign_in_btn.on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev, _window, cx| {
-                            this.source_control_sign_in(cx);
-                        }),
-                    );
-                    row = row.child(sign_in_btn);
-                }
-                section = section.child(row);
-            }
-        } else if !discovery.is_null() {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("No source control providers detected on the server."),
-            );
-        }
-
-        // Device-flow prompt while `signInWait` runs.
-        if let Some((code, uri)) = &state.sc_signin_prompt {
-            section = section.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .py_1p5()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme::fg())
-                                    .child(format!("Enter code {code}")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::fg_muted())
-                                    .truncate()
-                                    .child(uri.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("sc-signin-cancel")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .cursor_pointer()
-                            .bg(theme::hover())
-                            .text_color(theme::fg_muted())
-                            .hover(|s| s.bg(theme::selected()))
-                            .child("Cancel")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.source_control_sign_in_cancel(cx);
+                                .child(if state.sc_disc_loading.get() {
+                                    "Scanning the server for git / jj / CLIs…"
+                                } else if connected {
+                                    "No discovery result yet — the rescan button checks the server's tools."
+                                } else {
+                                    "Connect to a server to see version control tools."
                                 }),
-                            ),
-                    ),
+                        );
+                    }
+                    settings_card(vcs_rows)
+                }),
+        );
+
+        // ── Source control providers — provider discovery rows. ────────
+        let providers = discovery["sourceControlProviders"].as_array().cloned();
+        let mut provider_rows: Vec<Div> = Vec::new();
+        if let Some(items) = providers {
+            for item in &items {
+                provider_rows.push(self.sc_discovery_row(item, false, cx));
+            }
+        }
+        if provider_rows.is_empty() {
+            provider_rows.push(
+                div()
+                    .px_4()
+                    .py_3()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child(if state.sc_disc_loading.get() {
+                        "Scanning the server for source control providers…"
+                    } else {
+                        "No source control providers detected on the server."
+                    }),
             );
         }
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(settings_section_title("Source control providers"))
+                .child(settings_card(provider_rows)),
+        );
 
         if let Some(note) = &state.sc_note {
-            section = section.child(
+            page = page.child(
                 div()
                     .py_1p5()
                     .text_xs()
@@ -2187,21 +3015,24 @@ impl AppView {
             );
         }
 
-        // ── Writing (ServerSettings) ────────────────────────────────────
-        if let Some(error) = &self.misc_settings_state.settings_error {
-            section = section.child(
-                div()
-                    .py_1p5()
-                    .text_xs()
-                    .text_color(danger())
-                    .child(error.clone()),
-            );
-        }
-        section = section.child(self.render_scope_selector(cx));
-        section = section.child(group_label("Commit & pull request writing"));
+        // ── Commit & pull request writing (scoped ServerSettings). ─────
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(settings_section_title("Commit & pull request writing"))
+                .child(self.render_sc_writing_rows(cx)),
+        );
 
-        // Scoped keys — the mode/model write into projectSettingsOverrides
-        // when the scope selector picks a project.
+        page
+    }
+
+    /// The writing-settings card — `sourceControlWritingStyle` (+ the
+    /// custom-instructions field in "custom" mode) and the writer model.
+    fn render_sc_writing_rows(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.misc_settings_state.extra;
+        let mut rows: Vec<Div> = Vec::new();
+
         let style = self.scoped_value("sourceControlWritingStyle");
         let mode = style["mode"]
             .as_str()
@@ -2212,7 +3043,7 @@ impl AppView {
             .find(|(value, _, _)| *value == mode)
             .map(|(_, label, _)| *label)
             .unwrap_or(mode.as_str());
-        section = section.child(
+        rows.push(
             self.scoped_select_setting(
                 "Writing style",
                 "How generated commit messages and pull request text are shaped.",
@@ -2233,30 +3064,17 @@ impl AppView {
                 cx,
             ),
         );
-        if mode == "custom" {
-            if let Some(field) = state.sc_instructions_field.clone() {
-                section = section.child(setting_row(
-                    "Custom instructions",
-                    "Enter saves. Applied to generated commit messages and PR text.",
-                    div()
-                        .w(px(220.))
-                        .px_2()
-                        .py_1()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme::input())
-                        .bg(theme::field_surface())
-                        .text_sm()
-                        .text_color(theme::fg())
-                        .child(field),
-                ));
-            }
+        if mode == "custom"
+            && let Some(field) = state.sc_instructions_field.clone()
+        {
+            rows.push(setting_row(
+                "Custom instructions",
+                "Enter saves. Applied to generated commit messages and PR text.",
+                self.boxed_field(field, 220.),
+            ));
         }
 
-        // Writer model — same ModelSelection shape as Chat's defaults
-        // (scoped: nullable override).
         let writer_selection = self.scoped_value("sourceControlWriterModelSelection");
-        let writer_selection = &writer_selection;
         let writer_value = if writer_selection.is_null() {
             AUTO_VALUE.to_string()
         } else {
@@ -2271,7 +3089,7 @@ impl AppView {
         let writer_label: SharedString = if writer_selection.is_null() {
             "Automatic".into()
         } else {
-            Self::selection_label(writer_selection).into()
+            Self::selection_label(&writer_selection).into()
         };
         let mut writer_options = vec![(
             AUTO_VALUE.to_string(),
@@ -2285,7 +3103,7 @@ impl AppView {
                 Some(format!("{instance}/{model}")),
             ));
         }
-        section = section.child(self.scoped_select_setting(
+        rows.push(self.scoped_select_setting(
             "Writing model",
             "Model used for generated source control text.",
             OpenList::ScWriterModel,
@@ -2296,41 +3114,7 @@ impl AppView {
             cx,
         ));
 
-        // Default pull request merge method (web `ProjectDefaultsSettings`
-        // "Repositories") — `pullRequestMergeMethod`, null = last selected.
-        let merge_method = self.scoped_value("pullRequestMergeMethod");
-        let merge_value = merge_method.as_str().unwrap_or("last");
-        let merge_label = match merge_value {
-            "merge" => "Merge commit",
-            "squash" => "Squash and merge",
-            "rebase" => "Rebase and merge",
-            _ => "Last selected",
-        };
-        section = section.child(self.scoped_select_setting(
-            "Default merge method",
-            "How the merge button lands pull requests by default.",
-            OpenList::MergeMethod,
-            "pullRequestMergeMethod",
-            merge_label.into(),
-            merge_value,
-            vec![
-                ("last".to_string(), "Last selected".to_string(), None),
-                ("merge".to_string(), "Merge commit".to_string(), None),
-                (
-                    "squash".to_string(),
-                    "Squash and merge".to_string(),
-                    None,
-                ),
-                (
-                    "rebase".to_string(),
-                    "Rebase and merge".to_string(),
-                    None,
-                ),
-            ],
-            cx,
-        ));
-
-        section
+        settings_card(rows)
     }
 
     // ─── Threads (web /settings/threads) ────────────────────────────────
@@ -2361,9 +3145,7 @@ impl AppView {
             if preset["kind"].as_str() != Some("after") {
                 *preset = json!({ "kind": "after", "minutes": 60 });
             }
-        } else if preset["kind"].as_str() != Some("at")
-            || preset["day"].as_str() != Some(value)
-        {
+        } else if preset["kind"].as_str() != Some("at") || preset["day"].as_str() != Some(value) {
             let time = preset["time"].as_str().unwrap_or("09:00").to_string();
             *preset = json!({ "kind": "at", "day": value, "time": time });
         } else {
@@ -2409,55 +3191,52 @@ impl AppView {
     ) -> Div {
         let which = list.prefix();
         let open = self.misc_settings_state.open_list == Some(list);
-        let mut cell = div()
-            .relative()
-            .flex_none()
-            .child(
-                div()
-                    .id(format!("{which}-{row}"))
-                    .min_w(px(104.))
-                    .h(px(32.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::input())
-                    .bg(theme::field_surface())
-                    .text_sm()
-                    .cursor_pointer()
-                    .text_color(theme::fg())
-                    .hover(|s| s.bg(theme::accent()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme::fg())
-                            .child(current),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .child(icon(Icon::ChevronDown, 12.).text_color(theme::icon_muted())),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _window, cx| {
-                            let state = &mut this.misc_settings_state;
-                            state.open_list = if state.open_list == Some(list) {
-                                None
-                            } else {
-                                Some(list)
-                            };
-                            cx.notify();
-                        }),
-                    ),
-            );
+        let mut cell = div().relative().flex_none().child(
+            div()
+                .id(format!("{which}-{row}"))
+                .min_w(px(104.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::input())
+                .bg(theme::field_surface())
+                .text_sm()
+                .cursor_pointer()
+                .text_color(theme::fg())
+                .hover(|s| s.bg(theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::fg())
+                        .child(current),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .child(icon(Icon::ChevronDown, 12.).text_color(theme::icon_muted())),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        let state = &mut this.misc_settings_state;
+                        state.open_list = if state.open_list == Some(list) {
+                            None
+                        } else {
+                            Some(list)
+                        };
+                        cx.notify();
+                    }),
+                ),
+        );
         if open {
             let mut popup = div()
                 .flex()
@@ -2499,12 +3278,7 @@ impl AppView {
                 );
             }
             cell = cell.child(deferred(
-                div()
-                    .absolute()
-                    .top_full()
-                    .left_0()
-                    .pt_1()
-                    .child(popup),
+                div().absolute().top_full().left_0().pt_1().child(popup),
             ));
         }
         cell
@@ -2677,25 +3451,27 @@ impl AppView {
             .find(|(value, _, _)| *value == runtime_mode.as_str())
             .map(|(_, label, _)| (*label).to_string())
             .unwrap_or_else(|| runtime_mode.clone());
-        new_thread_rows.push(self.scoped_select_setting(
-            "Default permissions",
-            "Default permissions for new threads. Projects can override them.",
-            OpenList::RuntimeMode,
-            "defaultRuntimeMode",
-            runtime_label.into(),
-            &runtime_mode,
-            settings_misc::RUNTIME_MODES
-                .iter()
-                .map(|(value, label, detail)| {
-                    (
-                        value.to_string(),
-                        label.to_string(),
-                        Some(detail.to_string()),
-                    )
-                })
-                .collect(),
-            cx,
-        ));
+        new_thread_rows.push(
+            self.scoped_select_setting(
+                "Default permissions",
+                "Default permissions for new threads. Projects can override them.",
+                OpenList::RuntimeMode,
+                "defaultRuntimeMode",
+                runtime_label.into(),
+                &runtime_mode,
+                settings_misc::RUNTIME_MODES
+                    .iter()
+                    .map(|(value, label, detail)| {
+                        (
+                            value.to_string(),
+                            label.to_string(),
+                            Some(detail.to_string()),
+                        )
+                    })
+                    .collect(),
+                cx,
+            ),
+        );
 
         let env_mode = self
             .scoped_value("defaultThreadEnvMode")
@@ -2765,28 +3541,24 @@ impl AppView {
                 ("after".to_string(), "In".to_string())
             };
             let mut controls = div().flex().items_center().gap_2().flex_wrap();
-            controls = controls.child(self.snooze_select(
-                row,
-                OpenList::SnoozeWhen(row),
-                when_label.into(),
-                &when_value,
-                &SNOOZE_WHEN
-                    .iter()
-                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                    .collect::<Vec<_>>(),
-                cx,
-            ));
+            controls = controls.child(
+                self.snooze_select(
+                    row,
+                    OpenList::SnoozeWhen(row),
+                    when_label.into(),
+                    &when_value,
+                    &SNOOZE_WHEN
+                        .iter()
+                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                        .collect::<Vec<_>>(),
+                    cx,
+                ),
+            );
             if kind == "at" {
                 let time = preset["time"].as_str().unwrap_or("09:00").to_string();
                 let mut time_options: Vec<(String, String, Option<String>)> = SNOOZE_TIMES
                     .iter()
-                    .map(|value| {
-                        (
-                            format!("time:{value}"),
-                            (*value).to_string(),
-                            None,
-                        )
-                    })
+                    .map(|value| (format!("time:{value}"), (*value).to_string(), None))
                     .collect();
                 if !SNOOZE_TIMES.contains(&time.as_str()) {
                     time_options.insert(0, (format!("time:{time}"), time.clone(), None));
@@ -2801,25 +3573,14 @@ impl AppView {
                 ));
             } else {
                 let minutes = preset["minutes"].as_u64().unwrap_or(60);
-                let mut duration_options: Vec<(String, String, Option<String>)> =
-                    SNOOZE_DURATIONS
-                        .iter()
-                        .map(|(value, label)| {
-                            (format!("min:{value}"), (*label).to_string(), None)
-                        })
-                        .collect();
-                let in_options = SNOOZE_DURATIONS
+                let mut duration_options: Vec<(String, String, Option<String>)> = SNOOZE_DURATIONS
                     .iter()
-                    .any(|(value, _)| *value == minutes);
+                    .map(|(value, label)| (format!("min:{value}"), (*label).to_string(), None))
+                    .collect();
+                let in_options = SNOOZE_DURATIONS.iter().any(|(value, _)| *value == minutes);
                 if !in_options {
-                    duration_options.insert(
-                        0,
-                        (
-                            format!("min:{minutes}"),
-                            format_minutes(minutes),
-                            None,
-                        ),
-                    );
+                    duration_options
+                        .insert(0, (format!("min:{minutes}"), format_minutes(minutes), None));
                 }
                 controls = controls.child(self.snooze_select(
                     row,
@@ -2880,44 +3641,43 @@ impl AppView {
                     ),
             );
         }
-        let snooze_section = div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(settings_section_title("Snooze")),
-                    )
-                    .child(
-                        div()
-                            .id("snooze-reset")
-                            .cursor_pointer()
-                            .pb_2()
-                            .text_xs()
-                            .text_color(theme::primary())
-                            .hover(|s| s.text_color(theme::fg()))
-                            .child("Reset to defaults")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.snooze_write(default_snooze_presets(), cx);
-                                }),
-                            ),
+        let snooze_section =
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(settings_section_title("Snooze")),
+                        )
+                        .child(
+                            div()
+                                .id("snooze-reset")
+                                .cursor_pointer()
+                                .pb_2()
+                                .text_xs()
+                                .text_color(theme::primary())
+                                .hover(|s| s.text_color(theme::fg()))
+                                .child("Reset to defaults")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.snooze_write(default_snooze_presets(), cx);
+                                    }),
+                                ),
+                        ),
+                )
+                .child(snooze_card)
+                .child(
+                    div().pt_2().text_xs().text_color(theme::fg_muted()).child(
+                        "Options the thread's snooze menu offers, in the order they appear.",
                     ),
-            )
-            .child(snooze_card)
-            .child(
-                div()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(theme::fg_muted())
-                    .child("Options the thread's snooze menu offers, in the order they appear."),
-            );
+                );
         page = page.child(snooze_section);
 
         // ── Usage limits (ServerSettings) ────────────────────────────────
@@ -2996,19 +3756,21 @@ impl AppView {
                 .find(|(v, _)| *v == days_value)
                 .map(|(_, label)| *label)
                 .unwrap_or("Off");
-            settle_rows.push(self.scoped_select_setting(
-                "Settle inactive threads",
-                "Sidebar threads with no activity for this long settle automatically.",
-                OpenList::AutoSettleDays,
-                "sidebarAutoSettleAfterDays",
-                days_label.into(),
-                &days_value,
-                AUTO_SETTLE_DAYS
-                    .iter()
-                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                    .collect(),
-                cx,
-            ));
+            settle_rows.push(
+                self.scoped_select_setting(
+                    "Settle inactive threads",
+                    "Sidebar threads with no activity for this long settle automatically.",
+                    OpenList::AutoSettleDays,
+                    "sidebarAutoSettleAfterDays",
+                    days_label.into(),
+                    &days_value,
+                    AUTO_SETTLE_DAYS
+                        .iter()
+                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                        .collect(),
+                    cx,
+                ),
+            );
             if settle_days.is_some() {
                 settle_rows.push(self.scoped_switch_row(
                     "Keep threads with a PR",
@@ -3109,25 +3871,27 @@ impl AppView {
                 .find(|(v, _, _)| *v == streaming)
                 .map(|(_, label, _)| *label)
                 .unwrap_or("After each turn");
-            text_rows.push(self.scoped_select_setting(
-                "Response streaming",
-                "How agent replies appear while a turn is running.",
-                OpenList::ResponseStreaming,
-                "responseStreamingMode",
-                streaming_label.into(),
-                &streaming,
-                STREAMING_MODES
-                    .iter()
-                    .map(|(value, label, detail)| {
-                        (
-                            value.to_string(),
-                            label.to_string(),
-                            Some(detail.to_string()),
-                        )
-                    })
-                    .collect(),
-                cx,
-            ));
+            text_rows.push(
+                self.scoped_select_setting(
+                    "Response streaming",
+                    "How agent replies appear while a turn is running.",
+                    OpenList::ResponseStreaming,
+                    "responseStreamingMode",
+                    streaming_label.into(),
+                    &streaming,
+                    STREAMING_MODES
+                        .iter()
+                        .map(|(value, label, detail)| {
+                            (
+                                value.to_string(),
+                                label.to_string(),
+                                Some(detail.to_string()),
+                            )
+                        })
+                        .collect(),
+                    cx,
+                ),
+            );
             page = page.child(
                 div()
                     .flex()
@@ -3325,18 +4089,20 @@ impl AppView {
             .find(|(value, _)| *value == send)
             .map(|(_, label)| *label)
             .unwrap_or("Enter");
-        composer_rows.push(self.select_setting(
-            "Send shortcut",
-            "Choose when Enter sends a prompt or inserts a new line.",
-            OpenList::SendShortcut,
-            send_label.into(),
-            &send,
-            SEND_SHORTCUTS
-                .iter()
-                .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                .collect(),
-            cx,
-        ));
+        composer_rows.push(
+            self.select_setting(
+                "Send shortcut",
+                "Choose when Enter sends a prompt or inserts a new line.",
+                OpenList::SendShortcut,
+                send_label.into(),
+                &send,
+                SEND_SHORTCUTS
+                    .iter()
+                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                    .collect(),
+                cx,
+            ),
+        );
         composer_rows.push(self.client_switch(
             "Show skills in slash menu",
             "Also include skills in the / command menu. Skills always appear when you type $.",
@@ -3484,18 +4250,20 @@ impl AppView {
         } else {
             "Red & green (default)"
         };
-        diff_rows.push(self.select_setting(
-            "Diff colors",
-            "The palette added/removed lines use in diffs.",
-            OpenList::DiffColors,
-            colors_label.into(),
-            &colors,
-            DIFF_COLOR_SCHEMES
-                .iter()
-                .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                .collect(),
-            cx,
-        ));
+        diff_rows.push(
+            self.select_setting(
+                "Diff colors",
+                "The palette added/removed lines use in diffs.",
+                OpenList::DiffColors,
+                colors_label.into(),
+                &colors,
+                DIFF_COLOR_SCHEMES
+                    .iter()
+                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                    .collect(),
+                cx,
+            ),
+        );
 
         let pr_rows: Vec<Div> = vec![
             self.client_switch(
@@ -3560,18 +4328,20 @@ impl AppView {
                 .flex()
                 .flex_col()
                 .child(settings_section_title("Shortcut"))
-                .child(settings_card(vec![self.select_setting(
-                    "Voice shortcut",
-                    "How the microphone key starts and stops dictation.",
-                    OpenList::VoiceShortcut,
-                    mode_label.into(),
-                    &mode,
-                    VOICE_SHORTCUT_MODES
-                        .iter()
-                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                        .collect(),
-                    cx,
-                )])),
+                .child(settings_card(vec![
+                    self.select_setting(
+                        "Voice shortcut",
+                        "How the microphone key starts and stops dictation.",
+                        OpenList::VoiceShortcut,
+                        mode_label.into(),
+                        &mode,
+                        VOICE_SHORTCUT_MODES
+                            .iter()
+                            .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                            .collect(),
+                        cx,
+                    ),
+                ])),
         );
 
         let language = cfg.speech_language.clone();
@@ -3634,7 +4404,11 @@ impl AppView {
                 self.boxed_field(field, 220.),
             ));
         }
-        if let Some(field) = self.misc_settings_state.extra.speech_correction_field.clone()
+        if let Some(field) = self
+            .misc_settings_state
+            .extra
+            .speech_correction_field
+            .clone()
         {
             dictionary_rows.push(setting_row(
                 "Correction cue",
@@ -3685,18 +4459,20 @@ impl AppView {
             .find(|(value, _)| *value == shortcut)
             .map(|(_, label)| *label)
             .unwrap_or("Shift + Shift");
-        rows.push(self.select_setting(
-            "Capture shortcut",
-            "The key pair that captures the focused window.",
-            OpenList::SnapShortcut,
-            shortcut_label.into(),
-            &shortcut,
-            SNAPSHOT_SHORTCUTS
-                .iter()
-                .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                .collect(),
-            cx,
-        ));
+        rows.push(
+            self.select_setting(
+                "Capture shortcut",
+                "The key pair that captures the focused window.",
+                OpenList::SnapShortcut,
+                shortcut_label.into(),
+                &shortcut,
+                SNAPSHOT_SHORTCUTS
+                    .iter()
+                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                    .collect(),
+                cx,
+            ),
+        );
         rows.push(self.client_switch(
             "Include app text in snapshots",
             "Include text and controls when the app makes them available.",
@@ -3720,19 +4496,21 @@ impl AppView {
             } else {
                 "Soft pop"
             };
-            rows.push(self.select_setting(
-                "Snapshot sound",
-                "Choose the sound played when capture starts.",
-                OpenList::SnapSound,
-                sound_label.into(),
-                &sound,
-                SNAPSHOT_SOUNDS
-                    .iter()
-                    .filter(|(value, _)| *value != "off")
-                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
-                    .collect(),
-                cx,
-            ));
+            rows.push(
+                self.select_setting(
+                    "Snapshot sound",
+                    "Choose the sound played when capture starts.",
+                    OpenList::SnapSound,
+                    sound_label.into(),
+                    &sound,
+                    SNAPSHOT_SOUNDS
+                        .iter()
+                        .filter(|(value, _)| *value != "off")
+                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                        .collect(),
+                    cx,
+                ),
+            );
         }
         rows.push(self.client_switch(
             "Flash captured window",
@@ -3772,29 +4550,130 @@ impl AppView {
 
     // ─── Browser (web /settings/browser) ────────────────────────────────
 
+    /// One row in the Browser profiles sub-card — name + "Default" badge +
+    /// the ⋮ menu (Set as default / Remove for custom profiles).
+    fn browser_profile_row(&self, index: usize, cx: &mut Context<Self>) -> Div {
+        let profile = self.client_config.browser_profiles[index].clone();
+        let is_default = self.client_config.browser_default_profile_id == profile.id;
+        let built_in = profile.id == "default";
+        let menu_key = format!("browser:profile-menu:{}", profile.id);
+        let menu_open =
+            self.misc_settings_state.extra.extra_open.as_deref() == Some(menu_key.as_str());
+        let mut options = vec![("default".to_string(), "Set as default".to_string(), None)];
+        if !built_in {
+            options.push(("remove".to_string(), "Remove profile".to_string(), None));
+        }
+        let profile_id = profile.id.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .when(index > 0, |row| {
+                row.border_t_1().border_color(theme::card_divider())
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(theme::fg())
+                            .truncate()
+                            .child(profile.name),
+                    )
+                    .when(is_default, |name| {
+                        name.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .bg(theme::selected())
+                                .text_color(theme::primary())
+                                .child("Default"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(
+                        div()
+                            .id(format!("browser-profile-menu-{profile_id}"))
+                            .w(px(22.))
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(theme::fg_muted())
+                            .hover(|s| s.bg(theme::accent()))
+                            .child(icon(Icon::Ellipsis, 14.))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.extra_toggle(menu_key.clone(), cx);
+                                }),
+                            ),
+                    )
+                    .when(menu_open, |cell| {
+                        cell.child(self.extra_options_popup(
+                            &format!("browser:profile-menu:{profile_id}"),
+                            "",
+                            &options,
+                            cx,
+                        ))
+                    }),
+            )
+    }
+
     pub(crate) fn render_browser_section(&self, cx: &mut Context<Self>) -> Div {
         self.maybe_load_misc_settings(cx);
+        self.maybe_prepare_extra(cx);
         let cfg = &self.client_config;
         let mut page = div().flex().flex_col().gap_8();
 
+        if let Some(error) = &self.misc_settings_state.settings_error {
+            page = page.child(
+                div()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(danger())
+                    .child(error.clone()),
+            );
+        }
+        page = page.child(self.scope_sentence(false, cx));
+
+        // ── Agent access ──
         let mut agent_rows: Vec<Div> = Vec::new();
         if self.commands.is_some() {
             agent_rows.push(self.scoped_switch_row(
                 "Agent browser access",
-                "Let agents open and drive a browser on the connected environment — page fetch, automation, screenshots.",
+                "Allow agents to use the shared browser. Projects can override it.",
                 "enableAgentBrowserAccess",
                 "browser-agent-access",
                 cx,
             ));
+        } else {
+            agent_rows.push(setting_row(
+                "Agent browser access",
+                "Allow agents to use the shared browser. Projects can override it.",
+                div()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .child("Not connected"),
+            ));
         }
-        agent_rows.push(self.client_switch(
-            "Auto-show floating preview",
-            "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.",
-            "browser-auto-preview",
-            cfg.browser_auto_show_floating_preview,
-            |this, on| this.client_config.browser_auto_show_floating_preview = on,
-            cx,
-        ));
         page = page.child(
             div()
                 .flex()
@@ -3803,53 +4682,294 @@ impl AppView {
                 .child(settings_card(agent_rows)),
         );
 
+        // ── Browsing ──
+        let mut browsing_rows: Vec<Div> = Vec::new();
+
+        // Browser profiles — `ClientSettings.browserProfiles`: a sub-card
+        // inside the row's control area listing persistent profiles.
+        let mut profiles_list = div()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::card_border())
+            .bg(theme::field_surface());
+        for index in 0..cfg.browser_profiles.len() {
+            profiles_list = profiles_list.child(self.browser_profile_row(index, cx));
+        }
+        browsing_rows.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_8()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme::fg())
+                                        .child("Browser profiles"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::fg_muted())
+                                        .child("Profiles separate cookies and logins. Incognito data is cleared when the app closes."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("browser-add-profile")
+                                .flex_none()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(theme::input())
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme::fg())
+                                .hover(|s| s.bg(theme::accent()))
+                                .child("+ Add profile")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        let count = this.client_config.browser_profiles.len();
+                                        this.client_config.browser_profiles.push(
+                                            crate::config::BrowserProfile {
+                                                id: format!(
+                                                    "profile-{}",
+                                                    uuid::Uuid::new_v4()
+                                                ),
+                                                name: format!("Profile {count}"),
+                                            },
+                                        );
+                                        this.client_config.save();
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                )
+                .child(profiles_list),
+        );
+
         let target = cfg.browser_link_target.clone();
         let target_label = if target == "app" {
             "T3 Code"
         } else {
             "Your default browser"
         };
+        browsing_rows.push(self.select_setting(
+            "Open links in",
+            "Where links in the chat and terminal open. Hold Ctrl while clicking a link to open it in your default browser either way.",
+            OpenList::BrowserLink,
+            target_label.into(),
+            &target,
+            BROWSER_LINK_TARGETS
+                .iter()
+                .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                .collect(),
+            cx,
+        ));
+
+        browsing_rows.push(self.client_switch(
+            "Auto-show floating preview",
+            "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.",
+            "browser-auto-preview",
+            cfg.browser_auto_show_floating_preview,
+            |this, on| this.client_config.browser_auto_show_floating_preview = on,
+            cx,
+        ));
+
         let engine = cfg.browser_search_engine.clone();
         let engine_label = BROWSER_SEARCH_ENGINES
             .iter()
             .find(|(value, _)| *value == engine)
             .map(|(_, label)| *label)
             .unwrap_or("DuckDuckGo");
+        browsing_rows.push(
+            self.select_setting(
+                "Search engine",
+                "What the address bar searches when you type something that isn't a URL.",
+                OpenList::BrowserEngine,
+                engine_label.into(),
+                &engine,
+                BROWSER_SEARCH_ENGINES
+                    .iter()
+                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                    .collect(),
+                cx,
+            ),
+        );
+
+        // "> Advanced" disclosure — viewport / zoom / appearance defaults.
+        let advanced_open = self.misc_settings_state.extra.browser_advanced;
+        browsing_rows.push(
+            div().flex().flex_col().child(
+                div()
+                    .id("browser-advanced")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_2p5()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.text_color(theme::fg()))
+                    .child(icon(
+                        if advanced_open {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        12.,
+                    ))
+                    .child("Advanced")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            let open = this.misc_settings_state.extra.browser_advanced;
+                            this.misc_settings_state.extra.browser_advanced = !open;
+                            cx.notify();
+                        }),
+                    ),
+            ),
+        );
+        if advanced_open {
+            let viewport = cfg.browser_default_viewport.clone();
+            let viewport_label = BROWSER_VIEWPORTS
+                .iter()
+                .find(|(value, _, _)| *value == viewport)
+                .map(|(_, label, _)| *label)
+                .unwrap_or("Fill panel");
+            browsing_rows.push(self.extra_select_row(
+                "Default viewport",
+                "Tab size for you and agents. Fill fits the panel; other sizes show the device toolbar.",
+                "browser:viewport",
+                viewport_label.into(),
+                &viewport,
+                BROWSER_VIEWPORTS
+                    .iter()
+                    .map(|(value, label, detail)| {
+                        (
+                            value.to_string(),
+                            label.to_string(),
+                            if detail.is_empty() {
+                                None
+                            } else {
+                                Some(detail.to_string())
+                            },
+                        )
+                    })
+                    .collect(),
+                cx,
+            ));
+            let zoom = cfg.browser_default_zoom.clone();
+            let zoom_label = BROWSER_ZOOMS
+                .iter()
+                .find(|(value, _)| *value == zoom)
+                .map(|(_, label)| *label)
+                .unwrap_or("100%");
+            browsing_rows.push(
+                self.extra_select_row(
+                    "Default zoom",
+                    "Page zoom applied to new browser tabs.",
+                    "browser:zoom",
+                    zoom_label.into(),
+                    &zoom,
+                    BROWSER_ZOOMS
+                        .iter()
+                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                        .collect(),
+                    cx,
+                ),
+            );
+            let appearance = cfg.browser_default_appearance.clone();
+            let appearance_label = BROWSER_APPEARANCES
+                .iter()
+                .find(|(value, _)| *value == appearance)
+                .map(|(_, label)| *label)
+                .unwrap_or("System");
+            browsing_rows.push(
+                self.extra_select_row(
+                    "Default appearance",
+                    "The color scheme pages are told to prefer. System follows your OS setting.",
+                    "browser:appearance",
+                    appearance_label.into(),
+                    &appearance,
+                    BROWSER_APPEARANCES
+                        .iter()
+                        .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                        .collect(),
+                    cx,
+                ),
+            );
+        }
         page = page.child(
             div()
                 .flex()
                 .flex_col()
-                .child(settings_section_title("Links"))
-                .child(settings_card(vec![
-                    self.select_setting(
-                        "Open links in",
-                        "Where links in the chat and terminal open. Hold Ctrl while clicking a link to open it in your default browser either way.",
-                        OpenList::BrowserLink,
-                        target_label.into(),
-                        &target,
-                        BROWSER_LINK_TARGETS
-                            .iter()
-                            .map(|(value, label)| {
-                                (value.to_string(), label.to_string(), None)
-                            })
-                            .collect(),
-                        cx,
-                    ),
-                    self.select_setting(
-                        "Search engine",
-                        "What the address bar searches when you type something that isn't a URL.",
-                        OpenList::BrowserEngine,
-                        engine_label.into(),
-                        &engine,
-                        BROWSER_SEARCH_ENGINES
-                            .iter()
-                            .map(|(value, label)| {
-                                (value.to_string(), label.to_string(), None)
-                            })
-                            .collect(),
-                        cx,
-                    ),
-                ])),
+                .child(settings_section_title("Browsing"))
+                .child(settings_card(browsing_rows)),
+        );
+
+        // ── Recordings ──
+        let frame_rate = cfg.browser_recording_frame_rate.to_string();
+        let frame_label = BROWSER_FRAME_RATES
+            .iter()
+            .find(|(value, _)| *value == frame_rate)
+            .map(|(_, label)| *label)
+            .unwrap_or("30 fps");
+        let recording_rows: Vec<Div> = vec![
+            self.extra_select_row(
+                "Browser recording frame rate",
+                "Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.",
+                "browser:frame-rate",
+                frame_label.into(),
+                &frame_rate,
+                BROWSER_FRAME_RATES
+                    .iter()
+                    .map(|(value, label)| (value.to_string(), label.to_string(), None))
+                    .collect(),
+                cx,
+            ),
+            self.client_switch(
+                "Show key presses in recordings",
+                "Show pressed keys and shortcuts in new recordings. Password fields are excluded.",
+                "browser-rec-keys",
+                cfg.browser_recording_show_key_presses,
+                |this, on| this.client_config.browser_recording_show_key_presses = on,
+                cx,
+            ),
+            self.client_switch(
+                "Show mouse presses in recordings",
+                "Highlight mouse presses and held buttons in new recordings.",
+                "browser-rec-mouse",
+                cfg.browser_recording_show_mouse_presses,
+                |this, on| this.client_config.browser_recording_show_mouse_presses = on,
+                cx,
+            ),
+        ];
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(settings_section_title("Recordings"))
+                .child(settings_card(recording_rows)),
         );
 
         page = page.child(
@@ -4028,25 +5148,27 @@ impl AppView {
                 .find(|(value, _, _)| *value == naming)
                 .map(|(_, label, _)| *label)
                 .unwrap_or("Static");
-            branch_rows.push(self.scoped_select_setting(
-                "Branch naming",
-                "Choose how new worktree branches are named from your first message.",
-                OpenList::BranchNamingMode,
-                "branchNamingMode",
-                naming_label.into(),
-                &naming,
-                BRANCH_NAMING_MODES
-                    .iter()
-                    .map(|(value, label, detail)| {
-                        (
-                            value.to_string(),
-                            label.to_string(),
-                            Some(detail.to_string()),
-                        )
-                    })
-                    .collect(),
-                cx,
-            ));
+            branch_rows.push(
+                self.scoped_select_setting(
+                    "Branch naming",
+                    "Choose how new worktree branches are named from your first message.",
+                    OpenList::BranchNamingMode,
+                    "branchNamingMode",
+                    naming_label.into(),
+                    &naming,
+                    BRANCH_NAMING_MODES
+                        .iter()
+                        .map(|(value, label, detail)| {
+                            (
+                                value.to_string(),
+                                label.to_string(),
+                                Some(detail.to_string()),
+                            )
+                        })
+                        .collect(),
+                    cx,
+                ),
+            );
         }
         if let Some(field) = self.misc_settings_state.extra.branch_prefix_field.clone() {
             branch_rows.push(setting_row(
@@ -4372,9 +5494,1961 @@ impl AppView {
     /// semantics: an explicit `enabled` flag in the settings override or the
     /// stored config wins; default instances (codex/claudeAgent) and drivers
     /// the web enables by default resolve true.
+    /// The driver's runtime/config text fields — mirrors the
+    /// `providerSettingsForm` order of each settings schema.
+    fn provider_field_defs(driver: &str) -> &'static [ProviderFieldDef] {
+        match driver {
+            "codex" => PROVIDER_CODEX_FIELDS,
+            "claudeAgent" => PROVIDER_CLAUDE_FIELDS,
+            "antigravity" => PROVIDER_ANTIGRAVITY_FIELDS,
+            "grok" | "kiro" | "fx" | "muse" | "pi" | "opencode" | "devin" | "devReplay"
+            | "kilo" | "cursor" | "acpRegistry" => &[],
+            _ => &[],
+        }
+    }
+
+    /// Driver → simple binaryPath-only field sets (shared shape).
+    fn provider_simple_fields(driver: &str) -> &'static [ProviderFieldDef] {
+        const BINARY_ONLY: &[(&str, &[ProviderFieldDef])] = &[];
+        let _ = BINARY_ONLY;
+        match driver {
+            "grok" => &[ProviderFieldDef {
+                key: "binaryPath",
+                title: "Binary path",
+                description: "Path to the Grok CLI binary.",
+                placeholder: "grok",
+                secret: false,
+            }],
+            "kiro" => &[ProviderFieldDef {
+                key: "binaryPath",
+                title: "Binary path",
+                description: "Path to the Kiro CLI binary.",
+                placeholder: "kiro-cli",
+                secret: false,
+            }],
+            "fx" => &[ProviderFieldDef {
+                key: "binaryPath",
+                title: "Binary path",
+                description: "Path to the fx binary. All fx instances on this machine share its fx login.",
+                placeholder: "fx",
+                secret: false,
+            }],
+            "muse" => &[ProviderFieldDef {
+                key: "binaryPath",
+                title: "Binary path",
+                description: "Path to the Muse Code binary on this environment. Sign in with muse login on that host.",
+                placeholder: "muse",
+                secret: false,
+            }],
+            "pi" => &[
+                ProviderFieldDef {
+                    key: "binaryPath",
+                    title: "Binary path",
+                    description: "Path to the Pi coding agent binary.",
+                    placeholder: "pi",
+                    secret: false,
+                },
+                ProviderFieldDef {
+                    key: "launchArgs",
+                    title: "Launch arguments",
+                    description: "Additional CLI arguments passed to pi --mode rpc on session start.",
+                    placeholder: "",
+                    secret: false,
+                },
+            ],
+            "opencode" => &[
+                ProviderFieldDef {
+                    key: "binaryPath",
+                    title: "Binary path",
+                    description: "Path to the OpenCode binary.",
+                    placeholder: "opencode",
+                    secret: false,
+                },
+                ProviderFieldDef {
+                    key: "serverUrl",
+                    title: "Server URL",
+                    description: "Leave blank to let T3 Code spawn the server when needed.",
+                    placeholder: "http://127.0.0.1:4096",
+                    secret: false,
+                },
+                ProviderFieldDef {
+                    key: "serverPassword",
+                    title: "Server password",
+                    description: "Stored separately on the host.",
+                    placeholder: "Optional",
+                    secret: true,
+                },
+            ],
+            _ => &[],
+        }
+    }
+
+    /// All runtime fields for a driver (schema order — Claude interleaves
+    /// the `idleCompaction` select, Antigravity the `authMethod` select;
+    /// both render separately below).
+    fn provider_runtime_fields(driver: &str) -> &'static [ProviderFieldDef] {
+        let fields = Self::provider_field_defs(driver);
+        if !fields.is_empty() {
+            return fields;
+        }
+        Self::provider_simple_fields(driver)
+    }
+
+    /// `getProviderVersionLabel` — `v{semver}` plus the Antigravity
+    /// `agy_acp_server_YYYY_MM_DD_*` normalization.
+    fn provider_version_label(version: &str) -> Option<String> {
+        if version.is_empty() {
+            return None;
+        }
+        if let Some(rest) = version.strip_prefix("agy_acp_server_") {
+            let mut parts = rest.split('_');
+            if let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next())
+            {
+                let candidate = parts.next().unwrap_or_default();
+                return Some(if candidate.is_empty() {
+                    format!("{year}-{month}-{day}")
+                } else {
+                    format!("{year}-{month}-{day} {candidate}")
+                });
+            }
+        }
+        Some(
+            if version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                format!("v{version}")
+            } else {
+                version.to_string()
+            },
+        )
+    }
+
+    /// `getProviderSummary` — headline + optional message + dot color for
+    /// the list row and the detail's Status line.
+    fn provider_status_summary(
+        provider: &Value,
+        enabled: bool,
+    ) -> (String, Option<String>, gpui::Rgba) {
+        let message = provider["message"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let status = provider["status"].as_str().unwrap_or_default();
+        let installed = provider["installed"].as_bool() != Some(false);
+        let auth_status = provider["auth"]["status"].as_str().unwrap_or_default();
+        let auth_label = provider["auth"]["label"]
+            .as_str()
+            .or_else(|| provider["auth"]["type"].as_str())
+            .unwrap_or_default();
+        let antigravity_unchecked = provider["driver"].as_str() == Some("antigravity")
+            && installed
+            && status == "warning"
+            && (auth_status.is_empty() || auth_status == "unknown")
+            && matches!(
+                provider["auth"]["type"].as_str(),
+                None | Some("oauth-personal") | Some("oauth-business")
+            );
+        let muted = theme::fg_muted();
+        let warning = theme::warning();
+        if !enabled || status == "disabled" {
+            return (
+                "Disabled".to_string(),
+                Some(message.unwrap_or_else(|| {
+                    "This provider is installed but disabled for new sessions in T3 Code."
+                        .to_string()
+                })),
+                muted,
+            );
+        }
+        if !installed {
+            return (
+                "Not found".to_string(),
+                Some(message.unwrap_or_else(|| "CLI not detected on PATH.".to_string())),
+                warning,
+            );
+        }
+        if auth_status == "unauthenticated" {
+            return (
+                if auth_label.is_empty() {
+                    "Not authenticated".to_string()
+                } else {
+                    format!("Not authenticated · {auth_label}")
+                },
+                message,
+                warning,
+            );
+        }
+        if antigravity_unchecked {
+            return (
+                "Installed · Sign-in not checked".to_string(),
+                message,
+                muted,
+            );
+        }
+        if status == "warning" {
+            return (
+                "Needs attention".to_string(),
+                Some(message.unwrap_or_else(|| {
+                    "The provider is installed, but the server could not fully verify it."
+                        .to_string()
+                })),
+                warning,
+            );
+        }
+        if status == "error" {
+            return (
+                "Unavailable".to_string(),
+                Some(
+                    message
+                        .unwrap_or_else(|| "The provider failed its startup checks.".to_string()),
+                ),
+                danger(),
+            );
+        }
+        if auth_status == "authenticated" {
+            return (
+                if auth_label.is_empty() {
+                    "Authenticated".to_string()
+                } else {
+                    format!("Authenticated · {auth_label}")
+                },
+                message,
+                theme::success(),
+            );
+        }
+        ("Available".to_string(), message, theme::success())
+    }
+
+    // ─── Provider instance writes ───────────────────────────────────────
+
+    /// Merge `patch` into `providerInstances[{instance_id}]` and send the
+    /// whole record — the TS server merges per entry, but the native mock
+    /// server shallow-merges top-level keys, so the full map is the only
+    /// write both honor.
+    fn provider_instances_write(
+        &mut self,
+        instance_id: &str,
+        patch: serde_json::Map<String, Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut instances = self.misc_settings_state.settings["providerInstances"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut entry = instances
+            .get(instance_id)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        for (key, value) in patch {
+            if value.is_null() {
+                entry.remove(&key);
+            } else {
+                entry.insert(key, value);
+            }
+        }
+        instances.insert(instance_id.to_string(), Value::Object(entry));
+        self.update_server_settings(json!({ "providerInstances": Value::Object(instances) }), cx);
+    }
+
+    /// Write one `providerInstances.{id}.config.{key}` string (empty omits
+    /// the key — `clearWhenEmpty: "omit"`).
+    fn provider_config_write(
+        &mut self,
+        instance_id: &str,
+        key: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut config =
+            self.misc_settings_state.settings["providerInstances"][instance_id]["config"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+        if value.is_empty() {
+            config.remove(key);
+        } else {
+            config.insert(key.to_string(), json!(value));
+        }
+        let mut patch = serde_json::Map::new();
+        patch.insert("config".to_string(), Value::Object(config));
+        self.provider_instances_write(instance_id, patch, cx);
+    }
+
+    /// Replace `providerInstances.{id}.environment` (add/remove variable).
+    fn provider_environment_write(
+        &mut self,
+        instance_id: &str,
+        variables: Vec<Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut patch = serde_json::Map::new();
+        patch.insert("environment".to_string(), json!(variables));
+        self.provider_instances_write(instance_id, patch, cx);
+    }
+
+    /// "+ Add provider" — create `providerInstances[{driver}]` (or a
+    /// `-2`/`-3` suffix when taken) enabled per the driver's default.
+    fn add_provider_instance(&mut self, driver: &str, cx: &mut Context<Self>) {
+        let existing: HashSet<String> = self.misc_settings_state.settings["providerInstances"]
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default();
+        let reported: HashSet<String> = self
+            .misc_settings_state
+            .providers
+            .iter()
+            .chain(self.composer_state.config_providers.iter())
+            .filter_map(|provider| provider["instanceId"].as_str().map(str::to_string))
+            .collect();
+        let mut instance_id = driver.to_string();
+        let mut suffix = 2;
+        while existing.contains(&instance_id) || reported.contains(&instance_id) {
+            instance_id = format!("{driver}-{suffix}");
+            suffix += 1;
+        }
+        let enabled = !matches!(
+            driver,
+            "cursor" | "grok" | "fx" | "kiro" | "muse" | "pi" | "opencode" | "antigravity"
+        );
+        let mut patch = serde_json::Map::new();
+        patch.insert("driver".to_string(), json!(driver));
+        patch.insert("enabled".to_string(), json!(enabled));
+        patch.insert("config".to_string(), json!({}));
+        self.provider_instances_write(&instance_id.clone(), patch, cx);
+        self.select_provider_instance(instance_id, cx);
+    }
+
+    /// The header reset (↺) — drop the stored `providerInstances` entry so
+    /// the instance falls back to its reported defaults.
+    fn reset_provider_instance(&mut self, instance_id: String, cx: &mut Context<Self>) {
+        let mut instances = self.misc_settings_state.settings["providerInstances"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if instances.remove(&instance_id).is_none() {
+            return;
+        }
+        self.update_server_settings(json!({ "providerInstances": Value::Object(instances) }), cx);
+    }
+
+    // ─── Provider detail TextFields ─────────────────────────────────────
+
+    /// Select an instance in the list + create/seed its detail fields.
+    fn select_provider_instance(&mut self, instance_id: String, cx: &mut Context<Self>) {
+        self.misc_settings_state.extra.selected_provider = Some(instance_id.clone());
+        self.misc_settings_state.extra.provider_env_add = false;
+        self.misc_settings_state.extra.provider_model_add = false;
+        self.ensure_provider_fields(&instance_id, cx);
+        cx.notify();
+    }
+
+    /// Create + seed + wire the per-instance fields (`"{iid}|{slot}"` keys —
+    /// `|` separates because slots contain `:`).
+    fn ensure_provider_fields(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        let provider = self
+            .misc_settings_state
+            .providers
+            .iter()
+            .chain(self.composer_state.config_providers.iter())
+            .find(|p| p["instanceId"].as_str() == Some(instance_id))
+            .cloned();
+        let driver = provider
+            .as_ref()
+            .and_then(|p| p["driver"].as_str())
+            .unwrap_or(instance_id)
+            .to_string();
+        let config =
+            self.misc_settings_state.settings["providerInstances"][instance_id]["config"].clone();
+
+        let mut slots: Vec<(String, String, String)> = Vec::new(); // (slot, placeholder, seed)
+        let display_seed =
+            self.misc_settings_state.settings["providerInstances"][instance_id]["displayName"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    provider.as_ref().and_then(|p| {
+                        p["displayName"]
+                            .as_str()
+                            .or_else(|| p["name"].as_str())
+                            .map(str::to_string)
+                    })
+                })
+                .unwrap_or_default();
+        slots.push(("display_name".to_string(), "Name".to_string(), display_seed));
+        for field in Self::provider_runtime_fields(&driver) {
+            // Password fields never seed — secret values are stored
+            // separately on the host and come back redacted; typing a new
+            // value and pressing Enter replaces it.
+            let seed = if field.secret {
+                String::new()
+            } else {
+                config[field.key].as_str().unwrap_or_default().to_string()
+            };
+            slots.push((
+                format!("cfg:{}", field.key),
+                field.placeholder.to_string(),
+                seed,
+            ));
+        }
+        // Utility fields — drafts only (they write on their Add/Enter
+        // handlers, not per-keystroke).
+        for (slot, placeholder) in [
+            ("model_filter", "Filter models"),
+            ("model_add", "model-slug"),
+            ("env_name", "VARIABLE_NAME"),
+            ("env_value", "Value"),
+        ] {
+            slots.push((slot.to_string(), placeholder.to_string(), String::new()));
+        }
+
+        for (slot, placeholder, seed) in slots {
+            let key = format!("{instance_id}|{slot}");
+            if self
+                .misc_settings_state
+                .extra
+                .provider_fields
+                .contains_key(&key)
+            {
+                continue;
+            }
+            let field = cx.new(|cx| TextField::new(placeholder.clone(), cx));
+            let draft_key = key.clone();
+            self.misc_settings_state
+                .extra
+                .provider_field_subs
+                .push(cx.observe(&field, move |this, field, cx| {
+                    this.misc_settings_state
+                        .extra
+                        .provider_field_drafts
+                        .insert(draft_key.clone(), settings_misc::field_text(&field, cx));
+                    cx.notify();
+                }));
+            let submit_key = key.clone();
+            self.misc_settings_state
+                .extra
+                .provider_field_subs
+                .push(
+                    cx.subscribe(&field, move |this, _field, _event: &PromptSubmitted, cx| {
+                        this.provider_field_submit(submit_key.clone(), cx);
+                    }),
+                );
+            if !seed.is_empty() {
+                self.misc_settings_state
+                    .extra
+                    .provider_field_drafts
+                    .insert(key.clone(), seed.clone());
+                let applied = edit_field(&field, cx, |field, window, cx| {
+                    field.reset(window, cx);
+                    field.replace_text_in_range(Some(0..0), &seed, window, cx);
+                });
+                if applied.is_none() {
+                    self.misc_settings_state
+                        .extra
+                        .provider_field_pending_seeds
+                        .insert(key.clone(), seed);
+                }
+            }
+            self.misc_settings_state
+                .extra
+                .provider_fields
+                .insert(key.clone(), field);
+            self.misc_settings_state
+                .extra
+                .provider_field_seeded
+                .insert(key);
+        }
+    }
+
+    /// Enter-key handler for the per-instance fields — the slot decides the
+    /// write (display name, config value, env add, custom-model add).
+    fn provider_field_submit(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some((instance_id, slot)) = key.split_once('|') else {
+            return;
+        };
+        let instance_id = instance_id.to_string();
+        let slot = slot.to_string();
+        let draft = self
+            .misc_settings_state
+            .extra
+            .provider_field_drafts
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if slot == "display_name" {
+            let mut patch = serde_json::Map::new();
+            patch.insert(
+                "displayName".to_string(),
+                if draft.is_empty() {
+                    Value::Null
+                } else {
+                    json!(draft)
+                },
+            );
+            self.provider_instances_write(&instance_id, patch, cx);
+        } else if let Some(config_key) = slot.strip_prefix("cfg:") {
+            self.provider_config_write(&instance_id, config_key, &draft, cx);
+        } else if slot == "env_name" || slot == "env_value" {
+            self.provider_env_add_submit(&instance_id, cx);
+        } else if slot == "model_add" {
+            self.provider_model_add_submit(&instance_id, cx);
+        }
+    }
+
+    /// `providerInstances.{id}.environment` — stored entries only (the
+    /// server merges them with reported ones at runtime).
+    fn provider_environment(&self, instance_id: &str) -> Vec<Value> {
+        self.misc_settings_state.settings["providerInstances"][instance_id]["environment"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// "+ Add variable" submit — appends `{name, value, sensitive:false}`.
+    fn provider_env_add_submit(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        let name_key = format!("{instance_id}|env_name");
+        let value_key = format!("{instance_id}|env_value");
+        let name = self
+            .misc_settings_state
+            .extra
+            .provider_field_drafts
+            .get(&name_key)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return;
+        }
+        let value = self
+            .misc_settings_state
+            .extra
+            .provider_field_drafts
+            .get(&value_key)
+            .cloned()
+            .unwrap_or_default();
+        let mut variables = self.provider_environment(instance_id);
+        if let Some(existing) = variables
+            .iter_mut()
+            .find(|v| v["name"].as_str() == Some(name.as_str()))
+        {
+            existing["value"] = json!(value);
+        } else {
+            variables.push(json!({ "name": name, "value": value, "sensitive": false }));
+        }
+        self.provider_environment_write(instance_id, variables, cx);
+        self.misc_settings_state.extra.provider_env_add = false;
+        for key in [name_key, value_key] {
+            if let Some(field) = self
+                .misc_settings_state
+                .extra
+                .provider_fields
+                .get(&key)
+                .cloned()
+            {
+                edit_field(&field, cx, |field, window, cx| field.reset(window, cx));
+            }
+            self.misc_settings_state
+                .extra
+                .provider_field_drafts
+                .insert(key, String::new());
+        }
+        cx.notify();
+    }
+
+    /// `config.customModels` as `{slug, name}` objects (string entries
+    /// promote to objects for display).
+    fn provider_custom_models(&self, instance_id: &str) -> Vec<Value> {
+        self.misc_settings_state.settings["providerInstances"][instance_id]["config"]
+            ["customModels"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        if let Some(slug) = item.as_str() {
+                            Some(json!({ "slug": slug }))
+                        } else if item["slug"].as_str().is_some() {
+                            Some(item.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Write `config.customModels` (object entries keep `{slug, name}`).
+    fn provider_custom_models_write(
+        &mut self,
+        instance_id: &str,
+        models: Vec<Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut config =
+            self.misc_settings_state.settings["providerInstances"][instance_id]["config"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+        config.insert("customModels".to_string(), json!(models));
+        let mut patch = serde_json::Map::new();
+        patch.insert("config".to_string(), Value::Object(config));
+        self.provider_instances_write(instance_id, patch, cx);
+    }
+
+    /// "+ Add custom model" — `{slug, name, capabilities: null}` per the
+    /// web's `handleAdd` (dupes rejected silently like the web's error).
+    fn provider_model_add_submit(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        let key = format!("{instance_id}|model_add");
+        let slug = self
+            .misc_settings_state
+            .extra
+            .provider_field_drafts
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if slug.is_empty() {
+            return;
+        }
+        let mut models = self.provider_custom_models(instance_id);
+        if models
+            .iter()
+            .any(|m| m["slug"].as_str() == Some(slug.as_str()))
+        {
+            return;
+        }
+        models.push(json!({ "slug": slug, "name": slug }));
+        self.provider_custom_models_write(instance_id, models, cx);
+        self.misc_settings_state.extra.provider_model_add = false;
+        if let Some(field) = self
+            .misc_settings_state
+            .extra
+            .provider_fields
+            .get(&key)
+            .cloned()
+        {
+            edit_field(&field, cx, |field, window, cx| field.reset(window, cx));
+        }
+        self.misc_settings_state
+            .extra
+            .provider_field_drafts
+            .insert(key, String::new());
+        cx.notify();
+    }
+
+    /// Trash a custom model — removes it from `config.customModels` and
+    /// any favorite/hidden preference entry.
+    fn provider_model_remove(&mut self, instance_id: &str, slug: String, cx: &mut Context<Self>) {
+        let models: Vec<Value> = self
+            .provider_custom_models(instance_id)
+            .into_iter()
+            .filter(|m| m["slug"].as_str() != Some(slug.as_str()))
+            .collect();
+        self.provider_custom_models_write(instance_id, models, cx);
+        let mut prefs = self.provider_model_prefs(instance_id);
+        prefs.model_order.retain(|s| s != &slug);
+        self.provider_model_prefs_write(instance_id, prefs, cx);
+    }
+
+    // ─── Model list preferences (ClientConfig mirrors — device-local) ───
+
+    fn provider_model_prefs(&self, instance_id: &str) -> crate::config::ProviderModelPreferences {
+        self.client_config
+            .provider_model_preferences
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn provider_model_prefs_write(
+        &mut self,
+        instance_id: &str,
+        prefs: crate::config::ProviderModelPreferences,
+        cx: &mut Context<Self>,
+    ) {
+        self.client_config
+            .provider_model_preferences
+            .insert(instance_id.to_string(), prefs);
+        self.client_config.save();
+        cx.notify();
+    }
+
+    /// The visibility switch — flips `hiddenModels` membership.
+    fn provider_model_set_hidden(
+        &mut self,
+        instance_id: &str,
+        slug: String,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut prefs = self.provider_model_prefs(instance_id);
+        if hidden && !prefs.hidden_models.contains(&slug) {
+            prefs.hidden_models.push(slug);
+        } else {
+            prefs.hidden_models.retain(|s| s != &slug);
+        }
+        self.provider_model_prefs_write(instance_id, prefs, cx);
+    }
+
+    /// Star toggle — `ClientSettings.favorites` `{provider, model}` pair.
+    fn provider_model_toggle_favorite(
+        &mut self,
+        instance_id: &str,
+        slug: String,
+        cx: &mut Context<Self>,
+    ) {
+        let favorite = crate::config::ModelFavorite {
+            provider: instance_id.to_string(),
+            model: slug.clone(),
+        };
+        if self.client_config.model_favorites.contains(&favorite) {
+            self.client_config
+                .model_favorites
+                .retain(|f| *f != favorite);
+        } else {
+            self.client_config.model_favorites.push(favorite);
+        }
+        self.client_config.save();
+        cx.notify();
+    }
+
+    /// ↑/↓ reorder — swaps `slug` with its neighbor inside `ordered` and
+    /// stores the result as `modelOrder`.
+    fn provider_model_move(
+        &mut self,
+        instance_id: &str,
+        slug: &str,
+        direction: i32,
+        ordered: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let mut ordered = ordered.to_vec();
+        let Some(index) = ordered.iter().position(|s| s == slug) else {
+            return;
+        };
+        let target = index as i32 + direction;
+        if target < 0 || target >= ordered.len() as i32 {
+            return;
+        }
+        ordered.swap(index, target as usize);
+        let mut prefs = self.provider_model_prefs(instance_id);
+        prefs.model_order = ordered;
+        self.provider_model_prefs_write(instance_id, prefs, cx);
+    }
+
+    /// "Disable all" / "Enable all" — set hidden membership for every
+    /// built-in slug at once (`nextHiddenModelsForBulkToggle`).
+    fn provider_models_set_all_hidden(
+        &mut self,
+        instance_id: &str,
+        built_in_slugs: &[String],
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut prefs = self.provider_model_prefs(instance_id);
+        if hidden {
+            for slug in built_in_slugs {
+                if !prefs.hidden_models.contains(slug) {
+                    prefs.hidden_models.push(slug.clone());
+                }
+            }
+        } else {
+            let set: HashSet<&String> = built_in_slugs.iter().collect();
+            prefs.hidden_models.retain(|s| !set.contains(s));
+        }
+        self.provider_model_prefs_write(instance_id, prefs, cx);
+    }
+
+    /// The composite provider list — misc mirror, falling back to the
+    /// composer stream, plus instances that exist only as
+    /// `providerInstances` config entries (created via "+ Add provider"
+    /// before the server reports them).
+    fn provider_list(&self) -> Vec<Value> {
+        let mut providers = self.misc_settings_state.providers.clone();
+        if providers.is_empty() {
+            providers = self.composer_state.config_providers.clone();
+        }
+        let mut seen: HashSet<String> = providers
+            .iter()
+            .filter_map(|p| p["instanceId"].as_str().map(str::to_string))
+            .collect();
+        if let Some(configured) = self.misc_settings_state.settings["providerInstances"].as_object()
+        {
+            for (instance_id, entry) in configured {
+                if seen.contains(instance_id) {
+                    continue;
+                }
+                let driver = entry["driver"].as_str().unwrap_or(instance_id);
+                providers.push(json!({
+                    "instanceId": instance_id,
+                    "driver": driver,
+                    "displayName": entry["displayName"].as_str(),
+                    "enabled": entry["enabled"].as_bool().unwrap_or(false),
+                    "installed": false,
+                    "status": "warning",
+                    "auth": { "status": "unknown" },
+                    "models": [],
+                }));
+                seen.insert(instance_id.clone());
+            }
+        }
+        providers
+    }
+
+    /// The instance id shown in the detail pane — the stored selection
+    /// when it still exists, else the first provider.
+    fn selected_provider_id(&self, providers: &[Value]) -> Option<String> {
+        let selected = self.misc_settings_state.extra.selected_provider.clone();
+        if let Some(selected) = selected
+            && providers
+                .iter()
+                .any(|p| p["instanceId"].as_str() == Some(selected.as_str()))
+        {
+            return Some(selected);
+        }
+        providers
+            .iter()
+            .find_map(|p| p["instanceId"].as_str().map(str::to_string))
+    }
+
+    // ─── Provider page: left list ───────────────────────────────────────
+
+    /// One row in the provider list — icon + name/version + status +
+    /// switch; selected rows highlight like the web `ProviderInstanceRow`.
+    fn provider_list_row(
+        &self,
+        provider: &Value,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let instance_id = provider["instanceId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let name = provider["displayName"]
+            .as_str()
+            .or_else(|| provider["name"].as_str())
+            .unwrap_or(&instance_id)
+            .to_string();
+        let driver = provider["driver"]
+            .as_str()
+            .unwrap_or(&instance_id)
+            .to_string();
+        let enabled = self.provider_instance_enabled(&instance_id, provider);
+        let (headline, _, _) = Self::provider_status_summary(provider, enabled);
+        let version = provider["version"]
+            .as_str()
+            .and_then(Self::provider_version_label);
+        let mark = self.provider_mark(&driver);
+        let select_id = instance_id.clone();
+        let toggle_id = instance_id.clone();
+        let connected = self.commands.is_some();
+
+        let mut name_line = div().flex().items_center().gap_1p5().min_w_0().child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::fg())
+                .truncate()
+                .child(name.clone()),
+        );
+        if let Some(version) = version {
+            name_line = name_line.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child(version),
+            );
+        }
+
+        let mut row = div()
+            .id(format!("provider-row-{instance_id}"))
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .px_3()
+            .py_3()
+            .cursor_pointer()
+            .when(selected, |r| r.bg(theme::selected()))
+            .when(!selected, |r| r.hover(|s| s.bg(theme::accent())))
+            .child(
+                div()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex_none()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if let Some(mark) = mark {
+                        icon(mark, 15.).text_color(theme::fg()).into_any_element()
+                    } else {
+                        SharedString::from(
+                            name.chars()
+                                .next()
+                                .map(|c| c.to_ascii_uppercase().to_string())
+                                .unwrap_or_else(|| "?".into()),
+                        )
+                        .into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(name_line)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .truncate()
+                            .child(headline),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.select_provider_instance(select_id.clone(), cx);
+                }),
+            );
+        if connected {
+            row = row.child(
+                div()
+                    .id(format!("provider-toggle-{toggle_id}"))
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(switch_control(enabled))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.toggle_provider_instance(toggle_id.clone(), !enabled, cx);
+                        }),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// The "+ Add provider" row + driver popup at the bottom of the list.
+    fn provider_add_row(&self, cx: &mut Context<Self>) -> Div {
+        let open = self.misc_settings_state.extra.extra_open.as_deref() == Some("provider:add");
+        let options: Vec<(String, String, Option<String>)> = PROVIDER_DRIVER_OPTIONS
+            .iter()
+            .map(|(value, label)| (value.to_string(), label.to_string(), None))
+            .collect();
+        div()
+            .relative()
+            .child(
+                div()
+                    .id("provider-add")
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_3()
+                    .py_3()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()).text_color(theme::fg()))
+                    .child(icon(Icon::Plus, 14.))
+                    .child("Add provider")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.extra_toggle("provider:add".to_string(), cx);
+                        }),
+                    ),
+            )
+            .when(open, |cell| {
+                cell.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .pb_1()
+                            .child(self.extra_options_popup("provider:add", "", &options, cx)),
+                    )
+                    .with_priority(2),
+                )
+            })
+    }
+
+    // ─── Provider page: detail pane ─────────────────────────────────────
+
+    /// A runtime field row — title + description left, TextField right.
+    fn provider_field_row(&self, instance_id: &str, def: &ProviderFieldDef) -> Div {
+        let key = format!("{instance_id}|cfg:{}", def.key);
+        let control: Div = match self.misc_settings_state.extra.provider_fields.get(&key) {
+            Some(field) => self.boxed_field(field.clone(), 200.),
+            None => div().w(px(200.)),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_6()
+            .py_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::fg())
+                            .child(def.title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(def.description),
+                    ),
+            )
+            .child(control)
+    }
+
+    /// The right-hand detail pane — header, Status, Display name, Runtime,
+    /// Environment, Models — the web `ProviderInstanceCard` editor mode.
+    fn provider_detail_pane(&self, provider: &Value, cx: &mut Context<Self>) -> Div {
+        let instance_id = provider["instanceId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let driver = provider["driver"]
+            .as_str()
+            .unwrap_or(&instance_id)
+            .to_string();
+        let name = provider["displayName"]
+            .as_str()
+            .or_else(|| provider["name"].as_str())
+            .unwrap_or(&instance_id)
+            .to_string();
+        let enabled = self.provider_instance_enabled(&instance_id, provider);
+        let (headline, status_detail, dot) = Self::provider_status_summary(provider, enabled);
+        let mark = self.provider_mark(&driver);
+        let configured = &self.misc_settings_state.settings["providerInstances"][&instance_id];
+        let has_stored_config = configured.is_object();
+        let iid_reset = instance_id.clone();
+
+        let mut pane = div().flex().flex_col().min_w_0().flex_1();
+
+        // ── Header: mark + name (+ reset when the instance has stored
+        //    settings — the web shows the reset only while dirty). ──
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .px_4()
+            .pt_4()
+            .pb_3()
+            .child(
+                div()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if let Some(mark) = mark {
+                        icon(mark, 16.).text_color(theme::fg()).into_any_element()
+                    } else {
+                        SharedString::from(
+                            name.chars()
+                                .next()
+                                .map(|c| c.to_ascii_uppercase().to_string())
+                                .unwrap_or_else(|| "?".into()),
+                        )
+                        .into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::fg())
+                    .truncate()
+                    .child(name.clone()),
+            );
+        if has_stored_config {
+            header = header.child(self.extra_icon_button(
+                "provider-reset".to_string(),
+                Icon::Undo2,
+                cx,
+                move |this, cx| {
+                    this.reset_provider_instance(iid_reset.clone(), cx);
+                },
+            ));
+        }
+        pane = pane.child(header);
+
+        // ── Status + Display name ──
+        let mut status_block = div().flex().flex_col().gap_1().px_4();
+        status_block = status_block
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::fg())
+                    .child("Status"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child(headline),
+                    ),
+            );
+        if let Some(detail) = status_detail
+            && detail != "This provider is installed but disabled for new sessions in T3 Code."
+        {
+            status_block =
+                status_block.child(div().text_xs().text_color(theme::fg_muted()).child(detail));
+        }
+        pane = pane.child(status_block);
+
+        let name_key = format!("{instance_id}|display_name");
+        let name_control: Div = match self
+            .misc_settings_state
+            .extra
+            .provider_fields
+            .get(&name_key)
+        {
+            Some(field) => self.boxed_field(field.clone(), 200.),
+            None => div().w(px(200.)),
+        };
+        pane = pane.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_6()
+                .px_4()
+                .py_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme::fg())
+                                .child("Display name"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .child("The name shown for this provider across T3 Code."),
+                        ),
+                )
+                .child(name_control),
+        );
+
+        // ── Runtime ──
+        let runtime_fields = Self::provider_runtime_fields(&driver);
+        let show_idle_select = driver == "claudeAgent";
+        let show_auth_select = driver == "antigravity";
+        if !runtime_fields.is_empty() || show_idle_select || show_auth_select {
+            pane = pane.child(
+                div()
+                    .px_4()
+                    .pt_2()
+                    .pb_1()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::fg())
+                    .child("Runtime"),
+            );
+            for def in runtime_fields {
+                pane = pane.child(
+                    div()
+                        .px_4()
+                        .child(self.provider_field_row(&instance_id, def)),
+                );
+            }
+            if show_auth_select {
+                let current = configured["config"]["authMethod"]
+                    .as_str()
+                    .unwrap_or("oauth-personal");
+                let label = ANTIGRAVITY_AUTH_METHODS
+                    .iter()
+                    .find(|(value, _)| *value == current)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Google account");
+                pane = pane.child(
+                    div().px_4().child(self.extra_select_row(
+                        "Sign-in method",
+                        "Google accounts use your subscription; API keys and Agent Platform bill usage.",
+                        &format!("provider:{instance_id}:authMethod"),
+                        label.into(),
+                        current,
+                        ANTIGRAVITY_AUTH_METHODS
+                            .iter()
+                            .map(|(value, label)| {
+                                (value.to_string(), label.to_string(), None)
+                            })
+                            .collect(),
+                        cx,
+                    )),
+                );
+            }
+            if show_idle_select {
+                let current = configured["config"]["idleCompaction"]
+                    .as_str()
+                    .unwrap_or("default");
+                let label = PROVIDER_IDLE_COMPACTION_MODES
+                    .iter()
+                    .find(|(value, _)| *value == current)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Use default");
+                pane = pane.child(
+                    div().px_4().child(self.extra_select_row(
+                        "Compact idle threads",
+                        "When to compact an idle thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Overrides the default in Providers > Advanced.",
+                        &format!("provider:{instance_id}:idleCompaction"),
+                        label.into(),
+                        current,
+                        PROVIDER_IDLE_COMPACTION_MODES
+                            .iter()
+                            .map(|(value, label)| {
+                                (value.to_string(), label.to_string(), None)
+                            })
+                            .collect(),
+                        cx,
+                    )),
+                );
+            }
+        }
+
+        // ── Environment ──
+        let variables = self.provider_environment(&instance_id);
+        let adding_env = self.misc_settings_state.extra.provider_env_add;
+        let iid_env = instance_id.clone();
+        let mut env_head = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .px_4()
+            .pt_4()
+            .pb_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::fg())
+                            .child("Environment"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .child("API keys, base URLs, and other per-instance CLI settings."),
+                    ),
+            );
+        if !adding_env {
+            env_head = env_head.child(
+                div()
+                    .id("provider-env-add-open")
+                    .flex_none()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme::input())
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme::fg())
+                    .hover(|s| s.bg(theme::accent()))
+                    .child("+ Add variable")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.misc_settings_state.extra.provider_env_add = true;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        pane = pane.child(env_head);
+
+        for (index, variable) in variables.iter().enumerate() {
+            let var_name = variable["name"].as_str().unwrap_or_default().to_string();
+            let sensitive = variable["sensitive"].as_bool() == Some(true)
+                || variable["valueRedacted"].as_bool() == Some(true)
+                || variable["secret"].is_object();
+            let var_value = if sensitive {
+                "••••••••".to_string()
+            } else {
+                variable["value"].as_str().unwrap_or_default().to_string()
+            };
+            let iid_remove = instance_id.clone();
+            pane = pane.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_1p5()
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .flex_none()
+                            .text_sm()
+                            .text_color(theme::fg())
+                            .truncate()
+                            .child(var_name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme::fg_muted())
+                            .truncate()
+                            .child(if var_value.is_empty() {
+                                "(unset)".to_string()
+                            } else {
+                                var_value
+                            }),
+                    )
+                    .child(self.extra_icon_button(
+                        format!("provider-env-remove-{index}"),
+                        Icon::X,
+                        cx,
+                        move |this, cx| {
+                            let mut variables = this.provider_environment(&iid_remove);
+                            if index < variables.len() {
+                                variables.remove(index);
+                            }
+                            this.provider_environment_write(&iid_remove, variables, cx);
+                        },
+                    )),
+            );
+        }
+        if variables.is_empty() && !adding_env {
+            pane = pane.child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("No per-instance variables configured."),
+            );
+        }
+        if adding_env {
+            let name_key = format!("{instance_id}|env_name");
+            let value_key = format!("{instance_id}|env_value");
+            let fields = &self.misc_settings_state.extra.provider_fields;
+            let name_field = fields.get(&name_key).cloned();
+            let value_field = fields.get(&value_key).cloned();
+            let iid_submit = instance_id.clone();
+            let mut add_row = div().flex().items_center().gap_2().px_4().pb_3();
+            if let Some(field) = name_field {
+                add_row = add_row.child(self.boxed_field(field, 160.));
+            }
+            if let Some(field) = value_field {
+                add_row = add_row.child(self.boxed_field(field, 180.));
+            }
+            add_row = add_row
+                .child(
+                    div()
+                        .id("provider-env-add-submit")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::input())
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::accent()))
+                        .child("Add")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.provider_env_add_submit(&iid_submit, cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("provider-env-add-cancel")
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(theme::fg_muted())
+                        .hover(|s| s.bg(theme::accent()))
+                        .child("Cancel")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.misc_settings_state.extra.provider_env_add = false;
+                                cx.notify();
+                            }),
+                        ),
+                );
+            pane = pane.child(add_row);
+        }
+        let _ = iid_env;
+
+        pane = pane.child(self.provider_models_section(&instance_id, provider, cx));
+
+        pane
+    }
+
+    /// The Models block inside the detail pane — `ProviderModelsSection`:
+    /// filter/counts/add toolbar, Favorites/All/Hidden groups, star +
+    /// reorder + visibility controls per row.
+    fn provider_models_section(
+        &self,
+        instance_id: &str,
+        provider: &Value,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut block = div().flex().flex_col().px_4().pt_4().pb_4();
+
+        // Build the display list: reported models + custom entries.
+        let mut models: Vec<Value> = provider["models"].as_array().cloned().unwrap_or_default();
+        let built_in_slugs: Vec<String> = models
+            .iter()
+            .filter_map(|m| m["slug"].as_str().map(str::to_string))
+            .collect();
+        for custom in self.provider_custom_models(instance_id) {
+            let slug = custom["slug"].as_str().unwrap_or_default().to_string();
+            if slug.is_empty()
+                || models
+                    .iter()
+                    .any(|m| m["slug"].as_str() == Some(slug.as_str()))
+            {
+                continue;
+            }
+            models.push(json!({
+                "slug": slug,
+                "name": custom["name"].as_str().unwrap_or(&slug),
+                "isCustom": true,
+                "capabilities": null,
+            }));
+        }
+        if models.is_empty() {
+            return block;
+        }
+
+        let prefs = self.provider_model_prefs(instance_id);
+        let hidden: HashSet<String> = prefs.hidden_models.iter().cloned().collect();
+        let favorites: Vec<String> = self
+            .client_config
+            .model_favorites
+            .iter()
+            .filter(|f| f.provider == instance_id)
+            .map(|f| f.model.clone())
+            .collect();
+        let favorite_set: HashSet<String> = favorites.iter().cloned().collect();
+
+        // Order: modelOrder first, then server order (web `orderModels`).
+        let order_index = |slug: &str| -> usize {
+            prefs
+                .model_order
+                .iter()
+                .position(|s| s == slug)
+                .unwrap_or(usize::MAX)
+        };
+        let mut ordered_slugs: Vec<String> = models
+            .iter()
+            .filter_map(|m| m["slug"].as_str().map(str::to_string))
+            .collect();
+        let server_position: HashMap<String, usize> = ordered_slugs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+        ordered_slugs.sort_by_key(|slug| {
+            (
+                order_index(slug),
+                server_position.get(slug).copied().unwrap_or(usize::MAX),
+            )
+        });
+        let by_slug: HashMap<String, Value> = models
+            .iter()
+            .map(|m| {
+                (
+                    m["slug"].as_str().unwrap_or_default().to_string(),
+                    m.clone(),
+                )
+            })
+            .collect();
+
+        // Groups: favorites first, then visible, then hidden (built-ins
+        // only — custom models can't be hidden).
+        let group_of = |model: &Value| -> &'static str {
+            let slug = model["slug"].as_str().unwrap_or_default();
+            let custom = model["isCustom"].as_bool() == Some(true);
+            if favorite_set.contains(slug) {
+                "favorite"
+            } else if !custom && hidden.contains(slug) {
+                "hidden"
+            } else {
+                "visible"
+            }
+        };
+        let filter = self
+            .misc_settings_state
+            .extra
+            .provider_field_drafts
+            .get(&format!("{instance_id}|model_filter"))
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+        let filtered: Vec<Value> = ordered_slugs
+            .iter()
+            .filter_map(|slug| by_slug.get(slug).cloned())
+            .filter(|model| {
+                if filter.is_empty() {
+                    return true;
+                }
+                let slug = model["slug"].as_str().unwrap_or_default().to_lowercase();
+                let name = model["name"].as_str().unwrap_or_default().to_lowercase();
+                slug.contains(&filter) || name.contains(&filter)
+            })
+            .collect();
+        let favorite_models: Vec<&Value> = filtered
+            .iter()
+            .filter(|m| group_of(m) == "favorite")
+            .collect();
+        let visible_models: Vec<&Value> = filtered
+            .iter()
+            .filter(|m| group_of(m) == "visible")
+            .collect();
+        let hidden_models: Vec<&Value> = filtered
+            .iter()
+            .filter(|m| group_of(m) == "hidden")
+            .collect();
+        let favorite_count = favorites.len();
+        let hidden_count = models
+            .iter()
+            .filter(|m| m["isCustom"].as_bool() != Some(true))
+            .filter(|m| hidden.contains(m["slug"].as_str().unwrap_or_default()))
+            .count();
+        let all_built_in_hidden =
+            !built_in_slugs.is_empty() && built_in_slugs.iter().all(|slug| hidden.contains(slug));
+
+        // ── Header copy + toolbar ──
+        block = block.child(
+            div()
+                .pb_2()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .child("Model preferences and custom models are saved on the selected environment and shared across connected devices."),
+        );
+        let filter_key = format!("{instance_id}|model_filter");
+        let filter_field = self
+            .misc_settings_state
+            .extra
+            .provider_fields
+            .get(&filter_key)
+            .cloned();
+        let iid_bulk = instance_id.to_string();
+        let bulk_hidden = !all_built_in_hidden;
+        let bulk_slugs = built_in_slugs.clone();
+        let mut toolbar = div().flex().items_center().gap_2().pb_2();
+        if let Some(field) = filter_field {
+            toolbar = toolbar.child(self.boxed_field(field, 176.));
+        }
+        toolbar = toolbar
+            .child(div().flex_1().min_w_0())
+            .child(
+                div()
+                    .id("provider-models-bulk")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()))
+                    .child(if all_built_in_hidden {
+                        "Enable all"
+                    } else {
+                        "Disable all"
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.provider_models_set_all_hidden(
+                                &iid_bulk,
+                                &bulk_slugs,
+                                bulk_hidden,
+                                cx,
+                            );
+                        }),
+                    ),
+            )
+            .child(div().text_xs().text_color(theme::fg_muted()).child(format!(
+                "{} models{}{}",
+                models.len(),
+                if favorite_count > 0 {
+                    format!(" · {favorite_count} favorites")
+                } else {
+                    String::new()
+                },
+                if hidden_count > 0 {
+                    format!(" · {hidden_count} hidden")
+                } else {
+                    String::new()
+                },
+            )));
+        let adding_model = self.misc_settings_state.extra.provider_model_add;
+        if !adding_model && driver_allows_custom(&provider["driver"].as_str().unwrap_or_default()) {
+            toolbar = toolbar.child(
+                div()
+                    .id("provider-model-add-open")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()))
+                    .child("+ Add custom model")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _window, cx| {
+                            this.misc_settings_state.extra.provider_model_add = true;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        block = block.child(toolbar);
+
+        // ── Model rows ──
+        let full_order: Vec<String> = ordered_slugs.clone();
+        let mut render_rows = |items: &[&Value], first_index: usize, block: Div| -> Div {
+            let mut block = block;
+            for (offset, model) in items.iter().enumerate() {
+                let index = first_index + offset;
+                block = block.child(self.provider_model_row(
+                    instance_id,
+                    model,
+                    index,
+                    filtered.len(),
+                    &full_order,
+                    &favorite_set,
+                    &hidden,
+                    cx,
+                ));
+            }
+            block
+        };
+        if !favorite_models.is_empty() {
+            block = block.child(
+                div()
+                    .pt_1()
+                    .pb_1p5()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("Favorites"),
+            );
+        }
+        block = render_rows(&favorite_models, 0, block);
+        if !favorite_models.is_empty() {
+            block = block.child(
+                div()
+                    .pt_4()
+                    .pb_1p5()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("All"),
+            );
+        }
+        block = render_rows(&visible_models, favorite_models.len(), block);
+        if !hidden_models.is_empty() {
+            block = block.child(
+                div()
+                    .pt_4()
+                    .pb_1p5()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("Hidden from picker"),
+            );
+        }
+        block = render_rows(
+            &hidden_models,
+            favorite_models.len() + visible_models.len(),
+            block,
+        );
+        if filtered.is_empty() {
+            block = block.child(div().py_2().text_xs().text_color(theme::fg_muted()).child(
+                if filter.is_empty() {
+                    "No models reported for this provider yet."
+                } else {
+                    "No models match."
+                },
+            ));
+        }
+
+        // ── Add-model fold ──
+        if adding_model {
+            let add_key = format!("{instance_id}|model_add");
+            let field = self
+                .misc_settings_state
+                .extra
+                .provider_fields
+                .get(&add_key)
+                .cloned();
+            let iid_submit = instance_id.to_string();
+            let mut add_row = div().flex().items_center().gap_2().pt_2();
+            if let Some(field) = field {
+                add_row = add_row.child(self.boxed_field(field, 200.));
+            }
+            add_row = add_row
+                .child(
+                    div()
+                        .id("provider-model-add-submit")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::input())
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(theme::fg())
+                        .hover(|s| s.bg(theme::accent()))
+                        .child("Add")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.provider_model_add_submit(&iid_submit, cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("provider-model-add-cancel")
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(theme::fg_muted())
+                        .hover(|s| s.bg(theme::accent()))
+                        .child("Cancel")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.misc_settings_state.extra.provider_model_add = false;
+                                cx.notify();
+                            }),
+                        ),
+                );
+            block = block.child(add_row);
+        }
+        block
+    }
+
+    /// One model row — star, name + slug, capability hint, ↑/↓ reorder,
+    /// visibility switch; custom models get a remove (🗑) instead of the
+    /// hidden switch (the web only hides built-ins).
+    fn provider_model_row(
+        &self,
+        instance_id: &str,
+        model: &Value,
+        index: usize,
+        _visible_total: usize,
+        full_order: &[String],
+        favorite_set: &HashSet<String>,
+        hidden: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let slug = model["slug"].as_str().unwrap_or_default().to_string();
+        let name = model["name"].as_str().unwrap_or(&slug).to_string();
+        let is_custom = model["isCustom"].as_bool() == Some(true);
+        let is_favorite = favorite_set.contains(&slug);
+        let is_hidden = !is_custom && hidden.contains(&slug);
+        let iid = instance_id.to_string();
+
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .min_h(px(28.))
+            .child(
+                div()
+                    .id(format!("model-fav-{iid}-{index}"))
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(if is_favorite {
+                        theme::warning()
+                    } else {
+                        theme::fg_muted()
+                    })
+                    .hover(|s| s.bg(theme::accent()))
+                    .child(icon(
+                        if is_favorite {
+                            Icon::StarFilled
+                        } else {
+                            Icon::Star
+                        },
+                        13.,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let iid = iid.clone();
+                            let slug = slug.clone();
+                            move |this, _ev, _window, cx| {
+                                this.provider_model_toggle_favorite(&iid, slug.clone(), cx);
+                            }
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if is_hidden {
+                                theme::fg_muted()
+                            } else {
+                                theme::fg()
+                            })
+                            .truncate()
+                            .child(name.clone()),
+                    )
+                    .when(name != slug, |s| {
+                        s.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme::fg_muted())
+                                .truncate()
+                                .child(slug.clone()),
+                        )
+                    }),
+            );
+        if model["capabilities"].is_null() && !is_custom {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme::fg_muted())
+                    .child("No reasoning"),
+            );
+        }
+        // ↑/↓ reorder — writes the whole ordered list.
+        for (direction, mark) in [(-1, Icon::ArrowUp), (1, Icon::ArrowDown)] {
+            let iid = iid.clone();
+            let slug = slug.clone();
+            let order: Vec<String> = full_order.to_vec();
+            row = row.child(
+                div()
+                    .id(format!("model-move-{iid}-{index}-{direction}"))
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()))
+                    .child(icon(mark, 11.))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.provider_model_move(&iid, &slug, direction, &order, cx);
+                        }),
+                    ),
+            );
+        }
+        if is_custom {
+            let iid = iid.clone();
+            let slug = slug.clone();
+            row = row.child(
+                div()
+                    .id(format!("model-remove-{iid}-{index}"))
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme::fg_muted())
+                    .hover(|s| s.bg(theme::accent()).text_color(danger()))
+                    .child(icon(Icon::Trash2, 12.))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.provider_model_remove(&iid, slug.clone(), cx);
+                        }),
+                    ),
+            );
+        } else {
+            let iid = iid.clone();
+            let slug = slug.clone();
+            row = row.child(
+                div()
+                    .id(format!("model-visible-{iid}-{index}"))
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(switch_control(!is_hidden))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.provider_model_set_hidden(&iid, slug.clone(), is_hidden, cx);
+                        }),
+                    ),
+            );
+        }
+        row
+    }
     fn provider_instance_enabled(&self, instance_id: &str, provider: &Value) -> bool {
-        let configured =
-            &self.misc_settings_state.settings["providerInstances"][instance_id];
+        let configured = &self.misc_settings_state.settings["providerInstances"][instance_id];
         if let Some(enabled) = configured["enabled"].as_bool() {
             return enabled;
         }
@@ -4393,10 +7467,9 @@ impl AppView {
     /// Toggle one instance — `providerInstances` merges per entry on the
     /// server, so a `{instanceId: {enabled}}` patch can't drop siblings.
     fn toggle_provider_instance(&mut self, instance_id: String, on: bool, cx: &mut Context<Self>) {
-        self.update_server_settings(
-            json!({ "providerInstances": { instance_id: { "enabled": on } } }),
-            cx,
-        );
+        let mut patch = serde_json::Map::new();
+        patch.insert("enabled".to_string(), json!(on));
+        self.provider_instances_write(&instance_id, patch, cx);
     }
 
     /// Toggle a `usageLimitSources` / `textGenerators` entry — same
@@ -4411,11 +7484,23 @@ impl AppView {
         self.update_server_settings(json!({ record: { id: { "enabled": on } } }), cx);
     }
 
-    /// The 16px provider glyph — same driver mapping as the composer chip.
+    /// The provider brand glyph — the driver→icon map used by
+    /// `providerClients` in the web (list rows, detail header, composer).
     fn provider_mark(&self, driver: &str) -> Option<Icon> {
         match driver {
             "codex" | "openai" | "openaiCompatible" => Some(Icon::ProviderOpenAi),
             "claudeAgent" | "anthropic" => Some(Icon::ProviderClaude),
+            "devin" => Some(Icon::ProviderDevin),
+            "grok" => Some(Icon::ProviderGrok),
+            "opencode" => Some(Icon::ProviderOpencode),
+            "cursor" => Some(Icon::ProviderCursor),
+            "kiro" => Some(Icon::ProviderKiro),
+            "pi" => Some(Icon::ProviderPi),
+            "fx" => Some(Icon::ProviderFx),
+            "muse" => Some(Icon::ProviderMuse),
+            "kilo" => Some(Icon::ProviderKilo),
+            "devReplay" => Some(Icon::Play),
+            "antigravity" | "acpRegistry" => Some(Icon::Bot),
             _ => None,
         }
     }
@@ -4436,15 +7521,89 @@ impl AppView {
             );
         }
 
-        // ── Provider list — `server.getConfig → providers` (mirrored into
-        //    both misc state and the composer's config stream). ──
-        let mut providers: Vec<Value> = self.misc_settings_state.providers.clone();
-        if providers.is_empty() {
-            providers = self.composer_state.config_providers.clone();
+        // Scope sentence — the providers surface writes to the connected
+        // environment ("… on <env>").
+        page = page.child(self.scope_sentence(true, cx));
+
+        // ── Providers — `server.getConfig → providers` list + the
+        //    selected instance's detail pane (web ProviderSettingsPanel
+        //    two-pane editor). ──
+        let providers = self.provider_list();
+        let selected_id = self.selected_provider_id(&providers);
+        let selected_provider = providers
+            .iter()
+            .find(|p| p["instanceId"].as_str() == selected_id.as_deref())
+            .cloned();
+
+        // Auto-selection (no click yet) never ran `select_provider_instance`,
+        // so its TextFields don't exist and the detail inputs render empty —
+        // spawn the deferred creation; `&self` render can't build entities.
+        if let Some(instance_id) = &selected_id
+            && !self
+                .misc_settings_state
+                .extra
+                .provider_fields
+                .contains_key(&format!("{instance_id}|display_name"))
+        {
+            let instance_id = instance_id.clone();
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.ensure_provider_fields(&instance_id, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
-        let mut provider_card = div().flex().flex_col().rounded_lg();
-        let mut provider_count = 0usize;
-        for (index, provider) in providers.iter().enumerate() {
+        // Fields created inside listeners can't reach a window for seeding —
+        // flush the queued seeds once the spawn runs outside dispatch.
+        if !self
+            .misc_settings_state
+            .extra
+            .provider_field_pending_seeds
+            .is_empty()
+        {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    let pending = std::mem::take(
+                        &mut this.misc_settings_state.extra.provider_field_pending_seeds,
+                    );
+                    for (key, seed) in pending {
+                        let Some(field) = this
+                            .misc_settings_state
+                            .extra
+                            .provider_fields
+                            .get(&key)
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        edit_field(&field, cx, |field, window, cx| {
+                            field.reset(window, cx);
+                            field.replace_text_in_range(Some(0..0), &seed, window, cx);
+                        });
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // "↻ Checked just now" — the latest `checkedAt` across instances.
+        let checked_at = providers
+            .iter()
+            .filter_map(|p| p["checkedAt"].as_str())
+            .next()
+            .is_some();
+
+        let mut list_pane = div()
+            .w(px(220.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme::card_divider());
+        let mut row_index = 0usize;
+        for provider in &providers {
             let instance_id = provider["instanceId"]
                 .as_str()
                 .unwrap_or_default()
@@ -4452,225 +7611,13 @@ impl AppView {
             if instance_id.is_empty() {
                 continue;
             }
-            provider_count += 1;
-            let name = provider["name"]
-                .as_str()
-                .or_else(|| provider["displayName"].as_str())
-                .unwrap_or(&instance_id)
-                .to_string();
-            let driver = provider["driver"].as_str().unwrap_or(&instance_id).to_string();
-            let enabled = self.provider_instance_enabled(&instance_id, provider);
-            let mut detail = driver.clone();
-            if let Some(version) = provider["version"].as_str()
-                && !version.is_empty()
-            {
-                detail = format!("{detail} · v{version}");
-            }
-            let status = provider["status"].as_str().unwrap_or_default();
-            let availability = provider["availability"].as_str().unwrap_or_default();
-            if !status.is_empty() && status != "ready" {
-                detail = format!("{detail} · {status}");
-            }
-            if availability == "unavailable" {
-                detail = format!("{detail} · unavailable");
-            }
-            let mark = self.provider_mark(&driver);
-            let iid = instance_id.clone();
-            let mut row = div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_4()
-                .py_3()
-                .when(index > 0, |r| {
-                    r.border_t_1().border_color(theme::card_divider())
-                })
-                .child(
-                    div()
-                        .w(px(28.))
-                        .h(px(28.))
-                        .flex_none()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(theme::hover())
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme::fg_muted())
-                        .child(if let Some(mark) = mark {
-                            icon(mark, 14.).text_color(theme::fg()).into_any_element()
-                        } else {
-                            SharedString::from(
-                                provider["name"]
-                                    .as_str()
-                                    .or_else(|| provider["displayName"].as_str())
-                                    .unwrap_or(&instance_id)
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.to_ascii_uppercase().to_string())
-                                    .unwrap_or_else(|| "?".into()),
-                            )
-                            .into_any_element()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme::fg())
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::fg_muted())
-                                .truncate()
-                                .child(detail),
-                        ),
-                );
-            if connected {
-                row = row.child(
-                    div()
-                        .id(format!("provider-toggle-{index}"))
-                        .cursor_pointer()
-                        .child(switch_control(enabled))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.toggle_provider_instance(iid.clone(), !enabled, cx);
-                            }),
-                        ),
-                );
-            } else {
-                row = row.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::fg_muted())
-                        .child(if enabled { "enabled" } else { "disabled" }),
-                );
-            }
-            provider_card = provider_card.child(row);
-
-            // Per-instance configuration — stored `providerInstances[id]`
-            // rows: driver config fields the schema describes (binaryPath,
-            // homePath, launchArguments, setupMode…) plus the environment
-            // list, rendered read-only because secret values round-trip
-            // server-side.
-            let configured =
-                &self.misc_settings_state.settings["providerInstances"][&instance_id];
-            let config = &configured["config"];
-            let mut config_rows: Vec<(String, String)> = Vec::new();
-            for key in [
-                "binaryPath",
-                "homePath",
-                "shadowHomePath",
-                "launchArguments",
-                "setupMode",
-            ] {
-                let value = &config[key];
-                let text = match value {
-                    Value::String(s) if !s.is_empty() => s.clone(),
-                    Value::Array(items) if !items.is_empty() => items
-                        .iter()
-                        .filter_map(|item| item.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    _ => continue,
-                };
-                config_rows.push((key.to_string(), text));
-            }
-            let environment = configured["environment"].as_array().cloned().unwrap_or_else(
-                || {
-                    provider["environment"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                },
-            );
-            if !config_rows.is_empty() || !environment.is_empty() {
-                let mut detail_card = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_4()
-                    .pb_3()
-                    .pt_1();
-                for (key, text) in config_rows {
-                    detail_card = detail_card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .w(px(120.))
-                                    .flex_none()
-                                    .text_color(theme::fg_muted())
-                                    .child(key),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::fg())
-                                    .child(text),
-                            ),
-                    );
-                }
-                for variable in &environment {
-                    let name = variable["name"].as_str().unwrap_or_default().to_string();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let sensitive = variable["sensitive"].as_bool() == Some(true)
-                        || variable["valueRedacted"].as_bool() == Some(true)
-                        || variable["secret"].is_object();
-                    let value = if sensitive {
-                        "••••••••".to_string()
-                    } else {
-                        variable["value"].as_str().unwrap_or_default().to_string()
-                    };
-                    detail_card = detail_card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .w(px(120.))
-                                    .flex_none()
-                                    .text_color(theme::fg_muted())
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::fg())
-                                    .child(if value.is_empty() {
-                                        "(unset)".to_string()
-                                    } else {
-                                        value
-                                    }),
-                            ),
-                    );
-                }
-                provider_card = provider_card.child(detail_card);
-            }
+            let selected = selected_id.as_deref() == Some(instance_id.as_str());
+            let row = self.provider_list_row(provider, selected, cx);
+            list_pane = list_pane.child(row).when(row_index > 0, |pane| pane);
+            row_index += 1;
         }
-        if provider_count == 0 {
-            provider_card = provider_card.child(
+        if row_index == 0 {
+            list_pane = list_pane.child(
                 div()
                     .px_4()
                     .py_3()
@@ -4683,19 +7630,96 @@ impl AppView {
                     }),
             );
         }
+        if connected {
+            list_pane = list_pane.child(
+                div()
+                    .border_t_1()
+                    .border_color(theme::card_divider())
+                    .child(self.provider_add_row(cx)),
+            );
+        }
+
+        let detail_pane: Div = match &selected_provider {
+            Some(provider) => self.provider_detail_pane(provider, cx),
+            None => div()
+                .flex_1()
+                .px_4()
+                .py_8()
+                .text_xs()
+                .text_color(theme::fg_muted())
+                .child("Select a provider to configure it."),
+        };
+
+        let providers_card = div()
+            .flex()
+            .items_stretch()
+            .rounded_xl()
+            .border_1()
+            .border_color(theme::card_border())
+            .bg(theme::card_surface_40())
+            .overflow_hidden()
+            .child(list_pane)
+            .child(detail_pane);
+
+        // "Providers +" header with the checked stamp right-aligned — the
+        // web `SettingsSection` title + refresh affordance.
         page = page.child(
             div()
                 .flex()
                 .flex_col()
-                .child(settings_section_title("Providers"))
                 .child(
-                    provider_card
-                        .border_1()
-                        .border_color(theme::card_border())
-                        .bg(theme::card_surface_40()),
-                ),
+                    div()
+                        .min_h(px(28.))
+                        .pb_2p5()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::fg())
+                                .child("Providers")
+                                .child(
+                                    div()
+                                        .id("providers-add-title")
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(theme::fg_muted())
+                                        .hover(|s| s.text_color(theme::fg()))
+                                        .child(icon(Icon::Plus, 14.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev, _window, cx| {
+                                                this.extra_toggle("provider:add".to_string(), cx);
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .when(checked_at, |s| {
+                            s.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .text_color(theme::fg_muted())
+                                    .child(icon(Icon::RefreshCw, 11.))
+                                    .child("Checked just now"),
+                            )
+                        }),
+                )
+                .child(providers_card),
         );
-
         // ── Usage providers — `usageLimitSources` merges per entry. ─────
         let mut usage_rows: Vec<Div> = Vec::new();
         if let Some(sources) = settings["usageLimitSources"].as_object() {
@@ -4723,12 +7747,7 @@ impl AppView {
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme::fg())
-                                        .child(label),
-                                )
+                                .child(div().text_sm().text_color(theme::fg()).child(label))
                                 .child(
                                     div()
                                         .text_xs()
@@ -4786,9 +7805,7 @@ impl AppView {
                     .filter(|label| !label.is_empty())
                     .unwrap_or_else(|| id.clone());
                 let base_url = generator["baseUrl"].as_str().unwrap_or_default();
-                let kind = generator["kind"]
-                    .as_str()
-                    .unwrap_or("openaiCompatible");
+                let kind = generator["kind"].as_str().unwrap_or("openaiCompatible");
                 let record_id = id.clone();
                 generator_rows.push(setting_row(
                     "Text generator",
@@ -4804,12 +7821,7 @@ impl AppView {
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme::fg())
-                                        .child(label),
-                                )
+                                .child(div().text_sm().text_color(theme::fg()).child(label))
                                 .child(
                                     div()
                                         .text_xs()
