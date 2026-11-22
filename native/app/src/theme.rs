@@ -3,8 +3,8 @@
 //! these constants instead of hardcoding colors or metrics.
 #![allow(dead_code)] // Token palette — supersets are intentional.
 
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use gpui::{Rgba, px, rgb, rgba};
 
@@ -37,6 +37,87 @@ pub fn effective_dark() -> bool {
 
 fn pick(dark: Rgba, light: Rgba) -> Rgba {
     if effective_dark() { dark } else { light }
+}
+
+// ── Appearance tuning (Interface sliders) ─────────────────────────
+/// The web's `appearanceContrast` (50–200, default 100) and
+/// `glassOpacity` (40–100, default 80) unified settings, mirrored
+/// device-local in `ClientConfig`. Loaded lazily from the persisted
+/// config so every surface sees stored values from first paint;
+/// the settings sliders push live updates through `set_tuning`
+/// (`ClientConfig::save` stays the caller's job).
+static TUNING: OnceLock<RwLock<(i32, i32)>> = OnceLock::new();
+
+fn tuning() -> (i32, i32) {
+    TUNING
+        .get_or_init(|| {
+            let cfg = crate::config::ClientConfig::load();
+            RwLock::new((cfg.appearance_contrast, cfg.glass_opacity))
+        })
+        .read()
+        .map(|t| *t)
+        .unwrap_or((100, 80))
+}
+
+/// Push new slider values into the live tuning.
+pub fn set_tuning(appearance_contrast: i32, glass_opacity: i32) {
+    if let Ok(mut t) = TUNING
+        .get_or_init(|| RwLock::new((appearance_contrast, glass_opacity)))
+        .write()
+    {
+        *t = (appearance_contrast, glass_opacity);
+    }
+}
+
+/// Border/hairline strength multiplier — `appearanceContrast / 100`
+/// clamped to the contract's 0.5–2.0 range.
+pub fn contrast_factor() -> f32 {
+    (tuning().0 as f32 / 100.).clamp(0.5, 2.)
+}
+
+/// Glass alpha multiplier — `glassOpacity / 100` clamped to the
+/// contract's 0.4–1.0 range.
+pub fn glass_factor() -> f32 {
+    (tuning().1 as f32 / 100.).clamp(0.4, 1.)
+}
+
+/// Scale a translucent token's alpha by `factor` (contrast effect on
+/// dark-mode hairlines, which are stored as white-at-alpha).
+fn scaled_alpha(color: Rgba, factor: f32) -> Rgba {
+    Rgba {
+        a: (color.a * factor).clamp(0., 1.),
+        ..color
+    }
+}
+
+/// Nudge a solid color toward black (`f` > 0) or white (`f` < 0) —
+/// the light-mode side of the contrast effect, where borders are
+/// opaque hexes rather than fg-at-alpha.
+fn tint(color: Rgba, f: f32) -> Rgba {
+    let (target, w) = if f >= 0. {
+        (0f32, f.min(1.))
+    } else {
+        (1f32, -f.max(-1.))
+    };
+    Rgba {
+        r: color.r + (target - color.r) * w,
+        g: color.g + (target - color.g) * w,
+        b: color.b + (target - color.b) * w,
+        a: color.a,
+    }
+}
+
+/// `appearanceContrast` applied to a border-family token: alpha-scale
+/// dark-mode hairlines, lightness-nudge light-mode solid borders.
+fn contrast_border(dark: Rgba, light: Rgba) -> Rgba {
+    let c = contrast_factor();
+    if effective_dark() {
+        scaled_alpha(dark, c)
+    } else if c >= 1. {
+        tint(light, (c - 1.) * 0.25)
+    } else {
+        tint(light, -(1. - c) * 0.6)
+    }
 }
 
 // ── Typography ─────────────────────────────────────────────────────
@@ -94,12 +175,12 @@ pub fn raised() -> Rgba {
 }
 /// `--border`. dark white·8% · light zinc-200 #e4e4e7
 pub fn border() -> Rgba {
-    pick(rgba(0xffffff14), rgb(0xe4e4e7))
+    contrast_border(rgba(0xffffff14), rgb(0xe4e4e7))
 }
 /// `border-border/70` — the model picker's pane separators and footer top
 /// edge (`border-l border-border/70`, `border-t border-border/70`).
 pub fn border_70() -> Rgba {
-    pick(rgba(0xffffff0e), rgba(0xe4e4e7b3))
+    contrast_border(rgba(0xffffff0e), rgba(0xe4e4e7b3))
 }
 /// `bg-foreground/10` — icon-button hover/selected fill on the provider rail.
 pub fn fg_10() -> Rgba {
@@ -108,20 +189,24 @@ pub fn fg_10() -> Rgba {
 /// `border-border/60` — the web's 60%-border (SettingsGroup card outline).
 /// (`border_soft` already covers the terminal drawer's /80 hairline.)
 pub fn card_border() -> Rgba {
-    pick(rgba(0xffffff0d), rgba(0xe4e4e799))
+    contrast_border(rgba(0xffffff0d), rgba(0xe4e4e799))
 }
 /// `bg-card/40` — the web SettingsGroup card fill (--card · 40%).
 pub fn card_surface_40() -> Rgba {
     pick(rgba(0x11111166), rgba(0xffffff66))
 }
+/// `bg-card/60` — the web ThemeLibraryCard fill (Appearance theme cards).
+pub fn card_surface_60() -> Rgba {
+    pick(rgba(0x11111199), rgba(0xffffff99))
+}
 /// `border-border/50` — the web SettingsGroup row divider (a shade lighter
 /// than the card's /60 outline).
 pub fn card_divider() -> Rgba {
-    pick(rgba(0xffffff0a), rgba(0xe4e4e780))
+    contrast_border(rgba(0xffffff0a), rgba(0xe4e4e780))
 }
 /// `--input`. dark white·11% · light zinc-300 #d4d4d8
 pub fn input() -> Rgba {
-    pick(rgba(0xffffff1c), rgb(0xd4d4d8))
+    contrast_border(rgba(0xffffff1c), rgb(0xd4d4d8))
 }
 /// `bg-input/40` — segmented-control track (picker footer speed/permissions).
 pub fn input_40() -> Rgba {
@@ -348,9 +433,15 @@ pub fn popover_border() -> Rgba {
 }
 
 // ── Composer surfaces (apps/web ComposerSurface + dropdown-glass) ──
-/// `--chat-composer-glass-surface` (`--surface-raised`) at `--glass-opacity` 80%.
+/// `--chat-composer-glass-surface` (`--surface-raised`) at `--glass-opacity`.
+/// The web mixes `--background` at `glassOpacity` over transparent; the
+/// baked baseline is the 80% default scaled by the live factor.
 pub fn composer_surface() -> Rgba {
-    pick(rgba(0x111111cc), rgba(0xffffffcc))
+    let a = 0.8 * glass_factor();
+    pick(
+        scaled_alpha(rgba(0x111111ff), a),
+        scaled_alpha(rgba(0xffffffff), a),
+    )
 }
 /// `--chat-composer-outline` — the composer card's hairline.
 /// dark white·5% · light black·8%
@@ -547,7 +638,7 @@ pub fn pr_draft() -> Rgba {
 /// `border-border/80` — the web terminal drawer's top hairline.
 /// dark white·6.4% ≈ rgba(0xffffff10) · light zinc-200·80%
 pub fn border_soft() -> Rgba {
-    pick(rgba(0xffffff10), rgba(0xe4e4e7cc))
+    contrast_border(rgba(0xffffff10), rgba(0xe4e4e7cc))
 }
 
 // ── Timeline / chat-markdown extras ───────────────────────────────
@@ -588,12 +679,12 @@ pub fn tool_error_icon() -> Rgba {
 /// `border-border/70` — hairlines on working rows and meta pills.
 /// dark white·~5.5% · light zinc-200·70%
 pub fn hairline() -> Rgba {
-    pick(rgba(0xffffff0e), rgba(0xe4e4e7b3))
+    contrast_border(rgba(0xffffff0e), rgba(0xe4e4e7b3))
 }
 /// `.chat-markdown hr` — dark `--contrast-muted-foreground`, light `--border`.
 /// dark neutral-400 #a3a3a3 · light zinc-200 #e4e4e7
 pub fn rule_color() -> Rgba {
-    pick(rgb(0xa3a3a3), rgb(0xe4e4e7))
+    contrast_border(rgb(0xa3a3a3), rgb(0xe4e4e7))
 }
 
 // ── Sidebar/menu extras (visual-polish icon pass) ─────────────────
@@ -656,9 +747,14 @@ pub fn tree_ignored() -> Rgba {
     pick(rgb(0x4a4a4e), rgb(0xadadb1))
 }
 /// Toast dismiss orb `bg-popover/92` (apps/web toast.tsx).
-/// dark #111·92% · light #fff·92%
+/// dark #111·92% · light #fff·92% — scaled by `glassOpacity` like the
+/// web's `dropdown-glass`/`popover` surfaces.
 pub fn popover_92() -> Rgba {
-    pick(rgba(0x111111eb), rgba(0xffffffeb))
+    let a = 0.92 * glass_factor();
+    pick(
+        scaled_alpha(rgba(0x111111ff), a),
+        scaled_alpha(rgba(0xffffffff), a),
+    )
 }
 /// Toast orb hairline `border-border/60`.
 /// dark white·6% · light #e4e4e7·60%

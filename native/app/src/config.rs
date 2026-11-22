@@ -62,6 +62,32 @@ pub enum ThemeMode {
     System,
 }
 
+/// One browser profile — the web's `ClientSettings.browserProfiles`
+/// entry (`{ id, name }`). The built-in profile uses id `"default"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserProfile {
+    pub id: String,
+    pub name: String,
+}
+
+/// One favorite-model pair — `ClientSettings.favorites` entries
+/// (`{provider, model}` where `provider` is the instance id).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelFavorite {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Per-instance model list preferences — the web's
+/// `ClientSettings.providerModelPreferences[instanceId]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderModelPreferences {
+    #[serde(default)]
+    pub hidden_models: Vec<String>,
+    #[serde(default)]
+    pub model_order: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(default)]
@@ -69,6 +95,23 @@ pub struct ClientConfig {
     /// Accent hue override reserved for future use; None = default accent.
     #[serde(default)]
     pub accent: Option<String>,
+    /// Theme library selection — the web's persisted theme id
+    /// ("t3-chat", "grove", "ocean", "ember", "iris", or an
+    /// environment/custom theme). "" = the built-in T3 Code theme.
+    /// The native client ships only the default palette, so this
+    /// drives the settings previews, not the live colors.
+    #[serde(default)]
+    pub theme_id: String,
+    /// Appearance "Contrast" — the web's `appearanceContrast` unified
+    /// setting (50..=200, default 100). Scales border/hairline strength
+    /// via `theme::contrast_factor`.
+    #[serde(default = "default_appearance_contrast")]
+    pub appearance_contrast: i32,
+    /// Appearance "Glass opacity" — the web's `glassOpacity` unified
+    /// setting (40..=100, default 80). Scales glass surfaces (composer,
+    /// menus/popovers) via `theme::glass_factor`.
+    #[serde(default = "default_glass_opacity")]
+    pub glass_opacity: i32,
     #[serde(default)]
     pub environments: Vec<SavedEnvironment>,
     /// Index into `environments` of the last-connected endpoint.
@@ -237,6 +280,53 @@ pub struct ClientConfig {
     /// `ClientSettings.browserAutoShowFloatingPreview` (default true).
     #[serde(default = "default_true")]
     pub browser_auto_show_floating_preview: bool,
+    /// Browser profiles — the web's `ClientSettings.browserProfiles`
+    /// (id + display name). Always includes the built-in "default"
+    /// profile; entries added here are custom persistent profiles.
+    /// Stored client-side; the native client has no embedded browser
+    /// yet, so this is persisted state surfaced by the Browser page.
+    #[serde(default = "browser_profiles")]
+    pub browser_profiles: Vec<BrowserProfile>,
+    /// Browser "Default profile" — the web's
+    /// `ClientSettings.browserDefaultProfileId` ("default" = built-in).
+    #[serde(default = "browser_default_profile_id")]
+    pub browser_default_profile_id: String,
+    /// Browser "Default viewport" — the web's
+    /// `ClientSettings.browserDefaultViewport` ("fill" | "mobile" |
+    /// "tablet" | "laptop" | "desktop"; default "fill").
+    #[serde(default = "browser_default_viewport")]
+    pub browser_default_viewport: String,
+    /// Browser "Default zoom" — the web's
+    /// `ClientSettings.browserDefaultZoom` (percent string; "100").
+    #[serde(default = "browser_default_zoom")]
+    pub browser_default_zoom: String,
+    /// Browser "Default appearance" — the web's
+    /// `ClientSettings.browserDefaultAppearance` ("system" | "light" |
+    /// "dark"; default "system").
+    #[serde(default = "browser_default_appearance")]
+    pub browser_default_appearance: String,
+    /// Browser "Recording frame rate" — the web's
+    /// `ClientSettings.browserRecordingFrameRate` (30 | 60; default 30).
+    #[serde(default = "browser_recording_frame_rate")]
+    pub browser_recording_frame_rate: u32,
+    /// Browser "Show key presses" — the web's
+    /// `ClientSettings.browserRecordingShowKeyPresses` (default false).
+    #[serde(default)]
+    pub browser_recording_show_key_presses: bool,
+    /// Browser "Show mouse presses" — the web's
+    /// `ClientSettings.browserRecordingShowMousePresses` (default false).
+    #[serde(default)]
+    pub browser_recording_show_mouse_presses: bool,
+    /// Model favorites — the web's `ClientSettings.favorites`
+    /// (`{provider, model}` pairs pinned to the top of each provider's
+    /// model list). Device-local like the web.
+    #[serde(default)]
+    pub model_favorites: Vec<ModelFavorite>,
+    /// Per-instance model list preferences — the web's
+    /// `ClientSettings.providerModelPreferences` (hidden slugs + manual
+    /// order). Device-local like the web.
+    #[serde(default)]
+    pub provider_model_preferences: HashMap<String, ProviderModelPreferences>,
     /// Labs "Boring sidebar" — `ClientSettings.boringSidebarEnabled`.
     #[serde(default)]
     pub boring_sidebar: bool,
@@ -244,10 +334,29 @@ pub struct ClientConfig {
     /// `ClientSettings.boringSidebarMultilineRows`.
     #[serde(default)]
     pub boring_sidebar_multiline: bool,
+    /// Environments "Local environment" switch — the desktop's
+    /// `isLocalEnvironmentDisabled` mirror (default true = run agents on
+    /// this computer). Device-local; the launcher/server honors it on next
+    /// start, same as the web's restart-to-apply toggle.
+    #[serde(default = "default_true")]
+    pub local_environment_enabled: bool,
+    /// About "Update track" — release channel pick ("stable" | "nightly";
+    /// default "nightly"). Device-local like the web's update-channel
+    /// selection.
+    #[serde(default = "update_track")]
+    pub update_track: String,
 }
 
 fn default_in_app_notifications() -> bool {
     true
+}
+
+fn default_appearance_contrast() -> i32 {
+    100
+}
+
+fn default_glass_opacity() -> i32 {
+    80
 }
 
 fn default_project_sort_order() -> String {
@@ -291,6 +400,30 @@ fn browser_link_target() -> String {
 fn browser_search_engine() -> String {
     "duckduckgo".to_string()
 }
+fn browser_profiles() -> Vec<BrowserProfile> {
+    vec![BrowserProfile {
+        id: "default".to_string(),
+        name: "Default".to_string(),
+    }]
+}
+fn browser_default_profile_id() -> String {
+    "default".to_string()
+}
+fn browser_default_viewport() -> String {
+    "fill".to_string()
+}
+fn browser_default_zoom() -> String {
+    "100".to_string()
+}
+fn browser_default_appearance() -> String {
+    "system".to_string()
+}
+fn browser_recording_frame_rate() -> u32 {
+    30
+}
+fn update_track() -> String {
+    "nightly".to_string()
+}
 
 fn default_true() -> bool {
     true
@@ -311,13 +444,19 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 impl ClientConfig {
     pub fn load() -> Self {
+        // Deserializing an empty object applies every #[serde(default)]
+        // function — the derived Default would give e.g. `glass_opacity`
+        // 0 instead of its documented 80.
+        fn fresh() -> ClientConfig {
+            serde_json::from_str("{}").unwrap_or_default()
+        }
         let Some(path) = config_path() else {
-            return Self::default();
+            return fresh();
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
+            return fresh();
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        serde_json::from_str(&text).unwrap_or_else(|_| fresh())
     }
 
     pub fn save(&self) {

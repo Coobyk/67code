@@ -12,6 +12,10 @@ pub enum Icon {
     Activity,
     /// `alarm-clock`
     AlarmClock,
+    /// `android` — Android brand mark (apps/web Icons.tsx `AndroidIcon`).
+    Android,
+    /// `apple` — Apple brand mark (apps/web Icons.tsx `AppleIcon`).
+    Apple,
     /// `archive`
     Archive,
     /// `arrow-left`
@@ -170,6 +174,8 @@ pub enum Icon {
     Monitor,
     /// `moon`
     Moon,
+    /// `paintbrush`
+    Paintbrush,
     /// `palette`
     Palette,
     /// `panel-bottom`
@@ -198,12 +204,48 @@ pub enum Icon {
     Plus,
     /// `provider-claude` — Claude star (brand mark from apps/web Icons.tsx).
     ProviderClaude,
+    /// `provider-cursor` — Cursor hexagon mark (packages/provider-cursor icon).
+    ProviderCursor,
+    /// `provider-devin` — Devin pinwheel mark.
+    ProviderDevin,
+    /// `provider-fx` — fx glyph (packages/provider-fx icon).
+    ProviderFx,
+    /// `provider-grok` — Grok swoosh (packages/provider-grok icon).
+    ProviderGrok,
+    /// `provider-kilo` — Kilo K tile.
+    ProviderKilo,
+    /// `provider-kiro` — Kiro ghost tile (packages/provider-kiro icon).
+    ProviderKiro,
+    /// `provider-muse` — Muse ribbon (packages/provider-muse icon).
+    ProviderMuse,
     /// `provider-openai` — OpenAI knot (brand mark from apps/web Icons.tsx).
     ProviderOpenAi,
+    /// `provider-opencode` — OpenCode frame (packages/provider-opencode icon).
+    ProviderOpencode,
+    /// `provider-pi` — Pi pixel glyph (packages/provider-pi icon).
+    ProviderPi,
     /// `quote`
     Quote,
     /// `refresh-cw`
     RefreshCw,
+    /// `sc-azure-devops` — Azure DevOps ribbon (source control provider mark).
+    ScAzureDevops,
+    /// `sc-bitbucket` — Bitbucket bucket (source control provider mark).
+    ScBitbucket,
+    /// `sc-cursor-origin` — Cursor hexagon mark (Cursor Origin source control).
+    ScCursorOrigin,
+    /// `sc-forgejo` — Forgejo/Gitea mug (source control provider mark).
+    ScForgejo,
+    /// `sc-git` — Git diamond mark (version control).
+    ScGit,
+    /// `sc-gitcafe` — GitCafe cup (source control provider mark).
+    ScGitcafe,
+    /// `sc-github` — GitHub Octocat (source control provider mark).
+    ScGithub,
+    /// `sc-gitlab` — GitLab tanuki (source control provider mark).
+    ScGitlab,
+    /// `sc-jujutsu` — Jujutsu stacked glyph (version control).
+    ScJujutsu,
     /// `scroll-text`
     ScrollText,
     /// `search`
@@ -249,6 +291,8 @@ pub enum Icon {
     Star,
     /// `star` filled — favourites rail button and favourited model rows.
     StarFilled,
+    /// `sun`
+    Sun,
     /// `tag`
     Tag,
     /// `terminal`
@@ -296,6 +340,8 @@ impl Icon {
         match self {
             Icon::Activity => include_bytes!("../icons/activity.svg").as_slice(),
             Icon::AlarmClock => include_bytes!("../icons/alarm-clock.svg").as_slice(),
+            Icon::Android => include_bytes!("../icons/android.svg").as_slice(),
+            Icon::Apple => include_bytes!("../icons/apple.svg").as_slice(),
             Icon::AppWindow => include_bytes!("../icons/app-window.svg").as_slice(),
             Icon::Archive => include_bytes!("../icons/archive.svg").as_slice(),
             Icon::ArrowDown => include_bytes!("../icons/arrow-down.svg").as_slice(),
@@ -370,17 +416,24 @@ impl Icon {
             Icon::Maximize2 => include_bytes!("../icons/maximize-2.svg").as_slice(),
             Icon::MailOpen => include_bytes!("../icons/mail-open.svg").as_slice(),
             Icon::MessageSquare => include_bytes!("../icons/message-square.svg").as_slice(),
-            Icon::MessageCircleQuestion => include_bytes!("../icons/message-circle-question.svg").as_slice(),
+            Icon::MessageCircleQuestion => {
+                include_bytes!("../icons/message-circle-question.svg").as_slice()
+            }
             Icon::MessageSquareText => {
                 include_bytes!("../icons/message-square-text.svg").as_slice()
             }
             Icon::MessagesSquare => include_bytes!("../icons/messages-square.svg").as_slice(),
-            Icon::MessageSquarePlus => include_bytes!("../icons/message-square-plus.svg").as_slice(),
-            Icon::MessageSquareDashed => include_bytes!("../icons/message-square-dashed.svg").as_slice(),
+            Icon::MessageSquarePlus => {
+                include_bytes!("../icons/message-square-plus.svg").as_slice()
+            }
+            Icon::MessageSquareDashed => {
+                include_bytes!("../icons/message-square-dashed.svg").as_slice()
+            }
             Icon::Mic => include_bytes!("../icons/mic.svg").as_slice(),
             Icon::Minus => include_bytes!("../icons/minus.svg").as_slice(),
             Icon::Monitor => include_bytes!("../icons/monitor.svg").as_slice(),
             Icon::Moon => include_bytes!("../icons/moon.svg").as_slice(),
+            Icon::Paintbrush => include_bytes!("../icons/paintbrush.svg").as_slice(),
             Icon::Palette => include_bytes!("../icons/palette.svg").as_slice(),
             Icon::PanelBottom => include_bytes!("../icons/panel-bottom.svg").as_slice(),
             Icon::Paperclip => include_bytes!("../icons/paperclip.svg").as_slice(),
@@ -395,7 +448,25 @@ impl Icon {
             Icon::Plug => include_bytes!("../icons/plug.svg").as_slice(),
             Icon::Plus => include_bytes!("../icons/plus.svg").as_slice(),
             Icon::ProviderClaude => include_bytes!("../icons/provider-claude.svg").as_slice(),
+            Icon::ProviderCursor => include_bytes!("../icons/provider-cursor.svg").as_slice(),
+            Icon::ProviderDevin => include_bytes!("../icons/provider-devin.svg").as_slice(),
+            Icon::ProviderFx => include_bytes!("../icons/provider-fx.svg").as_slice(),
+            Icon::ProviderGrok => include_bytes!("../icons/provider-grok.svg").as_slice(),
+            Icon::ProviderKilo => include_bytes!("../icons/provider-kilo.svg").as_slice(),
+            Icon::ProviderKiro => include_bytes!("../icons/provider-kiro.svg").as_slice(),
+            Icon::ProviderMuse => include_bytes!("../icons/provider-muse.svg").as_slice(),
             Icon::ProviderOpenAi => include_bytes!("../icons/provider-openai.svg").as_slice(),
+            Icon::ProviderOpencode => include_bytes!("../icons/provider-opencode.svg").as_slice(),
+            Icon::ProviderPi => include_bytes!("../icons/provider-pi.svg").as_slice(),
+            Icon::ScAzureDevops => include_bytes!("../icons/sc-azure-devops.svg").as_slice(),
+            Icon::ScBitbucket => include_bytes!("../icons/sc-bitbucket.svg").as_slice(),
+            Icon::ScCursorOrigin => include_bytes!("../icons/sc-cursor-origin.svg").as_slice(),
+            Icon::ScForgejo => include_bytes!("../icons/sc-forgejo.svg").as_slice(),
+            Icon::ScGit => include_bytes!("../icons/sc-git.svg").as_slice(),
+            Icon::ScGitcafe => include_bytes!("../icons/sc-gitcafe.svg").as_slice(),
+            Icon::ScGithub => include_bytes!("../icons/sc-github.svg").as_slice(),
+            Icon::ScGitlab => include_bytes!("../icons/sc-gitlab.svg").as_slice(),
+            Icon::ScJujutsu => include_bytes!("../icons/sc-jujutsu.svg").as_slice(),
             Icon::Quote => include_bytes!("../icons/quote.svg").as_slice(),
             Icon::RefreshCw => include_bytes!("../icons/refresh-cw.svg").as_slice(),
             Icon::ScrollText => include_bytes!("../icons/scroll-text.svg").as_slice(),
@@ -426,6 +497,7 @@ impl Icon {
             Icon::SquareTerminal => include_bytes!("../icons/square-terminal.svg").as_slice(),
             Icon::Star => include_bytes!("../icons/star.svg").as_slice(),
             Icon::StarFilled => include_bytes!("../icons/star-filled.svg").as_slice(),
+            Icon::Sun => include_bytes!("../icons/sun.svg").as_slice(),
             Icon::Tag => include_bytes!("../icons/tag.svg").as_slice(),
             Icon::Terminal => include_bytes!("../icons/terminal.svg").as_slice(),
             Icon::ThumbsDown => include_bytes!("../icons/thumbs-down.svg").as_slice(),
@@ -453,6 +525,8 @@ impl Icon {
         match self {
             Icon::Activity => "activity",
             Icon::AlarmClock => "alarm-clock",
+            Icon::Android => "android",
+            Icon::Apple => "apple",
             Icon::AppWindow => "app-window",
             Icon::Archive => "archive",
             Icon::ArrowDown => "arrow-down",
@@ -532,6 +606,7 @@ impl Icon {
             Icon::Minus => "minus",
             Icon::Monitor => "monitor",
             Icon::Moon => "moon",
+            Icon::Paintbrush => "paintbrush",
             Icon::Palette => "palette",
             Icon::PanelBottom => "panel-bottom",
             Icon::Paperclip => "paperclip",
@@ -546,7 +621,25 @@ impl Icon {
             Icon::Plug => "plug",
             Icon::Plus => "plus",
             Icon::ProviderClaude => "provider-claude",
+            Icon::ProviderCursor => "provider-cursor",
+            Icon::ProviderDevin => "provider-devin",
+            Icon::ProviderFx => "provider-fx",
+            Icon::ProviderGrok => "provider-grok",
+            Icon::ProviderKilo => "provider-kilo",
+            Icon::ProviderKiro => "provider-kiro",
+            Icon::ProviderMuse => "provider-muse",
             Icon::ProviderOpenAi => "provider-openai",
+            Icon::ProviderOpencode => "provider-opencode",
+            Icon::ProviderPi => "provider-pi",
+            Icon::ScAzureDevops => "sc-azure-devops",
+            Icon::ScBitbucket => "sc-bitbucket",
+            Icon::ScCursorOrigin => "sc-cursor-origin",
+            Icon::ScForgejo => "sc-forgejo",
+            Icon::ScGit => "sc-git",
+            Icon::ScGitcafe => "sc-gitcafe",
+            Icon::ScGithub => "sc-github",
+            Icon::ScGitlab => "sc-gitlab",
+            Icon::ScJujutsu => "sc-jujutsu",
             Icon::Quote => "quote",
             Icon::RefreshCw => "refresh-cw",
             Icon::ScrollText => "scroll-text",
@@ -571,6 +664,7 @@ impl Icon {
             Icon::SquareTerminal => "square-terminal",
             Icon::Star => "star",
             Icon::StarFilled => "star-filled",
+            Icon::Sun => "sun",
             Icon::Tag => "tag",
             Icon::Terminal => "terminal",
             Icon::ThumbsDown => "thumbs-down",
